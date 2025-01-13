@@ -1,29 +1,35 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package awsoidc
 
 import (
 	"context"
+	"io"
 
+	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
 
 	awslib "github.com/gravitational/teleport/lib/cloud/aws"
+	"github.com/gravitational/teleport/lib/cloud/provisioning"
+	"github.com/gravitational/teleport/lib/cloud/provisioning/awsactions"
 )
 
 var (
@@ -39,6 +45,15 @@ type ConfigureIAMListDatabasesRequest struct {
 
 	// IntegrationRole is the Integration's AWS Role used by the integration.
 	IntegrationRole string
+
+	// AccountID is the AWS Account ID.
+	AccountID string
+
+	// AutoConfirm skips user confirmation of the operation plan if true.
+	AutoConfirm bool
+
+	// stdout is used to override stdout output in tests.
+	stdout io.Writer
 }
 
 // CheckAndSetDefaults ensures the required fields are present.
@@ -56,8 +71,30 @@ func (r *ConfigureIAMListDatabasesRequest) CheckAndSetDefaults() error {
 
 // ListDatabasesIAMConfigureClient describes the required methods to create the IAM Policies required for Listing Databases.
 type ListDatabasesIAMConfigureClient interface {
-	// PutRolePolicy creates or replaces a Policy by its name in a IAM Role.
-	PutRolePolicy(ctx context.Context, params *iam.PutRolePolicyInput, optFns ...func(*iam.Options)) (*iam.PutRolePolicyOutput, error)
+	CallerIdentityGetter
+	awsactions.RolePolicyPutter
+}
+
+type defaultListDatabasesIAMConfigureClient struct {
+	*iam.Client
+	CallerIdentityGetter
+}
+
+// NewListDatabasesIAMConfigureClient creates a new ListDatabasesIAMConfigureClient.
+func NewListDatabasesIAMConfigureClient(ctx context.Context, region string) (ListDatabasesIAMConfigureClient, error) {
+	if region == "" {
+		return nil, trace.BadParameter("region is required")
+	}
+
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return &defaultListDatabasesIAMConfigureClient{
+		Client:               iam.NewFromConfig(cfg),
+		CallerIdentityGetter: sts.NewFromConfig(cfg),
+	}, nil
 }
 
 // ConfigureListDatabasesIAM set ups the policy required for accessing an RDS DB Instances and RDS DB Clusters.
@@ -72,28 +109,25 @@ func ConfigureListDatabasesIAM(ctx context.Context, clt ListDatabasesIAMConfigur
 		return trace.Wrap(err)
 	}
 
-	listDatabasesPolicyDocument, err := awslib.NewPolicyDocument(
+	if err := CheckAccountID(ctx, clt, req.AccountID); err != nil {
+		return trace.Wrap(err)
+	}
+
+	policy := awslib.NewPolicyDocument(
 		awslib.StatementForListRDSDatabases(),
-	).Marshal()
+	)
+	policyName := defaultPolicyNameForListDatabases
+	putRolePolicy, err := awsactions.PutRolePolicy(clt, policyName, req.IntegrationRole, policy)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
-	_, err = clt.PutRolePolicy(ctx, &iam.PutRolePolicyInput{
-		PolicyName:     &defaultPolicyNameForListDatabases,
-		RoleName:       &req.IntegrationRole,
-		PolicyDocument: &listDatabasesPolicyDocument,
-	})
-	if err != nil {
-		if trace.IsNotFound(awslib.ConvertIAMv2Error(err)) {
-			return trace.NotFound("role %q not found.", req.IntegrationRole)
-		}
-		return trace.Wrap(err)
-	}
-
-	log.WithFields(log.Fields{
-		"policy": defaultPolicyNameForListDatabases,
-		"role":   req.IntegrationRole,
-	}).Info("Added Inline Policy to IAM Role")
-	return nil
+	return trace.Wrap(provisioning.Run(ctx, provisioning.OperationConfig{
+		Name: "listdatabases-iam",
+		Actions: []provisioning.Action{
+			*putRolePolicy,
+		},
+		AutoConfirm: req.AutoConfirm,
+		Output:      req.stdout,
+	}))
 }

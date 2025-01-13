@@ -1,45 +1,75 @@
 discovery_service:
     enabled: "yes"
     # discovery_group is used to group discovered resources into different
-    # sets. This is useful when you have multiple Teleport Discovery services
-    # running in the same cluster but polling different cloud providers or cloud
-    # accounts. It prevents discovered services from colliding in Teleport when
+    # sets. This is required when you have multiple Teleport Discovery services
+    # running. It prevents discovered services from colliding in Teleport when
     # managing discovered resources.
+    # If two Discovery Services match the same resources, they must be in the
+    # same discovery group.
+    # If two Discovery Services match different resources, they must be in
+    # different discovery groups.
     discovery_group: "disc-group"
+    # poll_interval is the cadence at which the discovery server will run each of its
+    # discovery cycles. The default is 5m.
+    poll_interval: 5m
+    # Matchers for discovering AWS-hosted resources.
     aws:
-       # AWS resource types. Valid options are:
-       # ec2 - discovers and registers AWS EC2 instances
-       # eks - discovers and registers AWS EKS clusters
-     - types: ["ec2"]
-       # AWS regions to search for resources from
-       regions: ["us-east-1","us-west-1"]
-       # AWS resource tags to match when registering resources
-       # Optional section: Defaults to "*":"*"
-       tags:
-         "*": "*"
-       # Optional section: install is used to provide parameters to the AWS SSM document.
-       # If the install section isn't provided, the below defaults are used.
-       # Only applicable for EC2 discovery.
-       install:
-         join_params:
-           # token_name is the name of the Teleport invite token to use.
-           # Optional, defaults to: "aws-discovery-iam-token".
-           token_name:  "aws-discovery-iam-token"
-         # script_name is the name of the Teleport install script to use.
-         # Optional, defaults to: "default-installer".
-         script_name: "default-installer"
-       # Optional section: ssm is used to configure which AWS SSM document to use
-       # If the ssm section isnt provided the below defaults are used.
-       ssm:
-         # document_name is the name of the SSM document that should be
-         # executed when installing teleport on matching nodes
-         # Optional, defaults to: "TeleportDiscoveryInstaller".
-         document_name: "TeleportDiscoveryInstaller"
+      # AWS resource types to discover and register with your Teleport cluster.
+      # Valid options are:
+      # 'ec2' - Amazon EC2 instances.
+      # 'eks' - Amazon EKS clusters.
+      # 'rds' - Amazon RDS and Aurora databases.
+      # 'rdsproxy' - Amazon RDS Proxy databases.
+      # 'redshift' - Amazon Redshift databases.
+      # 'redshift-serverless' - Amazon Redshift Serverless databases.
+      # 'elasticache' - Amazon ElastiCache Redis databases.
+      # 'memorydb' - Amazon MemoryDB Redis databases.
+      # 'opensearch' - Amazon OpenSearch Redis databases.
+    - types: ["ec2"]
+      # AWS regions to search for resources from
+      regions: ["us-east-1","us-west-1"]
+      # Optional AWS resource tags to match when registering resources
+      # Defaults to a wildcard selector that matches any resource: "*":"*"
+      tags:
+        "*": "*"
+      # Optional AWS role that the Discovery Service will assume to discover
+      # and register AWS-hosted databases and EKS clusters.
+      assume_role_arn: "arn:aws:iam::123456789012:role/example-role-name"
+      # Optional AWS external ID that the Discovery Service will use to assume
+      # a role in an external AWS account.
+      external_id: "example-external-id"
+      # Optional section: install is used to provide parameters to the AWS SSM document.
+      # If the install section isn't provided, the below defaults are used.
+      # Only applicable for EC2 discovery.
+      install:
+        join_params:
+          # token_name is the name of the Teleport invite token to use.
+          # Optional, defaults to: "aws-discovery-iam-token".
+          token_name:  "aws-discovery-iam-token"
+        # script_name is the name of the Teleport install script to use.
+        # Optional, defaults to: "default-installer".
+        script_name: "default-installer"
+      # Optional section: ssm is used to configure which AWS SSM document to use
+      # If the ssm section isnt provided the below defaults are used.
+      ssm:
+        # document_name is the name of the SSM document that should be
+        # executed when installing teleport on matching nodes
+        # Optional, defaults to: "TeleportDiscoveryInstaller".
+        document_name: "TeleportDiscoveryInstaller"
+      # Optional role for which the Discovery Service should create the EKS access entry.
+      # If not set, the Discovery Service will attempt to create the access
+      # entry using its own identity.
+      # If used, the role must match the role configured for a Teleport Kubernetes Service.
+      setup_access_for_arn: arn:aws:iam::123456789012:role/kube-service-role
     # Matchers for discovering Azure-hosted resources.
     azure:
       # Azure resource types. Valid options are:
       # 'aks' - discovers and registers Azure AKS Kubernetes Clusters.
       # 'vm' - discovers and registers Azure virtual machines.
+      # 'mysql' - discovers and registers Azure MySQL databases.
+      # 'postgres' - discovers and registers Azure PostgreSQL databases.
+      # 'redis' - discovers and registers Azure Cache for Redis databases.
+      # 'sqlserver' - discovers and registers Azure SQL Server databases.
     - types: ["aks"]
       # Azure regions to search for resources from. Valid options are:
       # '*' - discovers resources in all regions (default).

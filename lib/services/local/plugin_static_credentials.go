@@ -1,18 +1,20 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package local
 
@@ -21,6 +23,7 @@ import (
 
 	"github.com/gravitational/trace"
 
+	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/services"
@@ -37,11 +40,11 @@ type PluginStaticCredentialsService struct {
 }
 
 // NewPluginStaticCredentialsService creates a new PluginStaticCredentialsService.
-func NewPluginStaticCredentialsService(backend backend.Backend) (*PluginStaticCredentialsService, error) {
+func NewPluginStaticCredentialsService(b backend.Backend) (*PluginStaticCredentialsService, error) {
 	svc, err := generic.NewService(&generic.ServiceConfig[types.PluginStaticCredentials]{
-		Backend:       backend,
+		Backend:       b,
 		ResourceKind:  types.KindPluginStaticCredentials,
-		BackendPrefix: pluginStaticCredentialsPrefix,
+		BackendPrefix: backend.NewKey(pluginStaticCredentialsPrefix),
 		MarshalFunc:   services.MarshalPluginStaticCredentials,
 		UnmarshalFunc: services.UnmarshalPluginStaticCredentials,
 	})
@@ -56,12 +59,19 @@ func NewPluginStaticCredentialsService(backend backend.Backend) (*PluginStaticCr
 
 // CreatePluginStaticCredentials will create a new plugin static credentials resource.
 func (p *PluginStaticCredentialsService) CreatePluginStaticCredentials(ctx context.Context, pluginStaticCredentials types.PluginStaticCredentials) error {
-	return p.svc.CreateResource(ctx, pluginStaticCredentials)
+	_, err := p.svc.CreateResource(ctx, pluginStaticCredentials)
+	return trace.Wrap(err)
 }
 
 // GetPluginStaticCredentials will get a plugin static credentials resource by name.
 func (p *PluginStaticCredentialsService) GetPluginStaticCredentials(ctx context.Context, name string) (types.PluginStaticCredentials, error) {
-	return p.svc.GetResource(ctx, name)
+	creds, err := p.svc.GetResource(ctx, name)
+	return creds, trace.Wrap(err)
+}
+
+func (p *PluginStaticCredentialsService) UpdatePluginStaticCredentials(ctx context.Context, item types.PluginStaticCredentials) (types.PluginStaticCredentials, error) {
+	creds, err := p.svc.ConditionalUpdateResource(ctx, item)
+	return creds, trace.Wrap(err)
 }
 
 // GetPluginStaticCredentialsByLabels will get a list of plugin static credentials resource by matching labels.
@@ -82,7 +92,65 @@ func (p *PluginStaticCredentialsService) GetPluginStaticCredentialsByLabels(ctx 
 
 // DeletePluginStaticCredentials will delete a plugin static credentials resource.
 func (p *PluginStaticCredentialsService) DeletePluginStaticCredentials(ctx context.Context, name string) error {
-	return p.svc.DeleteResource(ctx, name)
+	return trace.Wrap(p.svc.DeleteResource(ctx, name))
+}
+
+// GetAllPluginStaticCredentials will get all plugin static credentials. Cache
+// use only.
+func (p *PluginStaticCredentialsService) GetAllPluginStaticCredentials(ctx context.Context) ([]types.PluginStaticCredentials, error) {
+	creds, err := p.svc.GetResources(ctx)
+	return creds, trace.Wrap(err)
+}
+
+// DeleteAllPluginStaticCredentials will remove all plugin static credentials.
+// Cache use only.
+func (p *PluginStaticCredentialsService) DeleteAllPluginStaticCredentials(ctx context.Context) error {
+	return trace.Wrap(p.svc.DeleteAllResources(ctx))
+}
+
+// UpsertPluginStaticCredentials will upsert a plugin static credentials. Cache
+// use only.
+func (p *PluginStaticCredentialsService) UpsertPluginStaticCredentials(ctx context.Context, item types.PluginStaticCredentials) (types.PluginStaticCredentials, error) {
+	cred, err := p.svc.UpsertResource(ctx, item)
+	return cred, trace.Wrap(err)
 }
 
 var _ services.PluginStaticCredentials = (*PluginStaticCredentialsService)(nil)
+
+type pluginStaticCredentialsParser struct {
+	baseParser
+}
+
+func newPluginStaticCredentialsParser() *pluginStaticCredentialsParser {
+	return &pluginStaticCredentialsParser{
+		baseParser: newBaseParser(backend.NewKey(pluginStaticCredentialsPrefix)),
+	}
+}
+
+func (p *pluginStaticCredentialsParser) parse(event backend.Event) (types.Resource, error) {
+	switch event.Type {
+	case types.OpDelete:
+		parts := event.Item.Key.Components()
+		if len(parts) != 2 {
+			return nil, trace.BadParameter("malformed key for %s event: %s", types.KindPluginStaticCredentials, event.Item.Key)
+		}
+
+		return &types.ResourceHeader{
+			Kind:    types.KindPluginStaticCredentials,
+			Version: types.V1,
+			Metadata: types.Metadata{
+				Name:        parts[1],
+				Namespace:   apidefaults.Namespace,
+				Description: parts[0],
+			},
+		}, nil
+
+	case types.OpPut:
+		return services.UnmarshalPluginStaticCredentials(
+			event.Item.Value,
+			services.WithExpires(event.Item.Expires),
+			services.WithRevision(event.Item.Revision))
+	default:
+		return nil, trace.BadParameter("event %v is not supported", event.Type)
+	}
+}

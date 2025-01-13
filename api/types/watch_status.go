@@ -1,5 +1,4 @@
 /*
- *
  * Copyright 2023 Gravitational, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +12,6 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
- *
  */
 
 package types
@@ -22,6 +20,7 @@ import (
 	"time"
 
 	"github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/api/utils"
 )
 
 // WatchStatus contains information about a successful Watch request.
@@ -31,6 +30,8 @@ type WatchStatus interface {
 	GetKinds() []WatchKind
 	// SetKinds sets the list of kinds confirmed by the Watch request.
 	SetKinds([]WatchKind)
+	// Clone performs a deep copy of watch status.
+	Clone() WatchStatus
 }
 
 // GetKind returns the watch status resource kind.
@@ -78,16 +79,6 @@ func (w *WatchStatusV1) GetMetadata() Metadata {
 	return w.Metadata
 }
 
-// GetResourceID returns the watch status resource ID.
-func (w *WatchStatusV1) GetResourceID() int64 {
-	return w.Metadata.ID
-}
-
-// SetResourceID sets the watch status resource ID.
-func (w *WatchStatusV1) SetResourceID(id int64) {
-	w.Metadata.ID = id
-}
-
 // GetRevision returns the revision
 func (w *WatchStatusV1) GetRevision() string {
 	return w.Metadata.GetRevision()
@@ -111,6 +102,11 @@ func (w *WatchStatusV1) GetKinds() []WatchKind {
 // SetKinds sets the list of kinds confirmed by the Watch request.
 func (w *WatchStatusV1) SetKinds(kinds []WatchKind) {
 	w.Spec.Kinds = kinds
+}
+
+// Clone performs a deep-copy of watch status.
+func (w *WatchStatusV1) Clone() WatchStatus {
+	return utils.CloneProtoMsg(w)
 }
 
 // NewWatchStatus returns a new WatchStatus resource.

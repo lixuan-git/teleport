@@ -1,24 +1,27 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package reverseproxy
 
 import (
 	"crypto/tls"
 	"net/http"
+	"net/http/httputil"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -97,6 +100,7 @@ func TestRewriter(t *testing.T) {
 			hostReq:    "teleport.dev:3543",
 			remoteAddr: "1.2.3.4:1234",
 			expected: http.Header{
+				XForwardedFor:    []string{"1.2.3.4"},
 				XForwardedHost:   []string{"teleport.dev:3543"},
 				XForwardedPort:   []string{"3543"},
 				XForwardedProto:  []string{"https"},
@@ -114,6 +118,7 @@ func TestRewriter(t *testing.T) {
 			hostReq:    "teleport.dev:3543",
 			remoteAddr: "1.2.3.4:1234",
 			expected: http.Header{
+				XForwardedFor:    []string{"1.2.3.4"},
 				XForwardedHost:   []string{"teleport.dev:3543"},
 				XForwardedPort:   []string{"3543"},
 				XForwardedProto:  []string{"http"},
@@ -130,6 +135,7 @@ func TestRewriter(t *testing.T) {
 			hostReq:    "teleport.dev",
 			remoteAddr: "1.2.3.4:1234",
 			expected: http.Header{
+				XForwardedFor:    []string{"1.2.3.4"},
 				XForwardedHost:   []string{"teleport.dev"},
 				XForwardedPort:   []string{"80"},
 				XForwardedProto:  []string{"http"},
@@ -138,9 +144,11 @@ func TestRewriter(t *testing.T) {
 			},
 		},
 	}
+
 	rewriter := NewHeaderRewriter()
 	// set hostname to make sure it's the same in all tests.
 	rewriter.Hostname = hostname
+
 	for _, test := range testCases {
 		test := test
 		t.Run(test.desc, func(t *testing.T) {
@@ -154,8 +162,20 @@ func TestRewriter(t *testing.T) {
 			if test.tlsReq {
 				req.TLS = &tls.ConnectionState{}
 			}
-			rewriter.Rewrite(req)
-			require.Equal(t, test.expected, req.Header)
+
+			// replicate net/http/httputil.ReverseProxy stripping
+			// forwarding headers from the outbound request
+			outReq := req.Clone(req.Context())
+			outReq.Header.Del("Forwarded")
+			outReq.Header.Del(XForwardedFor)
+			outReq.Header.Del(XForwardedHost)
+			outReq.Header.Del(XForwardedProto)
+
+			rewriter.Rewrite(&httputil.ProxyRequest{
+				In:  req,
+				Out: outReq,
+			})
+			require.Equal(t, test.expected, outReq.Header)
 		})
 	}
 }

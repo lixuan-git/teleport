@@ -1,18 +1,20 @@
-/*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 /*
 
@@ -35,8 +37,18 @@ export { ArrowBack } from './Icons/ArrowBack';
 export { ArrowDown } from './Icons/ArrowDown';
 export { ArrowFatLinesUp } from './Icons/ArrowFatLinesUp';
 export { ArrowForward } from './Icons/ArrowForward';
+export { ArrowLeft } from './Icons/ArrowLeft';
+export { ArrowLineLeft } from './Icons/ArrowLineLeft';
+export { ArrowRight } from './Icons/ArrowRight';
+export { ArrowSquareOut } from './Icons/ArrowSquareOut';
 export { ArrowUp } from './Icons/ArrowUp';
+export { ArrowsIn } from './Icons/ArrowsIn';
+export { ArrowsOut } from './Icons/ArrowsOut';
+export { BellRinging } from './Icons/BellRinging';
 export { BookOpenText } from './Icons/BookOpenText';
+export { Bots } from './Icons/Bots';
+export { Broadcast } from './Icons/Broadcast';
+export { BroadcastSlash } from './Icons/BroadcastSlash';
 export { Bubble } from './Icons/Bubble';
 export { CCAmex } from './Icons/CCAmex';
 export { CCDiscover } from './Icons/CCDiscover';
@@ -49,7 +61,10 @@ export { CardView } from './Icons/CardView';
 export { Cash } from './Icons/Cash';
 export { Chart } from './Icons/Chart';
 export { ChatBubble } from './Icons/ChatBubble';
+export { ChatCircleSparkle } from './Icons/ChatCircleSparkle';
 export { Check } from './Icons/Check';
+export { CheckThick } from './Icons/CheckThick';
+export { Checks } from './Icons/Checks';
 export { ChevronCircleDown } from './Icons/ChevronCircleDown';
 export { ChevronCircleLeft } from './Icons/ChevronCircleLeft';
 export { ChevronCircleRight } from './Icons/ChevronCircleRight';
@@ -79,8 +94,10 @@ export { Contract } from './Icons/Contract';
 export { Copy } from './Icons/Copy';
 export { CreditCard } from './Icons/CreditCard';
 export { Cross } from './Icons/Cross';
+export { Crown } from './Icons/Crown';
 export { Database } from './Icons/Database';
 export { Desktop } from './Icons/Desktop';
+export { DeviceMobileCamera } from './Icons/DeviceMobileCamera';
 export { Devices } from './Icons/Devices';
 export { Download } from './Icons/Download';
 export { Earth } from './Icons/Earth';
@@ -91,6 +108,9 @@ export { EnvelopeOpen } from './Icons/EnvelopeOpen';
 export { EqualizersVertical } from './Icons/EqualizersVertical';
 export { Expand } from './Icons/Expand';
 export { Facebook } from './Icons/Facebook';
+export { FingerprintSimple } from './Icons/FingerprintSimple';
+export { Floppy } from './Icons/Floppy';
+export { FlowArrow } from './Icons/FlowArrow';
 export { FolderPlus } from './Icons/FolderPlus';
 export { FolderShared } from './Icons/FolderShared';
 export { GitHub } from './Icons/GitHub';
@@ -103,49 +123,74 @@ export { Info } from './Icons/Info';
 export { Integrations } from './Icons/Integrations';
 export { Invoices } from './Icons/Invoices';
 export { Key } from './Icons/Key';
+export { KeyHole } from './Icons/KeyHole';
+export { Keyboard } from './Icons/Keyboard';
 export { Keypair } from './Icons/Keypair';
 export { Kubernetes } from './Icons/Kubernetes';
 export { Label } from './Icons/Label';
 export { Lan } from './Icons/Lan';
 export { Laptop } from './Icons/Laptop';
+export { Layout } from './Icons/Layout';
 export { License } from './Icons/License';
+export { LineSegment } from './Icons/LineSegment';
+export { LineSegments } from './Icons/LineSegments';
 export { Link } from './Icons/Link';
 export { Linkedin } from './Icons/Linkedin';
 export { Linux } from './Icons/Linux';
 export { ListAddCheck } from './Icons/ListAddCheck';
+export { ListMagnifyingGlass } from './Icons/ListMagnifyingGlass';
 export { ListThin } from './Icons/ListThin';
 export { ListView } from './Icons/ListView';
 export { Lock } from './Icons/Lock';
+export { LockKey } from './Icons/LockKey';
 export { Logout } from './Icons/Logout';
 export { Magnifier } from './Icons/Magnifier';
+export { MagnifyingMinus } from './Icons/MagnifyingMinus';
+export { MagnifyingPlus } from './Icons/MagnifyingPlus';
 export { Memory } from './Icons/Memory';
+export { Minus } from './Icons/Minus';
+export { MinusCircle } from './Icons/MinusCircle';
 export { Moon } from './Icons/Moon';
 export { MoreHoriz } from './Icons/MoreHoriz';
 export { MoreVert } from './Icons/MoreVert';
 export { Mute } from './Icons/Mute';
 export { NewTab } from './Icons/NewTab';
 export { NoteAdded } from './Icons/NoteAdded';
+export { Notification } from './Icons/Notification';
 export { NotificationsActive } from './Icons/NotificationsActive';
 export { PaperPlane } from './Icons/PaperPlane';
+export { Password } from './Icons/Password';
 export { Pencil } from './Icons/Pencil';
 export { Planet } from './Icons/Planet';
+export { Plugs } from './Icons/Plugs';
+export { PlugsConnected } from './Icons/PlugsConnected';
+export { Plus } from './Icons/Plus';
 export { PowerSwitch } from './Icons/PowerSwitch';
+export { Printer } from './Icons/Printer';
 export { Profile } from './Icons/Profile';
 export { PushPin } from './Icons/PushPin';
 export { PushPinFilled } from './Icons/PushPinFilled';
 export { Question } from './Icons/Question';
 export { Refresh } from './Icons/Refresh';
 export { Restore } from './Icons/Restore';
+export { RocketLaunch } from './Icons/RocketLaunch';
+export { Rows } from './Icons/Rows';
+export { Ruler } from './Icons/Ruler';
+export { Run } from './Icons/Run';
+export { Scan } from './Icons/Scan';
 export { Server } from './Icons/Server';
 export { Share } from './Icons/Share';
 export { ShieldCheck } from './Icons/ShieldCheck';
+export { ShieldWarning } from './Icons/ShieldWarning';
 export { Sliders } from './Icons/Sliders';
 export { SlidersVertical } from './Icons/SlidersVertical';
 export { Speed } from './Icons/Speed';
 export { Spinner } from './Icons/Spinner';
+export { SquaresFour } from './Icons/SquaresFour';
 export { Stars } from './Icons/Stars';
 export { Sun } from './Icons/Sun';
 export { SyncAlt } from './Icons/SyncAlt';
+export { Table } from './Icons/Table';
 export { Tablet } from './Icons/Tablet';
 export { Tags } from './Icons/Tags';
 export { Terminal } from './Icons/Terminal';
@@ -159,15 +204,18 @@ export { UsbDrive } from './Icons/UsbDrive';
 export { User } from './Icons/User';
 export { UserAdd } from './Icons/UserAdd';
 export { UserCircleGear } from './Icons/UserCircleGear';
+export { UserFocus } from './Icons/UserFocus';
 export { UserIdBadge } from './Icons/UserIdBadge';
 export { UserList } from './Icons/UserList';
 export { Users } from './Icons/Users';
 export { UsersTriple } from './Icons/UsersTriple';
+export { Vault } from './Icons/Vault';
 export { VideoGame } from './Icons/VideoGame';
 export { VolumeUp } from './Icons/VolumeUp';
 export { VpnKey } from './Icons/VpnKey';
 export { Wand } from './Icons/Wand';
 export { Warning } from './Icons/Warning';
+export { WarningCircle } from './Icons/WarningCircle';
 export { Wifi } from './Icons/Wifi';
 export { Windows } from './Icons/Windows';
 export { Wrench } from './Icons/Wrench';

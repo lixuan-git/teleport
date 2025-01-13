@@ -17,30 +17,39 @@ limitations under the License.
 package types
 
 import (
+	"slices"
 	"time"
 
 	"github.com/gravitational/trace"
-	"golang.org/x/exp/slices"
 
 	"github.com/gravitational/teleport/api/defaults"
-)
-
-const (
-	SSHSessionKind            SessionKind            = "ssh"
-	KubernetesSessionKind     SessionKind            = "k8s"
-	DatabaseSessionKind       SessionKind            = "db"
-	AppSessionKind            SessionKind            = "app"
-	WindowsDesktopSessionKind SessionKind            = "desktop"
-	SessionObserverMode       SessionParticipantMode = "observer"
-	SessionModeratorMode      SessionParticipantMode = "moderator"
-	SessionPeerMode           SessionParticipantMode = "peer"
 )
 
 // SessionKind is a type of session.
 type SessionKind string
 
+// These represent the possible values for the kind field in session trackers.
+const (
+	// SSHSessionKind is the kind used for session tracking with the
+	// session_tracker resource used in Teleport 9+. Note that it is
+	// different from the legacy [types.KindSSHSession] value that was
+	// used prior to the introduction of moderated sessions.
+	SSHSessionKind            SessionKind = "ssh"
+	KubernetesSessionKind     SessionKind = "k8s"
+	DatabaseSessionKind       SessionKind = "db"
+	AppSessionKind            SessionKind = "app"
+	WindowsDesktopSessionKind SessionKind = "desktop"
+	UnknownSessionKind        SessionKind = ""
+)
+
 // SessionParticipantMode is the mode that determines what you can do when you join a session.
 type SessionParticipantMode string
+
+const (
+	SessionObserverMode  SessionParticipantMode = "observer"
+	SessionModeratorMode SessionParticipantMode = "moderator"
+	SessionPeerMode      SessionParticipantMode = "peer"
+)
 
 // SessionTracker is a resource which tracks an active session.
 type SessionTracker interface {
@@ -125,6 +134,9 @@ type SessionTracker interface {
 
 	// GetTargetSubKind returns the sub kind of the target server.
 	GetTargetSubKind() string
+
+	// GetCommand returns the command that initiated the session.
+	GetCommand() []string
 }
 
 func NewSessionTracker(spec SessionTrackerSpecV1) (SessionTracker, error) {
@@ -342,6 +354,11 @@ func (s *SessionTrackerV1) GetLastActive() time.Time {
 // GetTargetSubKind returns the sub kind of the target server.
 func (s *SessionTrackerV1) GetTargetSubKind() string {
 	return s.Spec.TargetSubKind
+}
+
+// GetCommand returns command that intiated the session.
+func (s *SessionTrackerV1) GetCommand() []string {
+	return s.Spec.InitialCommand
 }
 
 // Match checks if a given session tracker matches this filter.

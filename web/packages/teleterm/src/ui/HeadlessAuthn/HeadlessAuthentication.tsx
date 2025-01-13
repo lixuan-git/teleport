@@ -1,27 +1,29 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React, { useRef, useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 
+import { HeadlessAuthenticationState } from 'gen-proto-ts/teleport/lib/teleterm/v1/service_pb';
 import { useAsync } from 'shared/hooks/useAsync';
 
+import { cloneAbortSignal } from 'teleterm/services/tshd/cloneableClient';
 import { useAppContext } from 'teleterm/ui/appContextProvider';
 import { RootClusterUri } from 'teleterm/ui/uri';
-
-import { HeadlessAuthenticationState } from 'teleterm/services/tshd/types';
 
 import { HeadlessPrompt } from './HeadlessPrompt';
 
@@ -32,11 +34,12 @@ interface HeadlessAuthenticationProps {
   skipConfirm: boolean;
   onCancel(): void;
   onSuccess(): void;
+  hidden?: boolean;
 }
 
 export function HeadlessAuthentication(props: HeadlessAuthenticationProps) {
   const { headlessAuthenticationService, clustersService } = useAppContext();
-  const refAbortCtrl = useRef(clustersService.client.createAbortController());
+  const refAbortCtrl = useRef(new AbortController());
   const cluster = clustersService.findCluster(props.rootClusterUri);
 
   const [updateHeadlessStateAttempt, updateHeadlessState] = useAsync(
@@ -47,13 +50,13 @@ export function HeadlessAuthentication(props: HeadlessAuthenticationProps) {
           headlessAuthenticationId: props.headlessAuthenticationId,
           state: state,
         },
-        refAbortCtrl.current.signal
+        cloneAbortSignal(refAbortCtrl.current.signal)
       )
   );
 
   async function handleHeadlessApprove(): Promise<void> {
     const [, error] = await updateHeadlessState(
-      HeadlessAuthenticationState.HEADLESS_AUTHENTICATION_STATE_APPROVED
+      HeadlessAuthenticationState.APPROVED
     );
     if (!error) {
       props.onSuccess();
@@ -62,7 +65,7 @@ export function HeadlessAuthentication(props: HeadlessAuthenticationProps) {
 
   async function handleHeadlessReject(): Promise<void> {
     const [, error] = await updateHeadlessState(
-      HeadlessAuthenticationState.HEADLESS_AUTHENTICATION_STATE_DENIED
+      HeadlessAuthenticationState.DENIED
     );
     if (!error) {
       props.onSuccess();
@@ -77,11 +80,12 @@ export function HeadlessAuthentication(props: HeadlessAuthenticationProps) {
 
   return (
     <HeadlessPrompt
+      hidden={props.hidden}
       cluster={cluster}
       clientIp={props.clientIp}
       skipConfirm={props.skipConfirm}
       onApprove={handleHeadlessApprove}
-      abortApproval={refAbortCtrl.current.abort}
+      abortApproval={() => refAbortCtrl.current.abort()}
       onReject={handleHeadlessReject}
       headlessAuthenticationId={props.headlessAuthenticationId}
       updateHeadlessStateAttempt={updateHeadlessStateAttempt}

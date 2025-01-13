@@ -1,18 +1,20 @@
 /*
-Copyright 2015-2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package opsgenie
 
@@ -34,6 +36,9 @@ import (
 func TestCreateAlert(t *testing.T) {
 	recievedReq := ""
 	testServer := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/v2/alerts" {
+			return
+		}
 		bodyBytes, err := io.ReadAll(req.Body)
 		if err != nil {
 			log.Fatal(err)
@@ -54,7 +59,8 @@ func TestCreateAlert(t *testing.T) {
 		Roles:         []string{"role1", "role2"},
 		RequestReason: "someReason",
 		SystemAnnotations: types.Labels{
-			types.TeleportNamespace + types.ReqAnnotationSchedulesLabel: {"responder@teleport.com"},
+			types.TeleportNamespace + types.ReqAnnotationNotifySchedulesLabel: {"responder@example.com", "bb4d9938-c3c2-455d-aaab-727aa701c0d8"},
+			types.TeleportNamespace + types.ReqAnnotationTeamsLabel:           {"MyOpsGenieTeam", "aee8a0de-c80f-4515-a232-501c0bc9d715"},
 		},
 	})
 	assert.NoError(t, err)
@@ -63,8 +69,13 @@ func TestCreateAlert(t *testing.T) {
 		Message:     "Access request from someUser",
 		Alias:       "teleport-access-request/someRequestID",
 		Description: "someUser requested permissions for roles role1, role2 on Teleport at 01 Jan 01 00:00 UTC.\nReason: someReason\n\n",
-		Responders:  []Responder{{Type: "schedule", ID: "responder@teleport.com"}},
-		Priority:    "somePriority",
+		Responders: []Responder{
+			{Type: "schedule", Name: "responder@example.com"},
+			{Type: "schedule", ID: "bb4d9938-c3c2-455d-aaab-727aa701c0d8"},
+			{Type: "team", Name: "MyOpsGenieTeam"},
+			{Type: "team", ID: "aee8a0de-c80f-4515-a232-501c0bc9d715"},
+		},
+		Priority: "somePriority",
 	}
 	var got AlertBody
 	err = json.Unmarshal([]byte(recievedReq), &got)

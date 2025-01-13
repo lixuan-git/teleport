@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package uri
 
@@ -30,6 +32,10 @@ var pathDbs = urlpath.New("/clusters/:cluster/dbs/:dbName")
 var pathLeafDbs = urlpath.New("/clusters/:cluster/leaves/:leaf/dbs/:dbName")
 var pathKubes = urlpath.New("/clusters/:cluster/kubes/:kubeName")
 var pathLeafKubes = urlpath.New("/clusters/:cluster/leaves/:leaf/kubes/:kubeName")
+var pathKubeResourceNamespace = urlpath.New("/clusters/:cluster/kubes/:kubeName/namespaces/:kubeNamespaceName")
+var pathLeafKubeResourceNamespace = urlpath.New("/clusters/:cluster/leaves/:leaf/kubes/:kubeName/namespaces/:kubeNamespaceName")
+var pathApps = urlpath.New("/clusters/:cluster/apps/:appName")
+var pathLeafApps = urlpath.New("/clusters/:cluster/leaves/:leaf/apps/:appName")
 
 // New creates an instance of ResourceURI
 func New(path string) ResourceURI {
@@ -118,6 +124,36 @@ func (r ResourceURI) GetKubeName() string {
 	return ""
 }
 
+// GetKubeResourceNamespace extracts the kube resource namespace from r. Returns an empty string if the path is not a kube resource URI.
+func (r ResourceURI) GetKubeResourceNamespace() string {
+	result, ok := pathKubeResourceNamespace.Match(r.path)
+	if ok {
+		return result.Params["kubeNamespaceName"]
+	}
+
+	result, ok = pathLeafKubeResourceNamespace.Match(r.path)
+	if ok {
+		return result.Params["kubeNamespaceName"]
+	}
+
+	return ""
+}
+
+// GetAppName extracts the app name from r. Returns an empty string if the path is not an app URI.
+func (r ResourceURI) GetAppName() string {
+	result, ok := pathApps.Match(r.path)
+	if ok {
+		return result.Params["appName"]
+	}
+
+	result, ok = pathLeafApps.Match(r.path)
+	if ok {
+		return result.Params["appName"]
+	}
+
+	return ""
+}
+
 // GetServerUUID extracts the server UUID from r. Returns an empty string if path is not a server URI.
 func (r ResourceURI) GetServerUUID() string {
 	result, ok := pathServers.Match(r.path)
@@ -145,12 +181,7 @@ func (r ResourceURI) GetRootClusterURI() ResourceURI {
 // If called on a leaf cluster resource URI, it'll return the URI of the leaf cluster.
 // If called on a root cluster URI or a leaf cluster URI, it's a noop.
 func (r ResourceURI) GetClusterURI() ResourceURI {
-	clusterURI := r.GetRootClusterURI()
-
-	if leafClusterName := r.GetLeafClusterName(); leafClusterName != "" {
-		clusterURI = clusterURI.AppendLeafCluster(leafClusterName)
-	}
-	return clusterURI
+	return r.GetRootClusterURI().AppendLeafCluster(r.GetLeafClusterName())
 }
 
 // AppendServer appends server segment to the URI
@@ -159,8 +190,12 @@ func (r ResourceURI) AppendServer(id string) ResourceURI {
 	return r
 }
 
-// AppendLeafCluster appends leaf cluster segment to the URI
+// AppendLeafCluster appends leaf cluster segment to the URI if name is not empty.
 func (r ResourceURI) AppendLeafCluster(name string) ResourceURI {
+	if name == "" {
+		return r
+	}
+
 	r.path = fmt.Sprintf("%v/leaves/%v", r.path, name)
 	return r
 }
@@ -168,6 +203,12 @@ func (r ResourceURI) AppendLeafCluster(name string) ResourceURI {
 // AppendKube appends kube segment to the URI
 func (r ResourceURI) AppendKube(name string) ResourceURI {
 	r.path = fmt.Sprintf("%v/kubes/%v", r.path, name)
+	return r
+}
+
+// AppendKubeResourceNamespace appends kube resource namespace segment to the URI.
+func (r ResourceURI) AppendKubeResourceNamespace(kubeNamespaceName string) ResourceURI {
+	r.path = fmt.Sprintf("%v/namespaces/%v", r.path, kubeNamespaceName)
 	return r
 }
 
@@ -208,4 +249,9 @@ func (r ResourceURI) IsDB() bool {
 // IsKube returns true if URI is a kube resource.
 func (r ResourceURI) IsKube() bool {
 	return r.GetKubeName() != ""
+}
+
+// IsApp returns true if URI is an app resource.
+func (r ResourceURI) IsApp() bool {
+	return r.GetAppName() != ""
 }

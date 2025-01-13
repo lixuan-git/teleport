@@ -1,23 +1,26 @@
-/**
- * Copyright 2021 Gravitational, Inc.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 package web
 
 import (
 	"net/http"
+	"slices"
 
 	"github.com/gravitational/trace"
 	"github.com/julienschmidt/httprouter"
@@ -26,8 +29,8 @@ import (
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/httplib"
 	"github.com/gravitational/teleport/lib/reversetunnelclient"
-	"github.com/gravitational/teleport/lib/services"
-	"github.com/gravitational/teleport/lib/web/ui"
+	"github.com/gravitational/teleport/lib/ui"
+	webui "github.com/gravitational/teleport/lib/web/ui"
 )
 
 // clusterKubesGet returns a list of kube clusters in a form the UI can present.
@@ -53,27 +56,41 @@ func (h *Handler) clusterKubesGet(w http.ResponseWriter, r *http.Request, p http
 	}
 
 	return listResourcesGetResponse{
-		Items:      ui.MakeKubeClusters(page.Resources, accessChecker),
+		Items:      webui.MakeKubeClusters(page.Resources, accessChecker),
 		StartKey:   page.NextKey,
 		TotalCount: page.Total,
 	}, nil
 }
 
-// clusterKubePodsGet returns a list of Kubernetes Pods in a form the
-// UI can present.
-func (h *Handler) clusterKubePodsGet(w http.ResponseWriter, r *http.Request, p httprouter.Params, sctx *SessionContext, site reversetunnelclient.RemoteSite) (interface{}, error) {
+// clusterKubeResourcesGet returns supported requested kubernetes subresources eg: pods, namespaces, secrets etc.
+func (h *Handler) clusterKubeResourcesGet(w http.ResponseWriter, r *http.Request, p httprouter.Params, sctx *SessionContext, site reversetunnelclient.RemoteSite) (interface{}, error) {
+	kind := r.URL.Query().Get("kind")
+	kubeCluster := r.URL.Query().Get("kubeCluster")
+
+	if kubeCluster == "" {
+		return nil, trace.BadParameter("missing param %q", "kubeCluster")
+	}
+
+	if kind == "" {
+		return nil, trace.BadParameter("missing param %q", "kind")
+	}
+
+	if !slices.Contains(types.KubernetesResourcesKinds, kind) {
+		return nil, trace.BadParameter("kind is not valid, valid kinds %v", types.KubernetesResourcesKinds)
+	}
+
 	clt, err := sctx.NewKubernetesServiceClient(r.Context(), h.cfg.ProxyWebAddr.Addr)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	resp, err := listKubeResources(r.Context(), clt, r.URL.Query(), site.GetName(), types.KindKubePod)
+	resp, err := listKubeResources(r.Context(), clt, r.URL.Query(), site.GetName(), kind)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	return listResourcesGetResponse{
-		Items:      ui.MakeKubeResources(resp.Resources, r.URL.Query().Get("kubeCluster")),
+		Items:      webui.MakeKubeResources(resp.Resources, kubeCluster),
 		StartKey:   resp.NextKey,
 		TotalCount: int(resp.TotalCount),
 	}, nil
@@ -97,9 +114,9 @@ func (h *Handler) clusterDatabasesGet(w http.ResponseWriter, r *http.Request, p 
 	}
 
 	// Make a list of all proxied databases.
-	databases := make([]types.Database, 0, len(page.Resources))
+	databases := make([]*types.DatabaseV3, 0, len(page.Resources))
 	for _, server := range page.Resources {
-		databases = append(databases, server.GetDatabase())
+		databases = append(databases, server.GetDatabase().Copy())
 	}
 
 	accessChecker, err := sctx.GetUserAccessChecker()
@@ -107,13 +124,8 @@ func (h *Handler) clusterDatabasesGet(w http.ResponseWriter, r *http.Request, p 
 		return nil, trace.Wrap(err)
 	}
 
-	dbNames, dbUsers, err := getDatabaseUsersAndNames(accessChecker)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
 	return listResourcesGetResponse{
-		Items:      ui.MakeDatabases(databases, dbUsers, dbNames),
+		Items:      webui.MakeDatabases(databases, accessChecker, h.cfg.DatabaseREPLRegistry),
 		StartKey:   page.NextKey,
 		TotalCount: page.Total,
 	}, nil
@@ -141,12 +153,7 @@ func (h *Handler) clusterDatabaseGet(w http.ResponseWriter, r *http.Request, p h
 		return nil, trace.Wrap(err)
 	}
 
-	dbNames, dbUsers, err := getDatabaseUsersAndNames(accessChecker)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	return ui.MakeDatabase(database, dbUsers, dbNames), nil
+	return webui.MakeDatabase(database, accessChecker, h.cfg.DatabaseREPLRegistry, false /* requiresRequest */), nil
 }
 
 // clusterDatabaseServicesList returns a list of DatabaseServices (database agents) in a form the UI can present.
@@ -167,7 +174,7 @@ func (h *Handler) clusterDatabaseServicesList(w http.ResponseWriter, r *http.Req
 	}
 
 	return listResourcesGetResponse{
-		Items:      ui.MakeDatabaseServices(page.Resources),
+		Items:      webui.MakeDatabaseServices(page.Resources),
 		StartKey:   page.NextKey,
 		TotalCount: page.Total,
 	}, nil
@@ -185,19 +192,19 @@ func (h *Handler) clusterDesktopsGet(w http.ResponseWriter, r *http.Request, p h
 		return nil, trace.Wrap(err)
 	}
 
-	page, err := client.GetResourcePage[types.WindowsDesktop](r.Context(), clt, req)
+	page, err := client.GetEnrichedResourcePage(r.Context(), clt, req)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	accessChecker, err := sctx.GetUserAccessChecker()
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
+	uiDesktops := make([]webui.Desktop, 0, len(page.Resources))
+	for _, r := range page.Resources {
+		desktop, ok := r.ResourceWithLabels.(types.WindowsDesktop)
+		if !ok {
+			continue
+		}
 
-	uiDesktops, err := ui.MakeDesktops(page.Resources, accessChecker)
-	if err != nil {
-		return nil, trace.Wrap(err)
+		uiDesktops = append(uiDesktops, webui.MakeDesktop(desktop, r.Logins, false /* requiresRequest */))
 	}
 
 	return listResourcesGetResponse{
@@ -227,7 +234,7 @@ func (h *Handler) clusterDesktopServicesGet(w http.ResponseWriter, r *http.Reque
 	}
 
 	return listResourcesGetResponse{
-		Items:      ui.MakeDesktopServices(page.Resources),
+		Items:      webui.MakeDesktopServices(page.Resources),
 		StartKey:   page.NextKey,
 		TotalCount: page.Total,
 	}, nil
@@ -242,8 +249,7 @@ func (h *Handler) getDesktopHandle(w http.ResponseWriter, r *http.Request, p htt
 
 	desktopName := p.ByName("desktopName")
 
-	windowsDesktops, err := clt.GetWindowsDesktops(r.Context(),
-		types.WindowsDesktopFilter{Name: desktopName})
+	windowsDesktops, err := clt.GetWindowsDesktops(r.Context(), types.WindowsDesktopFilter{Name: desktopName})
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -259,12 +265,14 @@ func (h *Handler) getDesktopHandle(w http.ResponseWriter, r *http.Request, p htt
 	// windowsDesktops may contain the same desktop multiple times
 	// if multiple Windows Desktop Services are in use. We only need
 	// to see the desktop once in the UI, so just take the first one.
-	uiDesktop, err := ui.MakeDesktop(windowsDesktops[0], accessChecker)
+	desktop := windowsDesktops[0]
+
+	logins, err := accessChecker.GetAllowedLoginsForResource(desktop)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	return uiDesktop, nil
+	return webui.MakeDesktop(desktop, logins, false /* requiresRequest */), nil
 }
 
 // desktopIsActive checks if a desktop has an active session and returns a desktopIsActive.
@@ -314,37 +322,18 @@ func (h *Handler) desktopIsActive(w http.ResponseWriter, r *http.Request, p http
 	return desktopIsActive{false}, nil
 }
 
-func getDatabaseUsersAndNames(accessChecker services.AccessChecker) (dbNames []string, dbUsers []string, err error) {
-	dbNames, dbUsers, err = accessChecker.CheckDatabaseNamesAndUsers(0, true /* force ttl override*/)
-	if err != nil {
-		// if NotFound error:
-		// This user cannot request database access, has no assigned database names or users
-		//
-		// Every other error should be reported upstream.
-		if !trace.IsNotFound(err) {
-			return nil, nil, trace.Wrap(err)
-		}
-
-		// We proceed with an empty list of DBUsers and DBNames
-		dbUsers = []string{}
-		dbNames = []string{}
-	}
-
-	return dbNames, dbUsers, nil
-}
-
 type desktopIsActive struct {
 	Active bool `json:"active"`
 }
 
 // createNodeRequest contains the required information to create a Node.
 type createNodeRequest struct {
-	Name     string         `json:"name,omitempty"`
-	SubKind  string         `json:"subKind,omitempty"`
-	Hostname string         `json:"hostname,omitempty"`
-	Addr     string         `json:"addr,omitempty"`
-	Labels   []ui.Label     `json:"labels,omitempty"`
-	AWSInfo  *types.AWSInfo `json:"aws,omitempty"`
+	Name     string             `json:"name,omitempty"`
+	SubKind  string             `json:"subKind,omitempty"`
+	Hostname string             `json:"hostname,omitempty"`
+	Addr     string             `json:"addr,omitempty"`
+	Labels   []ui.Label         `json:"labels,omitempty"`
+	AWSInfo  *webui.AWSMetadata `json:"aws,omitempty"`
 }
 
 func (r *createNodeRequest) checkAndSetDefaults() error {
@@ -377,7 +366,7 @@ func (h *Handler) handleNodeCreate(w http.ResponseWriter, r *http.Request, p htt
 	ctx := r.Context()
 
 	var req *createNodeRequest
-	if err := httplib.ReadJSON(r, &req); err != nil {
+	if err := httplib.ReadResourceJSON(r, &req); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
@@ -402,7 +391,14 @@ func (h *Handler) handleNodeCreate(w http.ResponseWriter, r *http.Request, p htt
 			Hostname: req.Hostname,
 			Addr:     req.Addr,
 			CloudMetadata: &types.CloudMetadata{
-				AWS: req.AWSInfo,
+				AWS: &types.AWSInfo{
+					AccountID:   req.AWSInfo.AccountID,
+					InstanceID:  req.AWSInfo.InstanceID,
+					Region:      req.AWSInfo.Region,
+					VPCID:       req.AWSInfo.VPCID,
+					Integration: req.AWSInfo.Integration,
+					SubnetID:    req.AWSInfo.SubnetID,
+				},
 			},
 		},
 		labels,
@@ -420,10 +416,10 @@ func (h *Handler) handleNodeCreate(w http.ResponseWriter, r *http.Request, p htt
 		return nil, trace.Wrap(err)
 	}
 
-	uiServer, err := ui.MakeServer(site.GetName(), server, accessChecker)
+	logins, err := accessChecker.GetAllowedLoginsForResource(server)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	return uiServer, nil
+	return webui.MakeServer(site.GetName(), server, logins, false /* requiresRequest */), nil
 }

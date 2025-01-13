@@ -1,18 +1,20 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package awsoidc
 
@@ -101,8 +103,8 @@ func TestListSecurityGroups(t *testing.T) {
 		require.NotEmpty(t, resp.NextToken)
 		require.Len(t, resp.SecurityGroups, pageSize)
 		nextPageToken := resp.NextToken
-		require.Equal(t, resp.SecurityGroups[0].ID, "sg-0")
-		require.Equal(t, resp.SecurityGroups[0].Name, "MySG-0")
+		require.Equal(t, "sg-0", resp.SecurityGroups[0].ID)
+		require.Equal(t, "MySG-0", resp.SecurityGroups[0].Name)
 
 		// Second page must return pageSize number of Endpoints
 		resp, err = ListSecurityGroups(ctx, mockListClient, ListSecurityGroupsRequest{
@@ -113,8 +115,8 @@ func TestListSecurityGroups(t *testing.T) {
 		require.NotEmpty(t, resp.NextToken)
 		require.Len(t, resp.SecurityGroups, pageSize)
 		nextPageToken = resp.NextToken
-		require.Equal(t, resp.SecurityGroups[0].ID, "sg-100")
-		require.Equal(t, resp.SecurityGroups[0].Name, "MySG-100")
+		require.Equal(t, "sg-100", resp.SecurityGroups[0].ID)
+		require.Equal(t, "MySG-100", resp.SecurityGroups[0].Name)
 
 		// Third page must return only the remaining Endpoints and an empty nextToken
 		resp, err = ListSecurityGroups(ctx, mockListClient, ListSecurityGroupsRequest{
@@ -124,8 +126,8 @@ func TestListSecurityGroups(t *testing.T) {
 		require.NoError(t, err)
 		require.Empty(t, resp.NextToken)
 		require.Len(t, resp.SecurityGroups, 3)
-		require.Equal(t, resp.SecurityGroups[0].ID, "sg-200")
-		require.Equal(t, resp.SecurityGroups[0].Name, "MySG-200")
+		require.Equal(t, "sg-200", resp.SecurityGroups[0].ID)
+		require.Equal(t, "MySG-200", resp.SecurityGroups[0].Name)
 	})
 
 	for _, tt := range []struct {
@@ -282,6 +284,10 @@ func TestConvertSecurityGroup(t *testing.T) {
 							ToPort:     aws.Int32(22),
 							IpProtocol: aws.String("tcp"),
 							IpRanges:   []ec2Types.IpRange{{CidrIp: aws.String("0.0.0.0/0")}},
+							UserIdGroupPairs: []ec2Types.UserIdGroupPair{{
+								GroupId:     aws.String("sg-123"),
+								Description: aws.String("allowed from another sg"),
+							}},
 						},
 					},
 					IpPermissionsEgress: []ec2Types.IpPermission{
@@ -298,6 +304,10 @@ func TestConvertSecurityGroup(t *testing.T) {
 							IpRanges: []ec2Types.IpRange{{
 								CidrIp:      aws.String("0.0.0.0/0"),
 								Description: aws.String("Everything"),
+							}},
+							UserIdGroupPairs: []ec2Types.UserIdGroupPair{{
+								GroupId:     aws.String("sg-456"),
+								Description: aws.String("allowed to another sg"),
 							}},
 						},
 					},
@@ -331,6 +341,7 @@ func TestConvertSecurityGroup(t *testing.T) {
 							FromPort:   22,
 							ToPort:     22,
 							CIDRs:      []CIDR{{CIDR: "0.0.0.0/0"}},
+							Groups:     []GroupIDRule{{GroupId: "sg-123", Description: "allowed from another sg"}},
 						},
 					},
 					OutboundRules: []SecurityGroupRule{
@@ -350,6 +361,7 @@ func TestConvertSecurityGroup(t *testing.T) {
 								CIDR:        "0.0.0.0/0",
 								Description: "Everything",
 							}},
+							Groups: []GroupIDRule{{GroupId: "sg-456", Description: "allowed to another sg"}},
 						},
 					},
 				},

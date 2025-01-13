@@ -1,16 +1,20 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package athena
 
@@ -20,27 +24,31 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"net/http"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3Types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	sqsTypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
+	"github.com/aws/smithy-go/tracing/smithyoteltracing"
 	"github.com/google/uuid"
 	"github.com/gravitational/trace"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/segmentio/parquet-go"
-	log "github.com/sirupsen/logrus"
-	"golang.org/x/exp/slices"
+	"github.com/parquet-go/parquet-go"
+	"go.opentelemetry.io/otel"
 
 	"github.com/gravitational/teleport"
 	apievents "github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/api/utils/retryutils"
 	"github.com/gravitational/teleport/lib/backend"
+	"github.com/gravitational/teleport/lib/defaults"
 	awsutils "github.com/gravitational/teleport/lib/utils/aws"
 )
 
@@ -67,12 +75,13 @@ const (
 // consumer is responsible for receiving messages from SQS, batching them up to
 // certain size or interval, and writes to s3 as parquet file.
 type consumer struct {
-	logger              log.FieldLogger
+	logger              *slog.Logger
 	backend             backend.Backend
 	storeLocationPrefix string
 	storeLocationBucket string
 	batchMaxItems       int
 	batchMaxInterval    time.Duration
+	consumerLockName    string
 
 	// perDateFileParquetWriter returns file writer per date.
 	// Added in config to allow testing.
@@ -82,6 +91,10 @@ type consumer struct {
 
 	sqsDeleter sqsDeleter
 	queueURL   string
+
+	// observeWriteEventsError is called once for each error (including nil
+	// errors) from writing events to S3.
+	observeWriteEventsError func(error)
 
 	// cancelRun is used to cancel consumer.Run
 	cancelRun context.CancelFunc
@@ -103,21 +116,45 @@ type s3downloader interface {
 	Download(ctx context.Context, w io.WriterAt, input *s3.GetObjectInput, options ...func(*manager.Downloader)) (n int64, err error)
 }
 
-func newConsumer(cfg Config, cancelFn context.CancelFunc, metricConsumerBatchProcessingDuration prometheus.Histogram) (*consumer, error) {
-	s3client := s3.NewFromConfig(*cfg.AWSConfig)
-	sqsClient := sqs.NewFromConfig(*cfg.AWSConfig)
+func newConsumer(cfg Config, cancelFn context.CancelFunc) (*consumer, error) {
+	// aggressively reuse connections to avoid choking up on TLS handshakes (the
+	// default value for MaxIdleConnsPerHost is 2)
+	sqsHTTPClient := awshttp.NewBuildableClient().WithTransportOptions(func(t *http.Transport) {
+		t.MaxIdleConns = defaults.HTTPMaxIdleConns
+		t.MaxIdleConnsPerHost = defaults.HTTPMaxIdleConnsPerHost
+	})
+	sqsClient := sqs.NewFromConfig(*cfg.PublisherConsumerAWSConfig,
+		func(o *sqs.Options) {
+			o.HTTPClient = sqsHTTPClient
+			o.TracerProvider = smithyoteltracing.Adapt(otel.GetTracerProvider())
+		})
+
+	s3HTTPClient := awshttp.NewBuildableClient().WithTransportOptions(func(t *http.Transport) {
+		t.MaxIdleConns = defaults.HTTPMaxIdleConns
+		t.MaxIdleConnsPerHost = defaults.HTTPMaxIdleConnsPerHost
+	})
+	publisherS3Client := s3.NewFromConfig(*cfg.PublisherConsumerAWSConfig,
+		func(o *s3.Options) {
+			o.HTTPClient = s3HTTPClient
+			o.TracerProvider = smithyoteltracing.Adapt(otel.GetTracerProvider())
+		})
+	storerS3Client := s3.NewFromConfig(*cfg.StorerQuerierAWSConfig,
+		func(o *s3.Options) {
+			o.HTTPClient = s3HTTPClient
+			o.TracerProvider = smithyoteltracing.Adapt(otel.GetTracerProvider())
+		})
 
 	collectCfg := sqsCollectConfig{
 		sqsReceiver: sqsClient,
 		queueURL:    cfg.QueueURL,
-		// TODO(tobiaszheller): use s3 manager from teleport observability.
-		payloadDownloader:                     manager.NewDownloader(s3client),
-		payloadBucket:                         cfg.largeEventsBucket,
-		visibilityTimeout:                     int32(cfg.BatchMaxInterval.Seconds()),
-		batchMaxItems:                         cfg.BatchMaxItems,
-		errHandlingFn:                         errHandlingFnFromSQS(cfg.LogEntry),
-		logger:                                cfg.LogEntry,
-		metricConsumerBatchProcessingDuration: metricConsumerBatchProcessingDuration,
+		// TODO(nklaassen): use s3 manager from teleport observability.
+		payloadDownloader: manager.NewDownloader(publisherS3Client),
+		payloadBucket:     cfg.largeEventsBucket,
+		visibilityTimeout: int32(cfg.BatchMaxInterval.Seconds()),
+		batchMaxItems:     cfg.BatchMaxItems,
+		errHandlingFn:     errHandlingFnFromSQS(&cfg),
+		logger:            cfg.Logger,
+		metrics:           cfg.metrics,
 	}
 	err := collectCfg.CheckAndSetDefaults()
 	if err != nil {
@@ -129,18 +166,26 @@ func newConsumer(cfg Config, cancelFn context.CancelFunc, metricConsumerBatchPro
 	}
 
 	return &consumer{
-		logger:              cfg.LogEntry,
+		logger:              cfg.Logger,
 		backend:             cfg.Backend,
 		storeLocationPrefix: cfg.locationS3Prefix,
 		storeLocationBucket: cfg.locationS3Bucket,
 		batchMaxItems:       cfg.BatchMaxItems,
 		batchMaxInterval:    cfg.BatchMaxInterval,
+		consumerLockName:    cfg.ConsumerLockName,
 		collectConfig:       collectCfg,
 		sqsDeleter:          sqsClient,
 		queueURL:            cfg.QueueURL,
 		perDateFileParquetWriter: func(ctx context.Context, date string) (io.WriteCloser, error) {
-			key := fmt.Sprintf("%s/%s/%s.parquet", cfg.locationS3Prefix, date, uuid.NewString())
-			fw, err := awsutils.NewS3V2FileWriter(ctx, s3client, cfg.locationS3Bucket, key, nil /* uploader options */, func(poi *s3.PutObjectInput) {
+			// use uuidv7 to give approximate time order to files. this isn't strictly necessary
+			// but it assists in bulk event export roughly progressing in time order through a given
+			// day which is what folks tend to expect.
+			id, err := uuid.NewV7()
+			if err != nil {
+				return nil, trace.Wrap(err)
+			}
+			key := fmt.Sprintf("%s/%s/%s.parquet", cfg.locationS3Prefix, date, id.String())
+			fw, err := awsutils.NewS3V2FileWriter(ctx, storerS3Client, cfg.locationS3Bucket, key, nil /* uploader options */, func(poi *s3.PutObjectInput) {
 				// ChecksumAlgorithm is required for putting objects when object lock is enabled.
 				poi.ChecksumAlgorithm = s3Types.ChecksumAlgorithmSha256
 			})
@@ -149,8 +194,9 @@ func newConsumer(cfg Config, cancelFn context.CancelFunc, metricConsumerBatchPro
 			}
 			return fw, nil
 		},
-		cancelRun: cancelFn,
-		finished:  make(chan struct{}),
+		observeWriteEventsError: cfg.ObserveWriteEventsError,
+		cancelRun:               cancelFn,
+		finished:                make(chan struct{}),
 	}, nil
 }
 
@@ -159,7 +205,7 @@ func newConsumer(cfg Config, cancelFn context.CancelFunc, metricConsumerBatchPro
 func (c *consumer) run(ctx context.Context) {
 	defer func() {
 		close(c.finished)
-		c.logger.Debug("Consumer finished")
+		c.logger.DebugContext(ctx, "Consumer finished")
 	}()
 	c.runContinuouslyOnSingleAuth(ctx, c.processEventsContinuously)
 }
@@ -183,19 +229,20 @@ func (c *consumer) Close() error {
 func (c *consumer) processEventsContinuously(ctx context.Context) {
 	processBatchOfEventsWithLogging := func(context.Context) (reachedMaxBatch bool) {
 		reachedMaxBatch, err := c.processBatchOfEvents(ctx)
+		c.observeWriteEventsError(err)
 		if err != nil {
 			// Ctx.Cancel is used to stop batcher
 			if ctx.Err() != nil {
 				return false
 			}
-			c.logger.Errorf("Batcher single run failed: %v", err)
+			c.logger.ErrorContext(ctx, "Batcher single run failed", "error", err)
 			return false
 		}
 		return reachedMaxBatch
 	}
 
-	c.logger.Debug("Processing of events started on this instance")
-	defer c.logger.Debug("Processing of events finished on this instance")
+	c.logger.DebugContext(ctx, "Processing of events started on this instance")
+	defer c.logger.DebugContext(ctx, "Processing of events finished on this instance")
 
 	// If batch took 90% of specified interval, we don't want to wait just little bit.
 	// It's mainly to avoid cases when we will wait like 10ms.
@@ -218,16 +265,20 @@ func (c *consumer) processEventsContinuously(ctx context.Context) {
 // Backend locking is used to make sure that only single auth is running consumer.
 func (c *consumer) runContinuouslyOnSingleAuth(ctx context.Context, eventsProcessorFn func(context.Context)) {
 	// for 1 minute it will be 5s sleep before retry which seems like reasonable value.
-	waitTimeAfterLockingError := retryutils.NewSeventhJitter()(c.batchMaxInterval / 12)
+	waitTimeAfterLockingError := retryutils.SeventhJitter(c.batchMaxInterval / 12)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
+			lockName := []string{"athena", c.consumerLockName}
+			if c.consumerLockName == "" {
+				lockName = []string{"athena_lock"}
+			}
 			err := backend.RunWhileLocked(ctx, backend.RunWhileLockedConfig{
 				LockConfiguration: backend.LockConfiguration{
-					Backend:  c.backend,
-					LockName: "athena_lock",
+					Backend:            c.backend,
+					LockNameComponents: lockName,
 					// TTL is higher then batchMaxInterval because we want to optimize
 					// for low backend writes.
 					TTL: 5 * c.batchMaxInterval,
@@ -245,7 +296,7 @@ func (c *consumer) runContinuouslyOnSingleAuth(ctx context.Context, eventsProces
 				}
 				// Ending up here means something went wrong in the backend while locking/waiting
 				// for lock. What we can do is log and retry whole operation.
-				c.logger.WithError(err).Warn("Could not get consumer to run with lock")
+				c.logger.WarnContext(ctx, "Could not get consumer to run with lock", "error", err)
 				select {
 				// Use wait to make sure we won't spam CPU with a lot requests
 				// if something goes wrong during acquire lock.
@@ -293,8 +344,8 @@ func (c *consumer) processBatchOfEvents(ctx context.Context) (reachedMaxSize boo
 	start := time.Now()
 	var size int
 	defer func() {
-		consumerLastProcessedTimestamp.SetToCurrentTime()
-		c.collectConfig.metricConsumerBatchProcessingDuration.Observe(time.Since(start).Seconds())
+		c.collectConfig.metrics.consumerLastProcessedTimestamp.SetToCurrentTime()
+		c.collectConfig.metrics.consumerBatchProcessingDuration.Observe(time.Since(start).Seconds())
 	}()
 
 	msgsCollector := newSqsMessagesCollector(c.collectConfig)
@@ -341,10 +392,10 @@ type sqsCollectConfig struct {
 	// noOfWorkers defines how many workers are processing messages from queue.
 	noOfWorkers int
 
-	logger        log.FieldLogger
+	logger        *slog.Logger
 	errHandlingFn func(ctx context.Context, errC chan error)
 
-	metricConsumerBatchProcessingDuration prometheus.Histogram
+	metrics *athenaMetrics
 }
 
 func (cfg *sqsCollectConfig) CheckAndSetDefaults() error {
@@ -382,15 +433,13 @@ func (cfg *sqsCollectConfig) CheckAndSetDefaults() error {
 		cfg.noOfWorkers = 5
 	}
 	if cfg.logger == nil {
-		cfg.logger = log.WithFields(log.Fields{
-			trace.Component: teleport.ComponentAthena,
-		})
+		cfg.logger = slog.With(teleport.ComponentKey, teleport.ComponentAthena)
 	}
 	if cfg.errHandlingFn == nil {
 		return trace.BadParameter("errHandlingFn is not specified")
 	}
-	if cfg.metricConsumerBatchProcessingDuration == nil {
-		return trace.BadParameter("metricConsumerBatchProcessingDuration is not specified")
+	if cfg.metrics == nil {
+		return trace.BadParameter("metrics is not specified")
 	}
 	return nil
 }
@@ -421,9 +470,7 @@ func (s *sqsMessagesCollector) getEventsChan() <-chan eventAndAckID {
 // It runs until context is canceled (via timeout) or when maxItems is reached.
 // MaxItems is soft limit and can happen that it will return more items then MaxItems.
 func (s *sqsMessagesCollector) fromSQS(ctx context.Context) {
-	// Errors should be immediately process by error handling loop, so 10 size
-	// should be enough to not cause blocking.
-	errorsC := make(chan error, 10)
+	errorsC := make(chan error)
 	defer close(errorsC)
 
 	// errhandle loop for receiving single event errors.
@@ -470,7 +517,7 @@ func (s *sqsMessagesCollector) fromSQS(ctx context.Context) {
 				if isOverBatch || isOverMaximumUniqueDays {
 					fullBatchMetadataMu.Unlock()
 					cancel()
-					s.cfg.logger.Debugf("Batcher aborting early because of maxSize: %v, or maxUniqueDays %v", isOverBatch, isOverMaximumUniqueDays)
+					s.cfg.logger.DebugContext(ctx, "Batcher aborting early", "max_size", isOverBatch, "max_unique_days", isOverMaximumUniqueDays)
 					return
 				}
 				fullBatchMetadataMu.Unlock()
@@ -480,12 +527,12 @@ func (s *sqsMessagesCollector) fromSQS(ctx context.Context) {
 	wg.Wait()
 	close(eventsC)
 	if fullBatchMetadata.Count > 0 {
-		consumerBatchCount.Add(float64(fullBatchMetadata.Count))
-		consumerBatchSize.Observe(float64(fullBatchMetadata.Size))
-		consumerAgeOfOldestProcessedMessage.Set(time.Since(fullBatchMetadata.OldestTimestamp).Seconds())
+		s.cfg.metrics.consumerBatchCount.Add(float64(fullBatchMetadata.Count))
+		s.cfg.metrics.consumerBatchSize.Observe(float64(fullBatchMetadata.Size))
+		s.cfg.metrics.consumerAgeOfOldestProcessedMessage.Set(time.Since(fullBatchMetadata.OldestTimestamp).Seconds())
 	} else {
 		// When no messages were processed, clear gauge metric.
-		consumerAgeOfOldestProcessedMessage.Set(0)
+		s.cfg.metrics.consumerAgeOfOldestProcessedMessage.Set(0)
 	}
 }
 
@@ -558,7 +605,11 @@ func (s *sqsMessagesCollector) receiveMessagesAndSendOnChan(ctx context.Context,
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return collectedEventsMetadata{}
 		}
-		errorsC <- trace.Wrap(err)
+		select {
+		case errorsC <- trace.Wrap(err):
+		case <-ctx.Done():
+			return collectedEventsMetadata{}
+		}
 
 		// We don't want to retry receiving message immediately to prevent huge load
 		// on CPU if calls are contantly failing.
@@ -576,7 +627,10 @@ func (s *sqsMessagesCollector) receiveMessagesAndSendOnChan(ctx context.Context,
 	for _, msg := range sqsOut.Messages {
 		event, err := s.auditEventFromSQSorS3(ctx, msg)
 		if err != nil {
-			errorsC <- trace.Wrap(err)
+			select {
+			case errorsC <- trace.Wrap(err):
+			case <-ctx.Done():
+			}
 			continue
 		}
 		eventsC <- eventAndAckID{
@@ -585,7 +639,7 @@ func (s *sqsMessagesCollector) receiveMessagesAndSendOnChan(ctx context.Context,
 		}
 		messageSentTimestamp, err := getMessageSentTimestamp(msg)
 		if err != nil {
-			s.cfg.logger.Debugf("Failed to get sentTimestamp: %v", err)
+			s.cfg.logger.DebugContext(ctx, "Failed to get sentTimestamp", "error", err)
 		}
 		singleReceiveMetadata.MergeWithEvent(event, messageSentTimestamp)
 	}
@@ -665,15 +719,15 @@ type eventAndAckID struct {
 	receiptHandle string
 }
 
-func errHandlingFnFromSQS(logger log.FieldLogger) func(ctx context.Context, errC chan error) {
+func errHandlingFnFromSQS(cfg *Config) func(ctx context.Context, errC chan error) {
 	return func(ctx context.Context, errC chan error) {
 		var errorsCount int
 
 		defer func() {
 			if errorsCount > maxErrorCountForLogsOnSQSReceive {
-				logger.Errorf("Got %d errors from SQS collector, printed only first %d", errorsCount, maxErrorCountForLogsOnSQSReceive)
+				cfg.Logger.ErrorContext(ctx, "Got errors from SQS collector", "error_count", errorsCount)
 			}
-			consumerNumberOfErrorsFromSQSCollect.Add(float64(errorsCount))
+			cfg.metrics.consumerNumberOfErrorsFromSQSCollect.Add(float64(errorsCount))
 		}()
 
 		for {
@@ -687,7 +741,7 @@ func errHandlingFnFromSQS(logger log.FieldLogger) func(ctx context.Context, errC
 				}
 				errorsCount++
 				if errorsCount <= maxErrorCountForLogsOnSQSReceive {
-					logger.WithError(err).Error("Failure processing SQS messages")
+					cfg.Logger.ErrorContext(ctx, "Failure processing SQS messages", "error", err)
 				}
 			}
 		}
@@ -708,7 +762,7 @@ func (s *sqsMessagesCollector) downloadEventFromS3(ctx context.Context, payload 
 	path := s3Payload.GetPath()
 	versionID := s3Payload.GetVersionId()
 
-	s.cfg.logger.Debugf("Downloading %v %v [%v].", s.cfg.payloadBucket, path, versionID)
+	s.cfg.logger.DebugContext(ctx, "Downloading event from S3", "bucket", s.cfg.payloadBucket, "path", path, "version", versionID)
 
 	var versionIDPtr *string
 	if versionID != "" {
@@ -749,7 +803,7 @@ eventLoop:
 			}
 			pqtEvent, err := auditEventToParquet(eventAndAckID.event)
 			if err != nil {
-				c.logger.WithError(err).Error("Could not convert event to parquet format")
+				c.logger.ErrorContext(ctx, "Could not convert event to parquet format", "error", err)
 				continue
 			}
 			date := pqtEvent.EventTime.Format(time.DateOnly)
@@ -790,7 +844,7 @@ eventLoop:
 	}
 	eventLoopFinishedTime := time.Now()
 	defer func() {
-		consumerS3parquetFlushDuration.Observe(time.Since(eventLoopFinishedTime).Seconds())
+		c.collectConfig.metrics.consumerS3parquetFlushDuration.Observe(time.Since(eventLoopFinishedTime).Seconds())
 	}()
 	for _, pw := range perDateWriter {
 		if err := pw.Close(); err != nil {
@@ -835,7 +889,7 @@ func (c *consumer) deleteMessagesFromQueue(ctx context.Context, handles []string
 	}
 	start := time.Now()
 	defer func() {
-		consumerDeleteMessageDuration.Observe(time.Since(start).Seconds())
+		c.collectConfig.metrics.consumerDeleteMessageDuration.Observe(time.Since(start).Seconds())
 	}()
 	const (
 		// maxDeleteBatchSize defines maximum number of handles passed to deleteMessage endpoint, limited by AWS.

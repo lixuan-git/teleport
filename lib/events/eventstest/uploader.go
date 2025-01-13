@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package eventstest
 
@@ -53,6 +55,8 @@ type MemoryUploader struct {
 	objects map[session.ID][]byte
 	eventsC chan events.UploadEvent
 
+	// Clock is an optional [clockwork.Clock] to determine the time to associate
+	// with uploads and parts.
 	Clock clockwork.Clock
 }
 
@@ -61,7 +65,7 @@ type MemoryUpload struct {
 	// id is the upload ID
 	id string
 	// parts is the upload parts
-	parts map[int64][]byte
+	parts map[int64]part
 	// sessionID is the session ID associated with the upload
 	sessionID session.ID
 	//completed specifies upload as completed
@@ -69,6 +73,11 @@ type MemoryUpload struct {
 	// Initiated contains the timestamp of when the upload
 	// was initiated, not always initialized
 	Initiated time.Time
+}
+
+type part struct {
+	data         []byte
+	lastModified time.Time
 }
 
 func (m *MemoryUploader) trySendEvent(event events.UploadEvent) {
@@ -96,6 +105,7 @@ func (m *MemoryUploader) CreateUpload(ctx context.Context, sessionID session.ID)
 	upload := &events.StreamUpload{
 		ID:        uuid.New().String(),
 		SessionID: sessionID,
+		Initiated: time.Now(),
 	}
 	if m.Clock != nil {
 		upload.Initiated = m.Clock.Now()
@@ -103,7 +113,7 @@ func (m *MemoryUploader) CreateUpload(ctx context.Context, sessionID session.ID)
 	m.uploads[upload.ID] = &MemoryUpload{
 		id:        upload.ID,
 		sessionID: sessionID,
-		parts:     make(map[int64][]byte),
+		parts:     make(map[int64]part),
 		Initiated: upload.Initiated,
 	}
 	return upload, nil
@@ -125,11 +135,11 @@ func (m *MemoryUploader) CompleteUpload(ctx context.Context, upload events.Strea
 	partsSet := make(map[int64]bool, len(parts))
 	for _, part := range parts {
 		partsSet[part.Number] = true
-		data, ok := up.parts[part.Number]
+		upPart, ok := up.parts[part.Number]
 		if !ok {
 			return trace.NotFound("part %v has not been uploaded", part.Number)
 		}
-		result = append(result, data...)
+		result = append(result, upPart.data...)
 	}
 	// exclude parts that are not requested to be completed
 	for number := range up.parts {
@@ -155,8 +165,15 @@ func (m *MemoryUploader) UploadPart(ctx context.Context, upload events.StreamUpl
 	if !ok {
 		return nil, trace.NotFound("upload %q is not found", upload.ID)
 	}
-	up.parts[partNumber] = data
-	return &events.StreamPart{Number: partNumber}, nil
+	lastModified := time.Now()
+	if m.Clock != nil {
+		lastModified = m.Clock.Now()
+	}
+	up.parts[partNumber] = part{
+		data:         data,
+		lastModified: lastModified,
+	}
+	return &events.StreamPart{Number: partNumber, LastModified: lastModified}, nil
 }
 
 // ListUploads lists uploads that have been initiated but not completed with
@@ -197,7 +214,7 @@ func (m *MemoryUploader) GetParts(uploadID string) ([][]byte, error) {
 		return partNumbers[i] < partNumbers[j]
 	})
 	for _, partNumber := range partNumbers {
-		sortedParts = append(sortedParts, up.parts[partNumber])
+		sortedParts = append(sortedParts, up.parts[partNumber].data)
 	}
 	return sortedParts, nil
 }
@@ -277,5 +294,58 @@ func (m *MemoryUploader) GetUploadMetadata(sid session.ID) events.UploadMetadata
 
 // ReserveUploadPart reserves an upload part.
 func (m *MemoryUploader) ReserveUploadPart(ctx context.Context, upload events.StreamUpload, partNumber int64) error {
+	return nil
+}
+
+// MockUploader is a limited implementation of [events.MultipartUploader] that
+// allows injecting errors for testing purposes. [MemoryUploader] is a more
+// complete implementation and should be preferred for testing the happy path.
+type MockUploader struct {
+	events.MultipartUploader
+
+	CreateUploadError      error
+	ReserveUploadPartError error
+
+	MockListParts      func(ctx context.Context, upload events.StreamUpload) ([]events.StreamPart, error)
+	MockListUploads    func(ctx context.Context) ([]events.StreamUpload, error)
+	MockCompleteUpload func(ctx context.Context, upload events.StreamUpload, parts []events.StreamPart) error
+}
+
+func (m *MockUploader) CreateUpload(ctx context.Context, sessionID session.ID) (*events.StreamUpload, error) {
+	if m.CreateUploadError != nil {
+		return nil, m.CreateUploadError
+	}
+
+	return &events.StreamUpload{
+		ID:        uuid.New().String(),
+		SessionID: sessionID,
+	}, nil
+}
+
+func (m *MockUploader) ReserveUploadPart(_ context.Context, _ events.StreamUpload, _ int64) error {
+	return m.ReserveUploadPartError
+}
+
+func (m *MockUploader) ListParts(ctx context.Context, upload events.StreamUpload) ([]events.StreamPart, error) {
+	if m.MockListParts != nil {
+		return m.MockListParts(ctx, upload)
+	}
+
+	return []events.StreamPart{}, nil
+}
+
+func (m *MockUploader) ListUploads(ctx context.Context) ([]events.StreamUpload, error) {
+	if m.MockListUploads != nil {
+		return m.MockListUploads(ctx)
+	}
+
+	return nil, nil
+}
+
+func (m *MockUploader) CompleteUpload(ctx context.Context, upload events.StreamUpload, parts []events.StreamPart) error {
+	if m.MockCompleteUpload != nil {
+		return m.MockCompleteUpload(ctx, upload, parts)
+	}
+
 	return nil
 }

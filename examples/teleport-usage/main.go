@@ -17,18 +17,21 @@ limitations under the License.
 package main
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/aws/endpoints"
 	awsrequest "github.com/aws/aws-sdk-go/aws/request"
 	awssession "github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
@@ -61,6 +64,15 @@ func main() {
 	// If this is too high and we encounter throttling that could impede Teleport, it will be adjusted automatically.
 	limiter := newAdaptiveRateLimiter(25)
 
+	// Check the package name for one of the boring primitives. If the package
+	// path is from BoringCrypto, we know this binary was compiled using
+	// `GOEXPERIMENT=boringcrypto`.
+	hash := sha256.New()
+	useFIPSEndpoint := endpoints.FIPSEndpointStateUnset
+	if reflect.TypeOf(hash).Elem().PkgPath() == "crypto/internal/boring" {
+		useFIPSEndpoint = endpoints.FIPSEndpointStateEnabled
+	}
+
 	// create an AWS session using default SDK behavior, i.e. it will interpret
 	// the environment and ~/.aws directory just like an AWS CLI tool would:
 	session, err := awssession.NewSessionWithOptions(awssession.Options{
@@ -69,6 +81,7 @@ func main() {
 			Retryer:                       limiter,
 			Region:                        aws.String(params.awsRegion),
 			CredentialsChainVerboseErrors: aws.Bool(true),
+			UseFIPSEndpoint:               useFIPSEndpoint,
 		},
 	})
 	if err != nil {
@@ -321,7 +334,7 @@ func (a *adaptiveRateLimiter) wait(permits float64) {
 	durationToWait := time.Duration(permits / a.permitCapacity * float64(time.Second))
 	time.Sleep(durationToWait)
 
-	if rand.Intn(10) == 0 {
+	if rand.N(10) == 0 {
 		a.adjustUp()
 	}
 }

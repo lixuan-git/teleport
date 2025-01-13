@@ -1,23 +1,22 @@
-/*
-Copyright 2020-2022 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React from 'react';
-
-import { WelcomeWrapper } from 'design/Onboard/WelcomeWrapper';
-
+import { WelcomeWrapper } from 'teleport/components/Onboard';
 import {
   NewMfaDevice,
   NewMfaDeviceProps,
@@ -51,6 +50,15 @@ export const PrimaryPasswordWithMfa = () =>
 export const PrimaryPasswordlessNoMfa = () =>
   renderNewCredentials({ primaryAuthType: 'passwordless' });
 
+export const PrimaryPasswordlessPasskeyCreated = () =>
+  renderNewCredentials({
+    primaryAuthType: 'passwordless',
+    credential: {
+      id: 'some-credential',
+      type: 'public-key',
+    },
+  });
+
 export const PrimaryPasswordlessWithMfa = () =>
   renderNewCredentials({
     primaryAuthType: 'passwordless',
@@ -69,21 +77,40 @@ export const PrimaryPasswordlessError = () =>
 export const MfaDeviceOtp = () =>
   renderMfaFlow({
     auth2faType: 'otp',
+    stepIndex: 1,
+    flowLength: 2,
   });
 
 export const MfaDeviceWebauthn = () =>
   renderMfaFlow({
     auth2faType: 'webauthn',
+    stepIndex: 1,
+    flowLength: 2,
+  });
+
+export const MfaDeviceWebauthnKeyCreated = () =>
+  renderMfaFlow({
+    auth2faType: 'webauthn',
+    credential: {
+      id: 'some-credential',
+      type: 'public-key',
+    },
+    stepIndex: 1,
+    flowLength: 2,
   });
 
 export const MfaDeviceOptional = () =>
   renderMfaFlow({
     auth2faType: 'optional',
+    stepIndex: 1,
+    flowLength: 2,
   });
 
 export const MfaDeviceOn = () =>
   renderMfaFlow({
     auth2faType: 'on',
+    stepIndex: 1,
+    flowLength: 2,
   });
 
 export const MfaDeviceError = () =>
@@ -93,6 +120,8 @@ export const MfaDeviceError = () =>
       status: 'failed',
       statusText: 'some server error message',
     },
+    stepIndex: 1,
+    flowLength: 2,
   });
 
 export const ExpiredInvite = () =>
@@ -137,19 +166,6 @@ export const SuccessReset = () =>
     resetMode: true,
   });
 
-export const SuccessAndPrivateKeyEnabledRegister = () =>
-  renderNewCredentials({
-    success: true,
-    privateKeyPolicyEnabled: true,
-  });
-
-export const SuccessAndPrivateKeyEnabledReset = () =>
-  renderNewCredentials({
-    success: true,
-    resetMode: true,
-    privateKeyPolicyEnabled: true,
-  });
-
 export const SuccessRegisterDashboard = () =>
   renderNewCredentials({
     success: true,
@@ -176,6 +192,8 @@ const makeNewMfaDeviceProps = (
       hasTransitionEnded: true,
       password: '',
       updatePassword: () => null,
+      stepIndex: 0,
+      flowLength: 1,
     },
     overrides
   );
@@ -193,12 +211,12 @@ const makeNewCredProps = (
       clearSubmitAttempt: () => null,
       fetchAttempt: { status: 'success' },
       onSubmitWithWebauthn: () => null,
+      createNewWebAuthnDevice: () => null,
       onSubmit: () => null,
       redirect: () => null,
       success: false,
       finishedRegister: () => null,
       recoveryCodes: null,
-      privateKeyPolicyEnabled: false,
       resetToken: {
         user: 'john@example.com',
         tokenId: 'test123',
@@ -281,7 +299,7 @@ const renderNewCredentials = (partialProps: Partial<NewCredentialsProps>) => {
  * @param partialProps - partial NewCredentialProps to override default values on individual stories
  *
  */
-const renderMfaFlow = (partialProps: Partial<NewCredentialsProps>) => {
+const renderMfaFlow = (partialProps: Partial<NewMfaDeviceProps>) => {
   const props = makeNewMfaDeviceProps(partialProps);
 
   return (

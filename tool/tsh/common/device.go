@@ -1,31 +1,39 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package common
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/gravitational/trace"
 	"google.golang.org/protobuf/encoding/protojson"
 
+	"github.com/gravitational/teleport"
 	devicepb "github.com/gravitational/teleport/api/gen/proto/go/teleport/devicetrust/v1"
 	"github.com/gravitational/teleport/lib/client"
 	"github.com/gravitational/teleport/lib/devicetrust"
 	"github.com/gravitational/teleport/lib/devicetrust/enroll"
 	dtnative "github.com/gravitational/teleport/lib/devicetrust/native"
+	"github.com/gravitational/teleport/lib/linux"
 )
 
 type deviceCommand struct {
@@ -39,6 +47,10 @@ type deviceCommand struct {
 	// activateCredential is a hidden command invoked on an elevated child
 	// process
 	activateCredential *deviceActivateCredentialCommand
+
+	// dmiRead is a hidden command invoked on an elevated child to read the
+	// device's DMI information.
+	dmiRead *deviceDMIReadCommand
 }
 
 func newDeviceCommand(app *kingpin.Application) *deviceCommand {
@@ -48,6 +60,7 @@ func newDeviceCommand(app *kingpin.Application) *deviceCommand {
 		assetTag:           &deviceAssetTagCommand{},
 		keyget:             &deviceKeygetCommand{},
 		activateCredential: &deviceActivateCredentialCommand{},
+		dmiRead:            &deviceDMIReadCommand{},
 	}
 
 	// "tsh device" command.
@@ -67,6 +80,8 @@ func newDeviceCommand(app *kingpin.Application) *deviceCommand {
 	root.collect.CmdClause = parentCmd.Command("collect", "Simulate enroll/authn device data collection").Hidden()
 	root.assetTag.CmdClause = parentCmd.Command("asset-tag", "Print the detected device asset tag").Hidden()
 	root.keyget.CmdClause = parentCmd.Command("keyget", "Get information about the device key").Hidden()
+
+	// Windows TPM hidden support commands.
 	root.activateCredential.CmdClause = parentCmd.Command("tpm-activate-credential", "").Hidden()
 	root.activateCredential.Flag("encrypted-credential", "").
 		Required().
@@ -74,6 +89,10 @@ func newDeviceCommand(app *kingpin.Application) *deviceCommand {
 	root.activateCredential.Flag("encrypted-credential-secret", "").
 		Required().
 		StringVar(&root.activateCredential.encryptedCredentialSecret)
+
+	// Linux TPM hidden support commands.
+	root.dmiRead.CmdClause = parentCmd.Command("dmi-read", "Read device DMI information").Hidden()
+
 	return root
 }
 
@@ -98,13 +117,13 @@ func (c *deviceEnrollCommand) run(cf *CLIConf) error {
 
 	ctx := cf.Context
 	return trace.Wrap(client.RetryWithRelogin(ctx, teleportClient, func() error {
-		proxyClient, err := teleportClient.ConnectToProxy(ctx)
+		clusterClient, err := teleportClient.ConnectToCluster(ctx)
 		if err != nil {
 			return trace.Wrap(err)
 		}
-		defer proxyClient.Close()
+		defer clusterClient.Close()
 
-		authClient, err := proxyClient.ConnectToRootCluster(ctx)
+		authClient, err := clusterClient.ConnectToRootCluster(ctx)
 		if err != nil {
 			return trace.Wrap(err)
 		}
@@ -115,20 +134,20 @@ func (c *deviceEnrollCommand) run(cf *CLIConf) error {
 		// Admin fast-tracked enrollment.
 		if c.currentDevice {
 			dev, outcome, err := enrollCeremony.RunAdmin(ctx, devices, cf.Debug)
-			printEnrollOutcome(outcome, dev) // Report partial successes.
+			printEnrollOutcome(cf.Stdout(), outcome, dev) // Report partial successes.
 			return trace.Wrap(err)
 		}
 
 		// End-user enrollment.
 		dev, err := enrollCeremony.Run(ctx, devices, cf.Debug, c.token)
 		if err == nil {
-			printEnrollOutcome(enroll.DeviceEnrolled, dev)
+			printEnrollOutcome(cf.Stdout(), enroll.DeviceEnrolled, dev)
 		}
 		return trace.Wrap(err)
 	}))
 }
 
-func printEnrollOutcome(outcome enroll.RunAdminOutcome, dev *devicepb.Device) {
+func printEnrollOutcome(out io.Writer, outcome enroll.RunAdminOutcome, dev *devicepb.Device) {
 	var action string
 	switch outcome {
 	case enroll.DeviceRegisteredAndEnrolled:
@@ -141,7 +160,14 @@ func printEnrollOutcome(outcome enroll.RunAdminOutcome, dev *devicepb.Device) {
 		return // All actions failed, don't print anything.
 	}
 
-	fmt.Printf(
+	// This shouldn't happen, but let's play it safe and avoid a silly panic.
+	if dev == nil {
+		fmt.Fprintf(out, "Device %v\n", action)
+		return
+	}
+
+	fmt.Fprintf(
+		out,
 		"Device %q/%v %v\n",
 		dev.AssetTag, devicetrust.FriendlyOSType(dev.OsType), action)
 }
@@ -151,7 +177,7 @@ type deviceCollectCommand struct {
 }
 
 func (c *deviceCollectCommand) run(cf *CLIConf) error {
-	cdd, err := dtnative.CollectDeviceData()
+	cdd, err := dtnative.CollectDeviceData(dtnative.CollectedDataAlwaysEscalate)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -165,7 +191,7 @@ func (c *deviceCollectCommand) run(cf *CLIConf) error {
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	fmt.Printf("DeviceCollectedData %s\n", val)
+	fmt.Fprintf(cf.Stdout(), "DeviceCollectedData %s\n", val)
 	return nil
 }
 
@@ -174,12 +200,12 @@ type deviceAssetTagCommand struct {
 }
 
 func (c *deviceAssetTagCommand) run(cf *CLIConf) error {
-	cdd, err := dtnative.CollectDeviceData()
+	cdd, err := dtnative.CollectDeviceData(dtnative.CollectedDataAlwaysEscalate)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
-	fmt.Println(cdd.SerialNumber)
+	fmt.Fprintln(cf.Stdout(), cdd.SerialNumber)
 	return nil
 }
 
@@ -202,7 +228,7 @@ func (c *deviceKeygetCommand) run(cf *CLIConf) error {
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	fmt.Printf("DeviceCredential %s\n", val)
+	fmt.Fprintf(cf.Stdout(), "DeviceCredential %s\n", val)
 	return nil
 }
 
@@ -222,8 +248,27 @@ func (c *deviceActivateCredentialCommand) run(cf *CLIConf) error {
 		// On error, wait for user input before executing. This is because this
 		// opens in a second window. If we return the error immediately, then
 		// this window closes before the user can inspect it.
-		log.WithError(err).Error("An error occurred during credential activation. Press enter to close this window.")
+		logger.ErrorContext(cf.Context, "An error occurred during credential activation, press enter to close this window", "error", err)
 		_, _ = fmt.Scanln()
 	}
 	return trace.Wrap(err)
+}
+
+type deviceDMIReadCommand struct {
+	*kingpin.CmdClause
+}
+
+func (c *deviceDMIReadCommand) run(cf *CLIConf) error {
+	dmiInfo, err := linux.DMIInfoFromSysfs()
+	if err != nil {
+		logger.WarnContext(cf.Context, "Failed to read DMI information",
+			teleport.ComponentKey, "DeviceTrust",
+			"error", err,
+		)
+		// err swallowed on purpose.
+	}
+	if dmiInfo != nil {
+		_ = json.NewEncoder(cf.Stdout()).Encode(dmiInfo)
+	}
+	return nil
 }

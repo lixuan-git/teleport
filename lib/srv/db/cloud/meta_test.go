@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package cloud
 
@@ -20,11 +22,13 @@ import (
 	"context"
 	"testing"
 
-	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/rds"
+	rdstypes "github.com/aws/aws-sdk-go-v2/service/rds/types"
+	"github.com/aws/aws-sdk-go-v2/service/redshift"
+	redshifttypes "github.com/aws/aws-sdk-go-v2/service/redshift/types"
 	"github.com/aws/aws-sdk-go/service/elasticache"
 	"github.com/aws/aws-sdk-go/service/memorydb"
-	"github.com/aws/aws-sdk-go/service/rds"
-	"github.com/aws/aws-sdk-go/service/redshift"
 	"github.com/aws/aws-sdk-go/service/redshiftserverless"
 	"github.com/stretchr/testify/require"
 
@@ -37,8 +41,8 @@ import (
 // TestAWSMetadata tests fetching AWS metadata for RDS and Redshift databases.
 func TestAWSMetadata(t *testing.T) {
 	// Configure RDS API mock.
-	rds := &mocks.RDSMock{
-		DBInstances: []*rds.DBInstance{
+	rdsClt := &mocks.RDSClient{
+		DBInstances: []rdstypes.DBInstance{
 			// Standalone RDS instance.
 			{
 				DBInstanceArn:                    aws.String("arn:aws:rds:us-west-1:123456789012:db:postgres-rds"),
@@ -53,7 +57,7 @@ func TestAWSMetadata(t *testing.T) {
 				DBClusterIdentifier:  aws.String("postgres-aurora"),
 			},
 		},
-		DBClusters: []*rds.DBCluster{
+		DBClusters: []rdstypes.DBCluster{
 			// Aurora cluster.
 			{
 				DBClusterArn:        aws.String("arn:aws:rds:us-east-1:123456789012:cluster:postgres-aurora"),
@@ -61,23 +65,24 @@ func TestAWSMetadata(t *testing.T) {
 				DbClusterResourceId: aws.String("cluster-xyz"),
 			},
 		},
-		DBProxies: []*rds.DBProxy{
+		DBProxies: []rdstypes.DBProxy{
 			{
 				DBProxyArn:  aws.String("arn:aws:rds:us-east-1:123456789012:db-proxy:prx-resource-id"),
 				DBProxyName: aws.String("rds-proxy"),
 			},
 		},
-		DBProxyEndpoints: []*rds.DBProxyEndpoint{
+		DBProxyEndpoints: []rdstypes.DBProxyEndpoint{
 			{
 				DBProxyEndpointName: aws.String("rds-proxy-endpoint"),
 				DBProxyName:         aws.String("rds-proxy"),
+				Endpoint:            aws.String("localhost"),
 			},
 		},
 	}
 
 	// Configure Redshift API mock.
-	redshift := &mocks.RedshiftMock{
-		Clusters: []*redshift.Cluster{
+	redshiftClt := &mocks.RedshiftClient{
+		Clusters: []redshifttypes.Cluster{
 			{
 				ClusterNamespaceArn: aws.String("arn:aws:redshift:us-west-1:123456789012:namespace:namespace-id"),
 				ClusterIdentifier:   aws.String("redshift-cluster-1"),
@@ -114,7 +119,7 @@ func TestAWSMetadata(t *testing.T) {
 		},
 	}
 
-	stsMock := &mocks.STSMock{}
+	fakeSTS := &mocks.STSClient{}
 
 	// Configure Redshift Serverless API mock.
 	redshiftServerlessWorkgroup := mocks.RedshiftServerlessWorkgroup("my-workgroup", "us-west-1")
@@ -127,12 +132,17 @@ func TestAWSMetadata(t *testing.T) {
 	// Create metadata fetcher.
 	metadata, err := NewMetadata(MetadataConfig{
 		Clients: &cloud.TestCloudClients{
-			RDS:                rds,
-			Redshift:           redshift,
 			ElastiCache:        elasticache,
 			MemoryDB:           memorydb,
 			RedshiftServerless: redshiftServerless,
-			STS:                stsMock,
+			STS:                &fakeSTS.STSClientV1,
+		},
+		AWSConfigProvider: &mocks.AWSConfigProvider{
+			STSClient: fakeSTS,
+		},
+		awsClients: fakeAWSClients{
+			rdsClient:      rdsClt,
+			redshiftClient: redshiftClt,
 		},
 	})
 	require.NoError(t, err)
@@ -390,9 +400,9 @@ func TestAWSMetadata(t *testing.T) {
 			err = metadata.Update(ctx, database)
 			require.NoError(t, err)
 			require.Equal(t, test.outAWS, database.GetAWS())
-			require.Equal(t, []string{test.inAWS.AssumeRoleARN}, stsMock.GetAssumedRoleARNs())
-			require.Equal(t, []string{test.inAWS.ExternalID}, stsMock.GetAssumedRoleExternalIDs())
-			stsMock.ResetAssumeRoleHistory()
+			require.Equal(t, []string{test.inAWS.AssumeRoleARN}, fakeSTS.GetAssumedRoleARNs())
+			require.Equal(t, []string{test.inAWS.ExternalID}, fakeSTS.GetAssumedRoleExternalIDs())
+			fakeSTS.ResetAssumeRoleHistory()
 		})
 	}
 }
@@ -401,17 +411,22 @@ func TestAWSMetadata(t *testing.T) {
 // cause an error.
 func TestAWSMetadataNoPermissions(t *testing.T) {
 	// Create unauthorized mocks.
-	rds := &mocks.RDSMockUnauth{}
-	redshift := &mocks.RedshiftMockUnauth{}
+	rdsClt := &mocks.RDSClient{Unauth: true}
+	redshiftClt := &mocks.RedshiftClient{Unauth: true}
 
-	stsMock := &mocks.STSMock{}
+	fakeSTS := &mocks.STSClient{}
 
 	// Create metadata fetcher.
 	metadata, err := NewMetadata(MetadataConfig{
 		Clients: &cloud.TestCloudClients{
-			RDS:      rds,
-			Redshift: redshift,
-			STS:      stsMock,
+			STS: &fakeSTS.STSClientV1,
+		},
+		AWSConfigProvider: &mocks.AWSConfigProvider{
+			STSClient: fakeSTS,
+		},
+		awsClients: fakeAWSClients{
+			rdsClient:      rdsClt,
+			redshiftClient: redshiftClt,
 		},
 	})
 	require.NoError(t, err)
@@ -478,9 +493,22 @@ func TestAWSMetadataNoPermissions(t *testing.T) {
 			err = metadata.Update(ctx, database)
 			require.NoError(t, err)
 			require.Equal(t, test.meta, database.GetAWS())
-			require.Equal(t, []string{test.meta.AssumeRoleARN}, stsMock.GetAssumedRoleARNs())
-			require.Equal(t, []string{test.meta.ExternalID}, stsMock.GetAssumedRoleExternalIDs())
-			stsMock.ResetAssumeRoleHistory()
+			require.Equal(t, []string{test.meta.AssumeRoleARN}, fakeSTS.GetAssumedRoleARNs())
+			require.Equal(t, []string{test.meta.ExternalID}, fakeSTS.GetAssumedRoleExternalIDs())
+			fakeSTS.ResetAssumeRoleHistory()
 		})
 	}
+}
+
+type fakeAWSClients struct {
+	rdsClient      rdsClient
+	redshiftClient redshiftClient
+}
+
+func (f fakeAWSClients) getRDSClient(aws.Config, ...func(*rds.Options)) rdsClient {
+	return f.rdsClient
+}
+
+func (f fakeAWSClients) getRedshiftClient(aws.Config, ...func(*redshift.Options)) redshiftClient {
+	return f.redshiftClient
 }

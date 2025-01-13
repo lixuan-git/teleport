@@ -1,18 +1,20 @@
 /*
-Copyright 2015-2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package srv
 
@@ -27,7 +29,6 @@ import (
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh"
 
@@ -36,15 +37,14 @@ import (
 	apievents "github.com/gravitational/teleport/api/types/events"
 	apisshutils "github.com/gravitational/teleport/api/utils/sshutils"
 	"github.com/gravitational/teleport/lib/auth"
-	"github.com/gravitational/teleport/lib/auth/keystore"
 	"github.com/gravitational/teleport/lib/auth/testauthority"
 	"github.com/gravitational/teleport/lib/backend/lite"
 	"github.com/gravitational/teleport/lib/bpf"
 	"github.com/gravitational/teleport/lib/events/eventstest"
 	"github.com/gravitational/teleport/lib/fixtures"
-	restricted "github.com/gravitational/teleport/lib/restrictedsession"
 	"github.com/gravitational/teleport/lib/service/servicecfg"
 	"github.com/gravitational/teleport/lib/services"
+	rsession "github.com/gravitational/teleport/lib/session"
 	"github.com/gravitational/teleport/lib/sshutils"
 	"github.com/gravitational/teleport/lib/utils"
 )
@@ -64,16 +64,16 @@ func newTestServerContext(t *testing.T, srv Server, roleSet services.RoleSet) *S
 	recConfig := types.DefaultSessionRecordingConfig()
 	recConfig.SetMode(types.RecordOff)
 	clusterName := "localhost"
+	_, connCtx := sshutils.NewConnectionContext(ctx, nil, &ssh.ServerConn{Conn: sshConn})
 	scx := &ServerContext{
-		Entry: logrus.NewEntry(logrus.StandardLogger()),
-		ConnectionContext: &sshutils.ConnectionContext{
-			ServerConn: &ssh.ServerConn{Conn: sshConn},
-		},
+		Logger:                 utils.NewSlogLoggerForTests(),
+		ConnectionContext:      connCtx,
 		env:                    make(map[string]string),
 		SessionRecordingConfig: recConfig,
 		IsTestStub:             true,
 		ClusterName:            clusterName,
 		srv:                    srv,
+		sessionID:              rsession.NewID(),
 		Identity: IdentityContext{
 			Login:        usr.Username,
 			TeleportUser: "teleportUser",
@@ -101,8 +101,13 @@ func newTestServerContext(t *testing.T, srv Server, roleSet services.RoleSet) *S
 
 	scx.killShellr, scx.killShellw, err = os.Pipe()
 	require.NoError(t, err)
+	scx.AddCloser(scx.killShellw)
 
-	t.Cleanup(func() { require.NoError(t, scx.Close()) })
+	// TODO (joerger): check the error coming from Close once the logic around
+	// closing open files has been fixed to fail with "close |1: file already closed".
+	// Note that outside of tests, we never check the error form scx.Close because this
+	// error is a part of normal execution currently.
+	t.Cleanup(func() { scx.Close() })
 
 	return scx
 }
@@ -126,17 +131,16 @@ func newMockServer(t *testing.T) *mockServer {
 		StaticTokens: []types.ProvisionTokenV1{},
 	})
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, bk.Close())
+	})
 
 	authCfg := &auth.InitConfig{
-		Backend:      bk,
-		Authority:    testauthority.New(),
-		ClusterName:  clusterName,
-		StaticTokens: staticTokens,
-		KeyStoreConfig: keystore.Config{
-			Software: keystore.SoftwareConfig{
-				RSAKeyPairSource: testauthority.New().GenerateKeyPair,
-			},
-		},
+		Backend:        bk,
+		VersionStorage: auth.NewFakeTeleportVersion(),
+		Authority:      testauthority.New(),
+		ClusterName:    clusterName,
+		StaticTokens:   staticTokens,
 	}
 
 	authServer, err := auth.NewServer(authCfg, auth.WithClock(clock))
@@ -156,6 +160,7 @@ type mockServer struct {
 	auth      *auth.Server
 	component string
 	clock     clockwork.FakeClock
+	bpf       bpf.BPF
 }
 
 // ID is the unique ID of the server.
@@ -239,7 +244,12 @@ func (m *mockServer) GetInfo() types.Server {
 }
 
 func (m *mockServer) TargetMetadata() apievents.ServerMetadata {
-	return apievents.ServerMetadata{}
+	return apievents.ServerMetadata{
+		ServerID:        "123",
+		ForwardedBy:     "abc",
+		ServerHostname:  "testHost",
+		ServerNamespace: "testNamespace",
+	}
 }
 
 // UseTunnel used to determine if this node has connected to this cluster
@@ -250,12 +260,11 @@ func (m *mockServer) UseTunnel() bool {
 
 // GetBPF returns the BPF service used for enhanced session recording.
 func (m *mockServer) GetBPF() bpf.BPF {
-	return &bpf.NOP{}
-}
+	if m.bpf != nil {
+		return m.bpf
+	}
 
-// GetRestrictedSessionManager returns the manager for restricting user activity
-func (m *mockServer) GetRestrictedSessionManager() restricted.Manager {
-	return &restricted.NOP{}
+	return &bpf.NOP{}
 }
 
 // Context returns server shutdown context
@@ -390,4 +399,24 @@ func (c *mockSSHChannel) SendRequest(name string, wantReply bool, payload []byte
 // Read and Write respectively.
 func (c *mockSSHChannel) Stderr() io.ReadWriter {
 	return c.stdErr
+}
+
+type fakeBPF struct {
+	bpf bpf.NOP
+}
+
+func (f fakeBPF) OpenSession(ctx *bpf.SessionContext) (uint64, error) {
+	return f.bpf.OpenSession(ctx)
+}
+
+func (f fakeBPF) CloseSession(ctx *bpf.SessionContext) error {
+	return f.bpf.CloseSession(ctx)
+}
+
+func (f fakeBPF) Close(restarting bool) error {
+	return f.bpf.Close(restarting)
+}
+
+func (f fakeBPF) Enabled() bool {
+	return true
 }

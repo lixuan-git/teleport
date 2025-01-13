@@ -1,37 +1,35 @@
-/*
-Copyright 2021-2022 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React, { useState } from 'react';
-import { NewFlow, StepSlider } from 'design/StepSlider';
-
-import { OnboardCard } from 'design/Onboard/OnboardCard';
+import { useState } from 'react';
 
 import { Box } from 'design';
+import { NewFlow, StepSlider } from 'design/StepSlider';
 
-import RecoveryCodes from 'teleport/components/RecoveryCodes';
-import { PrivateKeyLoginDisabledCard } from 'teleport/components/PrivateKeyPolicy';
+import { OnboardCard } from 'teleport/components/Onboard';
+import OSSRecoveryCodes from 'teleport/components/RecoveryCodes';
 import cfg from 'teleport/config';
-
 import { loginFlows } from 'teleport/Welcome/NewCredentials/constants';
 
 import useToken from '../useToken';
-
 import { Expired } from './Expired';
-import { LoginFlow, NewCredentialsProps } from './types';
 import { RegisterSuccess } from './Success';
+import { LoginFlow, NewCredentialsProps } from './types';
 
 /**
  *
@@ -61,11 +59,14 @@ export function NewCredentials(props: NewCredentialsProps) {
     primaryAuthType,
     success,
     finishedRegister,
-    privateKeyPolicyEnabled,
     isDashboard,
     displayOnboardingQuestionnaire = false,
     setDisplayOnboardingQuestionnaire = false,
     Questionnaire = undefined,
+    displayInviteCollaborators = false,
+    setDisplayInviteCollaborators = null,
+    InviteCollaborators = undefined,
+    RecoveryCodes,
   } = props;
 
   // Check which flow to render as default.
@@ -86,11 +87,19 @@ export function NewCredentials(props: NewCredentialsProps) {
     return null;
   }
 
-  if (success && privateKeyPolicyEnabled) {
+  if (
+    success &&
+    !resetMode &&
+    displayInviteCollaborators &&
+    setDisplayInviteCollaborators &&
+    InviteCollaborators
+  ) {
     return (
-      <PrivateKeyLoginDisabledCard
-        title={resetMode ? 'Reset Complete' : 'Registration Complete'}
-      />
+      <OnboardCard>
+        <InviteCollaborators
+          onSubmit={() => setDisplayInviteCollaborators(false)}
+        />
+      </OnboardCard>
     );
   }
 
@@ -124,8 +133,11 @@ export function NewCredentials(props: NewCredentialsProps) {
   }
 
   if (recoveryCodes) {
+    // TODO(bl-nero): Remove OSSRecoveryCodes once the enterprise code passes
+    // the RecoveryCodesComponent through props.
+    const Component = RecoveryCodes || OSSRecoveryCodes;
     return (
-      <RecoveryCodes
+      <Component
         recoveryCodes={recoveryCodes}
         onContinue={finishedRegister}
         isNewCodes={resetMode}

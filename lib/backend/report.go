@@ -1,23 +1,29 @@
 /*
-Copyright 2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package backend
 
 import (
 	"context"
+	"errors"
+	"log/slog"
+	"math"
+	"slices"
 	"strings"
 	"time"
 
@@ -25,15 +31,15 @@ import (
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/jonboulle/clockwork"
 	"github.com/prometheus/client_golang/prometheus"
-	log "github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel/attribute"
 	oteltrace "go.opentelemetry.io/otel/trace"
-	"golang.org/x/exp/slices"
+	"golang.org/x/time/rate"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/observability/metrics"
 	"github.com/gravitational/teleport/lib/observability/tracing"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
 const reporterDefaultCacheSize = 1000
@@ -69,6 +75,8 @@ func (r *ReporterConfig) CheckAndSetDefaults() error {
 	return nil
 }
 
+var _ Backend = (*Reporter)(nil)
+
 // Reporter wraps a Backend implementation and reports
 // statistics about the backend operations
 type Reporter struct {
@@ -82,6 +90,8 @@ type Reporter struct {
 	// This will keep an upper limit on our memory usage while still always
 	// reporting the most active keys.
 	topRequestsCache *lru.Cache[topRequestsCacheKey, struct{}]
+
+	slowRangeLogLimiter *rate.Limiter
 }
 
 // NewReporter returns a new Reporter.
@@ -103,8 +113,9 @@ func NewReporter(cfg ReporterConfig) (*Reporter, error) {
 		return nil, trace.Wrap(err)
 	}
 	r := &Reporter{
-		ReporterConfig:   cfg,
-		topRequestsCache: cache,
+		ReporterConfig:      cfg,
+		topRequestsCache:    cache,
+		slowRangeLogLimiter: rate.NewLimiter(rate.Every(time.Minute), 12),
 	}
 	return r, nil
 }
@@ -114,14 +125,14 @@ func (s *Reporter) GetName() string {
 }
 
 // GetRange returns query range
-func (s *Reporter) GetRange(ctx context.Context, startKey []byte, endKey []byte, limit int) (*GetResult, error) {
+func (s *Reporter) GetRange(ctx context.Context, startKey, endKey Key, limit int) (*GetResult, error) {
 	ctx, span := s.Tracer.Start(
 		ctx,
 		"backend/GetRange",
 		oteltrace.WithAttributes(
 			attribute.Int("limit", limit),
-			attribute.String("start_key", string(startKey)),
-			attribute.String("end_key", string(endKey)),
+			attribute.String("start_key", startKey.String()),
+			attribute.String("end_key", endKey.String()),
 		),
 	)
 	defer span.End()
@@ -132,8 +143,16 @@ func (s *Reporter) GetRange(ctx context.Context, startKey []byte, endKey []byte,
 	batchReadRequests.WithLabelValues(s.Component).Inc()
 	if err != nil {
 		batchReadRequestsFailed.WithLabelValues(s.Component).Inc()
+	} else {
+		reads.WithLabelValues(s.Component).Add(float64(len(res.Items)))
 	}
-	s.trackRequest(types.OpGet, startKey, endKey)
+	s.trackRequest(ctx, types.OpGet, startKey, endKey)
+	end := s.Clock().Now()
+	if d := end.Sub(start); d > time.Second*3 {
+		if s.slowRangeLogLimiter.AllowN(end, 1) {
+			slog.WarnContext(ctx, "slow GetRange request", "start_key", startKey.String(), "end_key", endKey.String(), "limit", limit, "duration", logutils.StringerAttr(d))
+		}
+	}
 	return res, err
 }
 
@@ -144,7 +163,7 @@ func (s *Reporter) Create(ctx context.Context, i Item) (*Lease, error) {
 		"backend/Create",
 		oteltrace.WithAttributes(
 			attribute.String("revision", i.Revision),
-			attribute.String("key", string(i.Key)),
+			attribute.String("key", i.Key.String()),
 		),
 	)
 	defer span.End()
@@ -155,8 +174,13 @@ func (s *Reporter) Create(ctx context.Context, i Item) (*Lease, error) {
 	writeRequests.WithLabelValues(s.Component).Inc()
 	if err != nil {
 		writeRequestsFailed.WithLabelValues(s.Component).Inc()
+		if trace.IsAlreadyExists(err) {
+			writeRequestsFailedPrecondition.WithLabelValues(s.Component).Inc()
+		}
+	} else {
+		writes.WithLabelValues(s.Component).Inc()
 	}
-	s.trackRequest(types.OpPut, i.Key, nil)
+	s.trackRequest(ctx, types.OpPut, i.Key, Key{})
 	return lease, err
 }
 
@@ -168,7 +192,7 @@ func (s *Reporter) Put(ctx context.Context, i Item) (*Lease, error) {
 		"backend/Put",
 		oteltrace.WithAttributes(
 			attribute.String("revision", i.Revision),
-			attribute.String("key", string(i.Key)),
+			attribute.String("key", i.Key.String()),
 		),
 	)
 	defer span.End()
@@ -179,8 +203,10 @@ func (s *Reporter) Put(ctx context.Context, i Item) (*Lease, error) {
 	writeRequests.WithLabelValues(s.Component).Inc()
 	if err != nil {
 		writeRequestsFailed.WithLabelValues(s.Component).Inc()
+	} else {
+		writes.WithLabelValues(s.Component).Inc()
 	}
-	s.trackRequest(types.OpPut, i.Key, nil)
+	s.trackRequest(ctx, types.OpPut, i.Key, Key{})
 	return lease, err
 }
 
@@ -191,7 +217,7 @@ func (s *Reporter) Update(ctx context.Context, i Item) (*Lease, error) {
 		"backend/Update",
 		oteltrace.WithAttributes(
 			attribute.String("revision", i.Revision),
-			attribute.String("key", string(i.Key)),
+			attribute.String("key", i.Key.String()),
 		),
 	)
 	defer span.End()
@@ -202,8 +228,13 @@ func (s *Reporter) Update(ctx context.Context, i Item) (*Lease, error) {
 	writeRequests.WithLabelValues(s.Component).Inc()
 	if err != nil {
 		writeRequestsFailed.WithLabelValues(s.Component).Inc()
+		if trace.IsNotFound(err) {
+			writeRequestsFailedPrecondition.WithLabelValues(s.Component).Inc()
+		}
+	} else {
+		writes.WithLabelValues(s.Component).Inc()
 	}
-	s.trackRequest(types.OpPut, i.Key, nil)
+	s.trackRequest(ctx, types.OpPut, i.Key, Key{})
 	return lease, err
 }
 
@@ -214,7 +245,7 @@ func (s *Reporter) ConditionalUpdate(ctx context.Context, i Item) (*Lease, error
 		"backend/ConditionalUpdate",
 		oteltrace.WithAttributes(
 			attribute.String("revision", i.Revision),
-			attribute.String("key", string(i.Key)),
+			attribute.String("key", i.Key.String()),
 		),
 	)
 	defer span.End()
@@ -225,18 +256,23 @@ func (s *Reporter) ConditionalUpdate(ctx context.Context, i Item) (*Lease, error
 	writeRequests.WithLabelValues(s.Component).Inc()
 	if err != nil {
 		writeRequestsFailed.WithLabelValues(s.Component).Inc()
+		if errors.Is(err, ErrIncorrectRevision) {
+			writeRequestsFailedPrecondition.WithLabelValues(s.Component).Inc()
+		}
+	} else {
+		writes.WithLabelValues(s.Component).Inc()
 	}
-	s.trackRequest(types.OpPut, i.Key, nil)
+	s.trackRequest(ctx, types.OpPut, i.Key, Key{})
 	return lease, err
 }
 
 // Get returns a single item or not found error
-func (s *Reporter) Get(ctx context.Context, key []byte) (*Item, error) {
+func (s *Reporter) Get(ctx context.Context, key Key) (*Item, error) {
 	ctx, span := s.Tracer.Start(
 		ctx,
 		"backend/Get",
 		oteltrace.WithAttributes(
-			attribute.String("key", string(key)),
+			attribute.String("key", key.String()),
 		),
 	)
 	defer span.End()
@@ -245,10 +281,11 @@ func (s *Reporter) Get(ctx context.Context, key []byte) (*Item, error) {
 	item, err := s.Backend.Get(ctx, key)
 	readLatencies.WithLabelValues(s.Component).Observe(s.Clock().Since(start).Seconds())
 	readRequests.WithLabelValues(s.Component).Inc()
+	reads.WithLabelValues(s.Component).Inc()
 	if err != nil && !trace.IsNotFound(err) {
 		readRequestsFailed.WithLabelValues(s.Component).Inc()
 	}
-	s.trackRequest(types.OpGet, key, nil)
+	s.trackRequest(ctx, types.OpGet, key, Key{})
 	return item, err
 }
 
@@ -259,7 +296,7 @@ func (s *Reporter) CompareAndSwap(ctx context.Context, expected Item, replaceWit
 		ctx,
 		"backend/CompareAndSwap",
 		oteltrace.WithAttributes(
-			attribute.String("key", string(expected.Key)),
+			attribute.String("key", expected.Key.String()),
 		),
 	)
 	defer span.End()
@@ -268,20 +305,25 @@ func (s *Reporter) CompareAndSwap(ctx context.Context, expected Item, replaceWit
 	lease, err := s.Backend.CompareAndSwap(ctx, expected, replaceWith)
 	writeLatencies.WithLabelValues(s.Component).Observe(s.Clock().Since(start).Seconds())
 	writeRequests.WithLabelValues(s.Component).Inc()
-	if err != nil && !trace.IsNotFound(err) && !trace.IsCompareFailed(err) {
+	if err != nil {
 		writeRequestsFailed.WithLabelValues(s.Component).Inc()
+		if trace.IsNotFound(err) || trace.IsCompareFailed(err) {
+			writeRequestsFailedPrecondition.WithLabelValues(s.Component).Inc()
+		}
+	} else {
+		writes.WithLabelValues(s.Component).Inc()
 	}
-	s.trackRequest(types.OpPut, expected.Key, nil)
+	s.trackRequest(ctx, types.OpPut, expected.Key, Key{})
 	return lease, err
 }
 
 // Delete deletes item by key
-func (s *Reporter) Delete(ctx context.Context, key []byte) error {
+func (s *Reporter) Delete(ctx context.Context, key Key) error {
 	ctx, span := s.Tracer.Start(
 		ctx,
 		"backend/Delete",
 		oteltrace.WithAttributes(
-			attribute.String("key", string(key)),
+			attribute.String("key", key.String()),
 		),
 	)
 	defer span.End()
@@ -290,21 +332,26 @@ func (s *Reporter) Delete(ctx context.Context, key []byte) error {
 	err := s.Backend.Delete(ctx, key)
 	writeLatencies.WithLabelValues(s.Component).Observe(s.Clock().Since(start).Seconds())
 	writeRequests.WithLabelValues(s.Component).Inc()
-	if err != nil && !trace.IsNotFound(err) {
+	if err != nil {
 		writeRequestsFailed.WithLabelValues(s.Component).Inc()
+		if trace.IsNotFound(err) {
+			writeRequestsFailedPrecondition.WithLabelValues(s.Component).Inc()
+		}
+	} else {
+		writes.WithLabelValues(s.Component).Inc()
 	}
-	s.trackRequest(types.OpDelete, key, nil)
+	s.trackRequest(ctx, types.OpDelete, key, Key{})
 	return err
 }
 
 // ConditionalDelete deletes the item by key if the revision matches the stored revision.
-func (s *Reporter) ConditionalDelete(ctx context.Context, key []byte, revision string) error {
+func (s *Reporter) ConditionalDelete(ctx context.Context, key Key, revision string) error {
 	ctx, span := s.Tracer.Start(
 		ctx,
 		"backend/ConditionalDelete",
 		oteltrace.WithAttributes(
 			attribute.String("revision", revision),
-			attribute.String("key", string(key)),
+			attribute.String("key", key.String()),
 		),
 	)
 	defer span.End()
@@ -313,21 +360,79 @@ func (s *Reporter) ConditionalDelete(ctx context.Context, key []byte, revision s
 	err := s.Backend.ConditionalDelete(ctx, key, revision)
 	writeLatencies.WithLabelValues(s.Component).Observe(s.Clock().Since(start).Seconds())
 	writeRequests.WithLabelValues(s.Component).Inc()
-	if err != nil && !trace.IsNotFound(err) {
+	if err != nil {
 		writeRequestsFailed.WithLabelValues(s.Component).Inc()
+		if trace.IsNotFound(err) {
+			writeRequestsFailedPrecondition.WithLabelValues(s.Component).Inc()
+		}
+	} else {
+		writes.WithLabelValues(s.Component).Inc()
 	}
-	s.trackRequest(types.OpDelete, key, nil)
+	s.trackRequest(ctx, types.OpDelete, key, Key{})
 	return err
 }
 
+// AtomicWrite implements batch conditional updates s.t. no writes occur unless all
+// conditions hold.
+func (s *Reporter) AtomicWrite(ctx context.Context, condacts []ConditionalAction) (revision string, err error) {
+	// note: the atomic write method's metrics are counted toward both the general 'write'
+	// metrics as well as equivalent metrics specific to atomic write.
+	ctx, span := s.Tracer.Start(
+		ctx,
+		"backend/AtomicWrite",
+		oteltrace.WithAttributes(
+			attribute.Int("condacts", len(condacts)),
+		),
+	)
+	defer span.End()
+
+	start := s.Clock().Now()
+	revision, err = s.Backend.AtomicWrite(ctx, condacts)
+
+	elapsed := s.Clock().Since(start).Seconds()
+	writeLatencies.WithLabelValues(s.Component).Observe(elapsed)
+	atomicWriteLatencies.WithLabelValues(s.Component).Observe(elapsed)
+
+	writeRequests.WithLabelValues(s.Component).Inc()
+	atomicWriteRequests.WithLabelValues(s.Component).Inc()
+	atomicWriteSize.WithLabelValues(s.Component).Observe(float64(len(condacts)))
+	if err != nil {
+		writeRequestsFailed.WithLabelValues(s.Component).Inc()
+		atomicWriteRequestsFailed.WithLabelValues(s.Component).Inc()
+		if errors.Is(err, ErrConditionFailed) {
+			writeRequestsFailedPrecondition.WithLabelValues(s.Component).Inc()
+			atomicWriteConditionFailed.WithLabelValues(s.Component).Inc()
+		}
+	}
+
+	var writeTotal int
+	for _, ca := range condacts {
+		switch ca.Action.Kind {
+		case KindPut:
+			writeTotal++
+			s.trackRequest(ctx, types.OpPut, ca.Key, Key{})
+		case KindDelete:
+			writeTotal++
+			s.trackRequest(ctx, types.OpDelete, ca.Key, Key{})
+		default:
+			// ignore other variants
+		}
+	}
+
+	if err == nil {
+		writes.WithLabelValues(s.Component).Add(float64(writeTotal))
+	}
+	return
+}
+
 // DeleteRange deletes range of items
-func (s *Reporter) DeleteRange(ctx context.Context, startKey []byte, endKey []byte) error {
+func (s *Reporter) DeleteRange(ctx context.Context, startKey, endKey Key) error {
 	ctx, span := s.Tracer.Start(
 		ctx,
 		"backend/DeleteRange",
 		oteltrace.WithAttributes(
-			attribute.String("start_key", string(startKey)),
-			attribute.String("end_key", string(endKey)),
+			attribute.String("start_key", startKey.String()),
+			attribute.String("end_key", endKey.String()),
 		),
 	)
 	defer span.End()
@@ -339,7 +444,7 @@ func (s *Reporter) DeleteRange(ctx context.Context, startKey []byte, endKey []by
 	if err != nil && !trace.IsNotFound(err) {
 		batchWriteRequestsFailed.WithLabelValues(s.Component).Inc()
 	}
-	s.trackRequest(types.OpDelete, startKey, endKey)
+	s.trackRequest(ctx, types.OpDelete, startKey, endKey)
 	return err
 }
 
@@ -353,8 +458,7 @@ func (s *Reporter) KeepAlive(ctx context.Context, lease Lease, expires time.Time
 		"backend/KeepAlive",
 		oteltrace.WithAttributes(
 			attribute.String("revision", lease.Revision),
-			attribute.Int64("lease", lease.ID),
-			attribute.String("key", string(lease.Key)),
+			attribute.String("key", lease.Key.String()),
 		),
 	)
 	defer span.End()
@@ -363,10 +467,15 @@ func (s *Reporter) KeepAlive(ctx context.Context, lease Lease, expires time.Time
 	err := s.Backend.KeepAlive(ctx, lease, expires)
 	writeLatencies.WithLabelValues(s.Component).Observe(s.Clock().Since(start).Seconds())
 	writeRequests.WithLabelValues(s.Component).Inc()
-	if err != nil && !trace.IsNotFound(err) {
+	if err != nil {
 		writeRequestsFailed.WithLabelValues(s.Component).Inc()
+		if trace.IsNotFound(err) {
+			writeRequestsFailedPrecondition.WithLabelValues(s.Component).Inc()
+		}
+	} else {
+		writes.WithLabelValues(s.Component).Inc()
 	}
-	s.trackRequest(types.OpPut, lease.Key, nil)
+	s.trackRequest(ctx, types.OpPut, lease.Key, Key{})
 	return err
 }
 
@@ -411,13 +520,13 @@ type topRequestsCacheKey struct {
 }
 
 // trackRequests tracks top requests, endKey is supplied for ranges
-func (s *Reporter) trackRequest(opType types.OpType, key []byte, endKey []byte) {
-	if len(key) == 0 {
+func (s *Reporter) trackRequest(ctx context.Context, opType types.OpType, key Key, endKey Key) {
+	if len(key.s) == 0 {
 		return
 	}
-	keyLabel := buildKeyLabel(string(key), sensitiveBackendPrefixes, singletonBackendPrefixes, len(endKey) != 0)
+	keyLabel := buildKeyLabel(key.String(), sensitiveBackendPrefixes, singletonBackendPrefixes, len(endKey.s) != 0)
 	rangeSuffix := teleport.TagFalse
-	if len(endKey) != 0 {
+	if len(endKey.s) != 0 {
 		// Range denotes range queries in stat entry
 		rangeSuffix = teleport.TagTrue
 	}
@@ -441,7 +550,7 @@ func (s *Reporter) trackRequest(opType types.OpType, key []byte, endKey []byte) 
 
 	counter, err := requests.GetMetricWithLabelValues(s.Component, keyLabel, rangeSuffix)
 	if err != nil {
-		log.Warningf("Failed to get counter: %v", err)
+		slog.WarnContext(ctx, "Failed to get prometheus counter", "error", err)
 		return
 	}
 	counter.Inc()
@@ -481,7 +590,7 @@ func buildKeyLabel(key string, sensitivePrefixes, singletonPrefixes []string, is
 	// if the first non-empty segment is a secret range and there are at least two non-empty
 	// segments, then the second non-empty segment should be masked.
 	if finalLen-realStart > 1 && slices.Contains(sensitivePrefixes, parts[realStart]) {
-		parts[realStart+1] = string(MaskKeyName(parts[realStart+1]))
+		parts[realStart+1] = MaskKeyName(parts[realStart+1])
 	}
 
 	return strings.Join(parts[:finalLen], string(Separator))
@@ -561,10 +670,79 @@ var (
 		},
 		[]string{teleport.ComponentLabel},
 	)
+	writes = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: teleport.MetricNamespace,
+			Name:      teleport.MetricBackendWrites,
+			Help:      "Number of individual items written to the backend",
+		},
+		[]string{teleport.ComponentLabel},
+	)
 	writeRequestsFailed = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: teleport.MetricBackendWriteFailedRequests,
 			Help: "Number of failed write requests to the backend",
+		},
+		[]string{teleport.ComponentLabel},
+	)
+	writeRequestsFailedPrecondition = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: teleport.MetricNamespace,
+			Name:      teleport.MetricBackendWriteFailedPreconditionRequests,
+			Help:      "Number of write requests that failed due to a precondition (existence, revision, value, etc)",
+		},
+		[]string{teleport.ComponentLabel},
+	)
+	atomicWriteRequests = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: teleport.MetricNamespace,
+			Name:      teleport.MetricBackendAtomicWriteRequests,
+			Help:      "Number of atomic write requests to the backend",
+		},
+		[]string{teleport.ComponentLabel},
+	)
+	atomicWriteRequestsFailed = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: teleport.MetricNamespace,
+			Name:      teleport.MetricBackendAtomicWriteFailedRequests,
+			Help:      "Number of failed atomic write requests to the backend",
+		},
+		[]string{teleport.ComponentLabel},
+	)
+	atomicWriteConditionFailed = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: teleport.MetricNamespace,
+			Name:      teleport.MetricBackendAtomicWriteConditionFailed,
+			Help:      "Number of times an atomic write request results in condition failure",
+		},
+		[]string{teleport.ComponentLabel},
+	)
+	atomicWriteLatencies = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: teleport.MetricNamespace,
+			Name:      teleport.MetricBackendAtomicWriteHistogram,
+			Help:      "Latency for backend atomic write operations",
+			// lowest bucket start of upper bound 0.001 sec (1 ms) with factor 2
+			// highest bucket start of 0.001 sec * 2^15 == 32.768 sec
+			Buckets: prometheus.ExponentialBuckets(0.001, 2, 16),
+		},
+		[]string{teleport.ComponentLabel},
+	)
+	atomicWriteSize = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: teleport.MetricNamespace,
+			Name:      teleport.MetricBackendAtomicWriteSize,
+			Help:      "Atomic write batch size",
+			// buckets of the form 1, 2, 4, 8, 16, etc...
+			Buckets: prometheus.ExponentialBuckets(1, 2, int(math.Sqrt(MaxAtomicWriteSize))),
+		},
+		[]string{teleport.ComponentLabel},
+	)
+	AtomicWriteContention = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: teleport.MetricNamespace,
+			Name:      teleport.MetricBackendAtomicWriteContention,
+			Help:      "Number of times atomic write requests experience contention",
 		},
 		[]string{teleport.ComponentLabel},
 	)
@@ -586,6 +764,14 @@ var (
 		prometheus.CounterOpts{
 			Name: teleport.MetricBackendReadRequests,
 			Help: "Number of read requests to the backend",
+		},
+		[]string{teleport.ComponentLabel},
+	)
+	reads = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: teleport.MetricNamespace,
+			Name:      teleport.MetricBackendReads,
+			Help:      "Number of individual items read from the backend",
 		},
 		[]string{teleport.ComponentLabel},
 	)
@@ -655,6 +841,9 @@ var (
 		watchers, watcherQueues, requests, writeRequests,
 		writeRequestsFailed, batchWriteRequests, batchWriteRequestsFailed, readRequests,
 		readRequestsFailed, batchReadRequests, batchReadRequestsFailed, writeLatencies,
+		writeRequestsFailedPrecondition,
+		atomicWriteRequests, atomicWriteRequestsFailed, atomicWriteConditionFailed, atomicWriteLatencies,
+		AtomicWriteContention, atomicWriteSize, reads, writes,
 		batchWriteLatencies, batchReadLatencies, readLatencies,
 	}
 )

@@ -1,44 +1,46 @@
 /**
- * Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React, { useState, useEffect } from 'react';
-import { Text, Box, Flex } from 'design';
+import { useEffect, useState } from 'react';
 
-import Validation, { Validator } from 'shared/components/Validation';
+import { Box, Flex, Mark, Text } from 'design';
+import { P } from 'design/Text/Text';
 import FieldInput from 'shared/components/FieldInput';
-import { requiredField } from 'shared/components/Validation/rules';
 import TextEditor from 'shared/components/TextEditor';
+import Validation, { Validator } from 'shared/components/Validation';
+import { requiredField } from 'shared/components/Validation/rules';
 
-import {
-  ActionButtons,
-  HeaderSubtitle,
-  LabelsCreater,
-  Mark,
-  Header,
-} from '../../Shared';
-import { dbCU } from '../../yamlTemplates';
+import { ResourceLabelTooltip } from 'teleport/Discover/Shared/ResourceLabelTooltip';
+import type { ResourceLabel } from 'teleport/services/agents';
+
 import {
   getDatabaseProtocol,
   getDefaultDatabasePort,
 } from '../../SelectResource';
-
-import { useCreateDatabase, State } from './useCreateDatabase';
+import {
+  ActionButtons,
+  Header,
+  HeaderSubtitle,
+  LabelsCreater,
+} from '../../Shared';
+import { dbCU } from '../../yamlTemplates';
 import { CreateDatabaseDialog } from './CreateDatabaseDialog';
-
-import type { ResourceLabel } from 'teleport/services/agents';
+import { State, useCreateDatabase } from './useCreateDatabase';
 
 export function CreateDatabase() {
   const state = useCreateDatabase();
@@ -55,6 +57,7 @@ export function CreateDatabaseView({
   isDbCreateErr,
   prevStep,
   nextStep,
+  handleOnTimeout,
 }: State) {
   const [dbName, setDbName] = useState('');
   const [dbUri, setDbUri] = useState('');
@@ -72,7 +75,10 @@ export function CreateDatabaseView({
     }
   }, [isDbCreateErr]);
 
-  function handleOnProceed(validator: Validator, retry = false) {
+  function handleOnProceed(
+    validator: Validator,
+    { overwriteDb = false, retry = false } = {}
+  ) {
     if (!validator.validate()) {
       return;
     }
@@ -83,12 +89,15 @@ export function CreateDatabaseView({
       return;
     }
 
-    registerDatabase({
-      labels,
-      name: dbName,
-      uri: `${dbUri}:${dbPort}`,
-      protocol: getDatabaseProtocol(dbEngine),
-    });
+    registerDatabase(
+      {
+        labels,
+        name: dbName,
+        uri: `${dbUri}:${dbPort}`,
+        protocol: getDatabaseProtocol(dbEngine),
+      },
+      { overwriteDb }
+    );
   }
 
   return (
@@ -101,12 +110,11 @@ export function CreateDatabaseView({
           </HeaderSubtitle>
           {!canCreateDatabase && (
             <Box>
-              <Text>
-                You don't have permission to register a database.
-                <br />
+              <P>You don't have permission to register a database.</P>
+              <P>
                 Please ask your Teleport administrator to update your role and
                 add the <Mark>db</Mark> rule:
-              </Text>
+              </P>
               <Flex minHeight="195px" mt={3}>
                 <TextEditor
                   readOnly={true}
@@ -155,13 +163,13 @@ export function CreateDatabaseView({
                     />
                   </Flex>
                   <Box mt={3}>
-                    <Text bold>Labels (optional)</Text>
-                    <Text mb={2}>
-                      Labels make this new database discoverable by the database
-                      service. <br />
-                      Not defining labels is equivalent to asterisks (any
-                      database service can discover this database).
-                    </Text>
+                    <Flex alignItems="center" gap={1} mb={2}>
+                      <Text bold>Labels (optional)</Text>
+                      <ResourceLabelTooltip
+                        toolTipPosition="top"
+                        resourceKind="db"
+                      />
+                    </Flex>
                     <LabelsCreater
                       labels={labels}
                       setLabels={setLabels}
@@ -186,7 +194,11 @@ export function CreateDatabaseView({
             <CreateDatabaseDialog
               pollTimeout={pollTimeout}
               attempt={attempt}
-              retry={() => handleOnProceed(validator, true /* retry */)}
+              retry={() => handleOnProceed(validator, { retry: true })}
+              onOverwrite={() =>
+                handleOnProceed(validator, { overwriteDb: true })
+              }
+              onTimeout={handleOnTimeout}
               close={clearAttempt}
               dbName={dbName}
               next={nextStep}

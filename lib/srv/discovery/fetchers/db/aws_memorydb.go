@@ -1,18 +1,21 @@
 /*
-Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package db
 
 import (
@@ -26,7 +29,6 @@ import (
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/cloud"
 	libcloudaws "github.com/gravitational/teleport/lib/cloud/aws"
-	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/srv/discovery/common"
 )
 
@@ -45,7 +47,9 @@ func (f *memoryDBPlugin) ComponentShortName() string {
 // GetDatabases returns MemoryDB databases matching the watcher's selectors.
 func (f *memoryDBPlugin) GetDatabases(ctx context.Context, cfg *awsFetcherConfig) (types.Databases, error) {
 	memDBClient, err := cfg.AWSClients.GetAWSMemoryDBClient(ctx, cfg.Region,
-		cloud.WithAssumeRole(cfg.AssumeRole.RoleARN, cfg.AssumeRole.ExternalID))
+		cloud.WithAssumeRole(cfg.AssumeRole.RoleARN, cfg.AssumeRole.ExternalID),
+		cloud.WithCredentialsMaybeIntegration(cfg.Integration),
+	)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -56,15 +60,16 @@ func (f *memoryDBPlugin) GetDatabases(ctx context.Context, cfg *awsFetcherConfig
 
 	var eligibleClusters []*memorydb.Cluster
 	for _, cluster := range clusters {
-		if !services.IsMemoryDBClusterSupported(cluster) {
-			cfg.Log.Debugf("MemoryDB cluster %q is not supported. Skipping.", aws.StringValue(cluster.Name))
+		if !libcloudaws.IsMemoryDBClusterSupported(cluster) {
+			cfg.Logger.DebugContext(ctx, "Skipping unsupported MemoryDB cluster", "cluster", aws.StringValue(cluster.Name))
 			continue
 		}
 
-		if !services.IsMemoryDBClusterAvailable(cluster) {
-			cfg.Log.Debugf("The current status of MemoryDB cluster %q is %q. Skipping.",
-				aws.StringValue(cluster.Name),
-				aws.StringValue(cluster.Status))
+		if !libcloudaws.IsMemoryDBClusterAvailable(cluster) {
+			cfg.Logger.DebugContext(ctx, "Skipping unavailable MemoryDB cluster",
+				"cluster", aws.StringValue(cluster.Name),
+				"status", aws.StringValue(cluster.Status),
+			)
 			continue
 		}
 
@@ -80,9 +85,9 @@ func (f *memoryDBPlugin) GetDatabases(ctx context.Context, cfg *awsFetcherConfig
 	allSubnetGroups, err := getMemoryDBSubnetGroups(ctx, memDBClient)
 	if err != nil {
 		if trace.IsAccessDenied(err) {
-			cfg.Log.WithError(err).Debug("No permissions to describe subnet groups")
+			cfg.Logger.DebugContext(ctx, "No permissions to describe subnet groups", "error", err)
 		} else {
-			cfg.Log.WithError(err).Info("Failed to describe subnet groups.")
+			cfg.Logger.InfoContext(ctx, "Failed to describe subnet groups", "error", err)
 		}
 	}
 
@@ -91,16 +96,22 @@ func (f *memoryDBPlugin) GetDatabases(ctx context.Context, cfg *awsFetcherConfig
 		tags, err := getMemoryDBResourceTags(ctx, memDBClient, cluster.ARN)
 		if err != nil {
 			if trace.IsAccessDenied(err) {
-				cfg.Log.WithError(err).Debug("No permissions to list resource tags")
+				cfg.Logger.DebugContext(ctx, "No permissions to list resource tags", "error", err)
 			} else {
-				cfg.Log.WithError(err).Infof("Failed to list resource tags for MemoryDB cluster %q.", aws.StringValue(cluster.Name))
+				cfg.Logger.InfoContext(ctx, "Failed to list resource tags for MemoryDB cluster ",
+					"error", err,
+					"cluster", aws.StringValue(cluster.Name),
+				)
 			}
 		}
 
-		extraLabels := services.ExtraMemoryDBLabels(cluster, tags, allSubnetGroups)
-		database, err := services.NewDatabaseFromMemoryDBCluster(cluster, extraLabels)
+		extraLabels := common.ExtraMemoryDBLabels(cluster, tags, allSubnetGroups)
+		database, err := common.NewDatabaseFromMemoryDBCluster(cluster, extraLabels)
 		if err != nil {
-			cfg.Log.WithError(err).Infof("Could not convert memorydb cluster %q configuration endpoint to database resource.", aws.StringValue(cluster.Name))
+			cfg.Logger.InfoContext(ctx, "Could not convert memorydb cluster configuration endpoint to database resource",
+				"error", err,
+				"cluster", aws.StringValue(cluster.Name),
+			)
 		} else {
 			databases = append(databases, database)
 		}

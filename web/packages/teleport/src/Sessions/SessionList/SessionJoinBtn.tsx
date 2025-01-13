@@ -1,27 +1,29 @@
-/*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 import React, { useState } from 'react';
 
-import { Box, ButtonBorder, Flex, Menu, MenuItem, Text } from 'design';
+import { Box, ButtonBorder, Flex, H3, Menu, MenuItem, Text } from 'design';
 import { ChevronDown, Warning } from 'design/Icon';
 
+import { ButtonLockedFeature } from 'teleport/components/ButtonLockedFeature';
 import cfg from 'teleport/config';
 import { ParticipantMode } from 'teleport/services/session';
-import { ButtonLockedFeature } from 'teleport/components/ButtonLockedFeature';
 import { CtaEvent } from 'teleport/services/userEvent';
 
 export const SessionJoinBtn = ({
@@ -177,7 +179,7 @@ function JoinMenuItem({
         `}
       >
         <Box height="fit-content" width="264px">
-          <Text typography="h6">{title}</Text>
+          <H3>{title}</H3>
           <Text color="text.slightlyMuted">{description}</Text>
         </Box>
       </MenuItem>
@@ -201,13 +203,13 @@ function JoinMenuItem({
       `}
     >
       <Box height="fit-content" width="264px">
-        <Text typography="h6">{title}</Text>
+        <H3>{title}</H3>
         <Text>{description}</Text>
         {!showCTA && (
           <Box color="text.main" px={1} mt={1}>
             <Flex>
               <Warning color="error.main" mr={2} size="small" />
-              <Text fontSize="10px" color="text.slightlyMuted">
+              <Text typography="body4" color="text.slightlyMuted">
                 {modeWarningText[participantMode]}
               </Text>
             </Flex>

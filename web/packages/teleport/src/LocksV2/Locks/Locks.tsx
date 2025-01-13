@@ -1,41 +1,41 @@
-/*
-Copyright 2023 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React, { useState, useEffect } from 'react';
-import { useLocation, useHistory } from 'react-router';
 import { formatRelative } from 'date-fns';
-import { Danger } from 'design/Alert';
+import { Fragment, useEffect, useState } from 'react';
+import { useHistory, useLocation } from 'react-router';
 
+import { Button, Label as Pill } from 'design';
+import { Danger } from 'design/Alert';
 import Table, { Cell } from 'design/DataTable';
-import { ButtonPrimary, Label as Pill } from 'design';
 import useAttempt from 'shared/hooks/useAttemptNext';
 
-import cfg from 'teleport/config';
 import {
   FeatureBox,
   FeatureHeader,
   FeatureHeaderTitle,
 } from 'teleport/components/Layout';
 import { NavLink } from 'teleport/components/Router';
+import cfg from 'teleport/config';
+import { Lock, lockService, LockTarget } from 'teleport/services/locks';
 import useTeleport from 'teleport/useTeleport';
 
-import { lockService, Lock, LockTarget } from 'teleport/services/locks';
-
 import { TrashButton } from '../common';
-
 import { DeleteLockDialogue } from './DeleteLockDialogue';
 
 export function Locks() {
@@ -86,7 +86,13 @@ export function Locks() {
       <FeatureBox>
         <FeatureHeader>
           <FeatureHeaderTitle>Session & Identity Locks</FeatureHeaderTitle>
-          <ButtonPrimary
+          <Button
+            intent="primary"
+            fill={
+              attempt.status === 'success' && locks.length === 0
+                ? 'filled'
+                : 'border'
+            }
             as={NavLink}
             to={cfg.getNewLocksRoute()}
             ml="auto"
@@ -98,7 +104,7 @@ export function Locks() {
             }
           >
             Add New Lock
-          </ButtonPrimary>
+          </Button>
         </FeatureHeader>
         {attempt.status === 'failed' && <Danger>{attempt.statusText}</Danger>}
         <Table
@@ -175,7 +181,7 @@ export function Locks() {
 function getFormattedDate(d: string): string {
   try {
     return formatRelative(new Date(d), Date.now());
-  } catch (e) {
+  } catch {
     return '';
   }
 }
@@ -199,13 +205,10 @@ export function Pills({ targets }: { targets: LockTarget[] }) {
   const pills = targets.map((target, index) => {
     const labelText = `${target.kind}: ${target.name}`;
     return (
-      <Pill
-        key={`${target.kind}${target.name}${index}`}
-        mr="1"
-        kind="secondary"
-      >
-        {labelText}
-      </Pill>
+      <Fragment key={`${target.kind}${target.name}${index}`}>
+        {index > 0 && ' '}
+        <Pill kind="secondary">{labelText}</Pill>
+      </Fragment>
     );
   });
 

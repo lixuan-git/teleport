@@ -1,34 +1,42 @@
 /**
- * Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 import React from 'react';
-
+import { useLocation } from 'react-router';
 import { Prompt } from 'react-router-dom';
+
 import { Box } from 'design';
 
 import { FeatureBox } from 'teleport/components/Layout';
-
-import { Navigation } from 'teleport/Discover/Navigation/Navigation';
-import { SelectResource } from 'teleport/Discover/SelectResource';
+import { findViewAtIndex } from 'teleport/components/Wizard/flow';
+import { Navigation } from 'teleport/components/Wizard/Navigation';
 import cfg from 'teleport/config';
+import type { View } from 'teleport/Discover/flow';
+import { SelectResource } from 'teleport/Discover/SelectResource/SelectResource';
+import { DiscoverEvent } from 'teleport/services/userEvent';
 
+import { DiscoverIcon } from './SelectResource/icons';
 import { EViewConfigs } from './types';
-import { findViewAtIndex } from './flow';
-
-import { DiscoverProvider, useDiscover } from './useDiscover';
+import {
+  DiscoverProvider,
+  DiscoverUpdateProps,
+  useDiscover,
+} from './useDiscover';
 
 function DiscoverContent() {
   const {
@@ -39,12 +47,15 @@ function DiscoverContent() {
     ...agentProps
   } = useDiscover();
 
-  let content;
-  const hasSelectedResource = Boolean(viewConfig);
-  if (hasSelectedResource) {
-    const view = findViewAtIndex(indexedViews, currentStep);
+  let currentView: View | undefined;
+  let content: React.ReactNode;
 
-    const Component = view.component;
+  const hasSelectedResource = Boolean(viewConfig);
+
+  if (hasSelectedResource) {
+    currentView = findViewAtIndex(indexedViews, currentStep);
+
+    const Component = currentView.component;
 
     content = <Component {...agentProps} />;
 
@@ -52,6 +63,8 @@ function DiscoverContent() {
       content = viewConfig.wrapper(content);
     }
   } else {
+    currentView = undefined;
+
     content = (
       <SelectResource onSelect={resource => onSelectResource(resource)} />
     );
@@ -61,11 +74,16 @@ function DiscoverContent() {
     <>
       <FeatureBox>
         {hasSelectedResource && (
-          <Navigation
-            currentStep={currentStep}
-            views={indexedViews}
-            selectedResource={agentProps.resourceSpec}
-          />
+          <Box mt={2} mb={6}>
+            <Navigation
+              currentStep={currentStep}
+              views={indexedViews}
+              startWithIcon={{
+                title: agentProps.resourceSpec.name,
+                component: <DiscoverIcon name={agentProps.resourceSpec.icon} />,
+              }}
+            />
+          </Box>
         )}
         <Box>{content}</Box>
       </FeatureBox>
@@ -78,8 +96,12 @@ function DiscoverContent() {
           }}
           when={
             viewConfig.shouldPrompt
-              ? viewConfig.shouldPrompt(currentStep, agentProps.resourceSpec)
-              : true
+              ? viewConfig.shouldPrompt(
+                  currentStep,
+                  currentView,
+                  agentProps.resourceSpec
+                )
+              : currentView?.eventName !== DiscoverEvent.Completed
           }
         />
       )}
@@ -87,9 +109,17 @@ function DiscoverContent() {
   );
 }
 
-export function DiscoverComponent({ eViewConfigs = [] }: Props) {
+export function DiscoverComponent({
+  eViewConfigs = [],
+  updateFlow,
+}: DiscoverComponentProps) {
+  const location = useLocation();
   return (
-    <DiscoverProvider eViewConfigs={eViewConfigs}>
+    <DiscoverProvider
+      eViewConfigs={eViewConfigs}
+      key={location.key}
+      updateFlow={updateFlow}
+    >
       <DiscoverContent />
     </DiscoverProvider>
   );
@@ -99,6 +129,7 @@ export function Discover() {
   return <DiscoverComponent />;
 }
 
-type Props = {
+export type DiscoverComponentProps = {
   eViewConfigs?: EViewConfigs;
+  updateFlow?: DiscoverUpdateProps;
 };

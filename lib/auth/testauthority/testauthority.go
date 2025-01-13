@@ -1,18 +1,20 @@
 /*
-Copyright 2015 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 // Package testauthority implements a wrapper around native.Keygen that uses
 // pre-computed keys.
@@ -24,10 +26,10 @@ import (
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
 
-	"github.com/gravitational/teleport/api/utils/keys"
 	"github.com/gravitational/teleport/lib/auth/keygen"
-	"github.com/gravitational/teleport/lib/auth/native"
+	"github.com/gravitational/teleport/lib/cryptosuites"
 	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/sshca"
 )
 
 type Keygen struct {
@@ -45,31 +47,21 @@ func NewWithClock(clock clockwork.Clock) *Keygen {
 	return &Keygen{Keygen: inner}
 }
 
-// GeneratePrivateKey generates a new PrivateKey.
-func (n *Keygen) GeneratePrivateKey() (*keys.PrivateKey, error) {
-	priv, _, err := n.GenerateKeyPair()
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	return keys.ParsePrivateKey(priv)
-}
-
-func (n *Keygen) GetNewKeyPairFromPool() (priv []byte, pub []byte, err error) {
-	return n.GenerateKeyPair()
-}
-
 // GenerateKeyPair returns a new private key in PEM format and an ssh
 // public key in authorized_key format.
 func (n *Keygen) GenerateKeyPair() (priv []byte, pub []byte, err error) {
-	return native.GenerateKeyPair()
+	privateKey, err := cryptosuites.GeneratePrivateKeyWithAlgorithm(cryptosuites.ECDSAP256)
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+	return privateKey.PrivateKeyPEM(), privateKey.MarshalSSHPublicKey(), nil
 }
 
 func (n *Keygen) GenerateHostCert(c services.HostCertParams) ([]byte, error) {
 	return n.GenerateHostCertWithoutValidation(c)
 }
 
-func (n *Keygen) GenerateUserCert(c services.UserCertParams) ([]byte, error) {
+func (n *Keygen) GenerateUserCert(c sshca.UserCertificateRequest) ([]byte, error) {
 	return n.GenerateUserCertWithoutValidation(c)
 }
 

@@ -1,34 +1,45 @@
 /**
- * Copyright 2021 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React, { useState } from 'react';
+import { useState } from 'react';
+
+import {
+  Box,
+  ButtonIcon,
+  ButtonSecondary,
+  Flex,
+  H2,
+  Image,
+  Text,
+} from 'design';
 import * as Alerts from 'design/Alert';
-import { ButtonIcon, Text, ButtonSecondary, Image, Flex, Box } from 'design';
 import DialogConfirmation, {
   DialogContent,
-  DialogHeader,
   DialogFooter,
+  DialogHeader,
 } from 'design/DialogConfirmation';
-import { Attempt } from 'shared/hooks/useAsync';
 import * as Icons from 'design/Icon';
-
-import LinearProgress from 'teleterm/ui/components/LinearProgress';
-import svgHardwareKey from 'teleterm/ui/ClusterConnect/ClusterLogin/FormLogin/PromptWebauthn/hardware.svg';
+import { P, P3 } from 'design/Text/Text';
+import { Attempt } from 'shared/hooks/useAsync';
 
 import type * as tsh from 'teleterm/services/tshd/types';
+import svgHardwareKey from 'teleterm/ui/ClusterConnect/ClusterLogin/FormLogin/PromptPasswordless/hardware.svg';
+import { LinearProgress } from 'teleterm/ui/components/LinearProgress';
 
 export type HeadlessPromptProps = {
   cluster: tsh.Cluster;
@@ -47,6 +58,7 @@ export type HeadlessPromptProps = {
    * reject the request from the Web UI.
    */
   onCancel(): void;
+  hidden?: boolean;
 };
 
 export function HeadlessPrompt({
@@ -59,6 +71,7 @@ export function HeadlessPrompt({
   headlessAuthenticationId,
   updateHeadlessStateAttempt,
   onCancel,
+  hidden,
 }: HeadlessPromptProps) {
   // skipConfirm automatically attempts to approve a headless auth attempt,
   // so let's show waitForMfa from the very beginning in that case.
@@ -66,17 +79,17 @@ export function HeadlessPrompt({
 
   return (
     <DialogConfirmation
+      open={!hidden}
+      keepInDOMAfterClose
       dialogCss={() => ({
         maxWidth: '480px',
         width: '100%',
       })}
-      disableEscapeKeyDown={false}
-      open={true}
     >
       <DialogHeader justifyContent="space-between" mb={0} alignItems="baseline">
-        <Text typography="h4">
+        <H2 mb={4}>
           Headless command on <b>{cluster.name}</b>
-        </Text>
+        </H2>
         <ButtonIcon
           type="button"
           color="text.slightlyMuted"
@@ -89,19 +102,16 @@ export function HeadlessPrompt({
         </ButtonIcon>
       </DialogHeader>
       {updateHeadlessStateAttempt.status === 'error' && (
-        <Alerts.Danger mb={0}>
-          {updateHeadlessStateAttempt.statusText}
+        <Alerts.Danger mb={0} details={updateHeadlessStateAttempt.statusText}>
+          Could not update the headless command state
         </Alerts.Danger>
       )}
       <DialogContent>
-        <Text color="text.slightlyMuted">
+        <P color="text.slightlyMuted">
           Someone initiated a headless command from <b>{clientIp}</b>.
-          <br />
-          If it was not you, click Reject and contact your administrator.
-        </Text>
-        <Text color="text.muted" mt={1} fontSize="12px">
-          Request ID: {headlessAuthenticationId}
-        </Text>
+        </P>
+        <P>If it was not you, click Reject and contact your administrator.</P>
+        <P3 color="text.muted">Request ID: {headlessAuthenticationId}</P3>
       </DialogContent>
       {waitForMfa && (
         <DialogContent mb={2}>

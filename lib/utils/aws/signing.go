@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package aws
 
@@ -23,7 +25,6 @@ import (
 	"net/http"
 	"time"
 
-	awssession "github.com/aws/aws-sdk-go/aws/session"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
 
@@ -49,8 +50,8 @@ type SigningService struct {
 
 // SigningServiceConfig is the SigningService configuration.
 type SigningServiceConfig struct {
-	// Session is AWS session.
-	Session *awssession.Session
+	// SessionProvider is a provider for AWS Sessions.
+	SessionProvider AWSSessionProvider
 	// Clock is used to override time in tests.
 	Clock clockwork.Clock
 	// CredentialsGetter is used to obtain STS credentials.
@@ -62,14 +63,8 @@ func (s *SigningServiceConfig) CheckAndSetDefaults() error {
 	if s.Clock == nil {
 		s.Clock = clockwork.NewRealClock()
 	}
-	if s.Session == nil {
-		ses, err := awssession.NewSessionWithOptions(awssession.Options{
-			SharedConfigState: awssession.SharedConfigEnable,
-		})
-		if err != nil {
-			return trace.Wrap(err)
-		}
-		s.Session = ses
+	if s.SessionProvider == nil {
+		return trace.BadParameter("session provider is required")
 	}
 	if s.CredentialsGetter == nil {
 		// Use cachedCredentialsGetter by default. cachedCredentialsGetter
@@ -100,6 +95,11 @@ type SigningCtx struct {
 	AWSRoleArn string
 	// AWSExternalID is an optional external ID used when getting sts credentials.
 	AWSExternalID string
+	// SessionTags is a list of AWS STS session tags.
+	SessionTags map[string]string
+	// Integration is the Integration name to use to generate credentials.
+	// If empty, it will use ambient credentials
+	Integration string
 }
 
 // Check checks signing context parameters.
@@ -161,12 +161,18 @@ func (s *SigningService) SignRequest(ctx context.Context, req *http.Request, sig
 	// 100-continue" headers without being signed, otherwise the Athena service
 	// would reject the requests.
 	unsignedHeaders := removeUnsignedHeaders(reqCopy)
+
+	session, err := s.SessionProvider(ctx, signCtx.SigningRegion, signCtx.Integration)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
 	credentials, err := s.CredentialsGetter.Get(ctx, GetCredentialsRequest{
-		Provider:    s.Session,
+		Provider:    session,
 		Expiry:      signCtx.Expiry,
 		SessionName: signCtx.SessionName,
 		RoleARN:     signCtx.AWSRoleArn,
 		ExternalID:  signCtx.AWSExternalID,
+		Tags:        signCtx.SessionTags,
 	})
 	if err != nil {
 		return nil, trace.Wrap(err)

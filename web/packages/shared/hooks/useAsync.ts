@@ -1,20 +1,22 @@
-/*
-Copyright 2019 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import { useCallback, useState, useRef, useEffect } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 /**
  * `useAsync` lets you represent the state of an async operation as data. It accepts an async function
@@ -44,7 +46,6 @@ import { useCallback, useState, useRef, useEffect } from 'react';
  *
  *   return { fetchUserProfileAttempt, fetchUserProfile };
  * }
- *
  *
  * @example In the view layer you can use it like this:
  * function UserProfile(props) {
@@ -90,7 +91,7 @@ export function useAsync<Args extends unknown[], AttemptData>(
   const isMounted = useIsMounted();
   const asyncTask = useRef<Promise<AttemptData>>();
 
-  const run = useCallback(
+  const run: (...args: Args) => RunFuncReturnValue<AttemptData> = useCallback(
     (...args: Args) => {
       setState(prevState => ({
         status: 'processing',
@@ -272,3 +273,43 @@ export function mapAttempt<A, B>(
     data: mapFunction(attempt.data),
   };
 }
+
+/**
+ * useDelayedRepeatedAttempt makes it so that on repeated calls to `run`, the attempt changes its
+ * state to 'processing' only after a delay. This can be used to mask repeated calls and
+ * optimistically show stale results.
+ *
+ * @example
+ * const [eagerFetchUserProfileAttempt, fetchUserProfile] = useAsync(async () => {
+ *   return await fetch(`/users/${userId}`);
+ * })
+ * const fetchUserProfileAttempt = useDelayedRepeatedAttempt(eagerFetchUserProfileAttempt, 600)
+ */
+export function useDelayedRepeatedAttempt<Data>(
+  attempt: Attempt<Data>,
+  delayMs = 400
+): Attempt<Data> {
+  const [currentAttempt, setCurrentAttempt] = useState(attempt);
+
+  useEffect(() => {
+    if (
+      currentAttempt.status === 'success' &&
+      attempt.status === 'processing'
+    ) {
+      const timeout = setTimeout(() => {
+        setCurrentAttempt(attempt);
+      }, delayMs);
+      return () => {
+        clearTimeout(timeout);
+      };
+    }
+
+    if (currentAttempt !== attempt) {
+      setCurrentAttempt(attempt);
+    }
+  }, [attempt, currentAttempt, delayMs]);
+
+  return currentAttempt;
+}
+
+export type RunFuncReturnValue<AttemptData> = Promise<[AttemptData, Error]>;

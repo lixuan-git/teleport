@@ -1,21 +1,26 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package connectmycomputer
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -30,7 +35,7 @@ import (
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/teleterm/api/uri"
 	"github.com/gravitational/teleport/lib/teleterm/clusters"
-	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/lib/utils/hostid"
 )
 
 func TestRoleSetupRun_WithNonLocalUser(t *testing.T) {
@@ -83,8 +88,64 @@ func TestRoleSetupRun_Idempotency(t *testing.T) {
 	_, err = roleSetup.Run(ctx, accessAndIdentity, certManager, &clusters.Cluster{URI: uri.NewClusterURI("foo")})
 	require.NoError(t, err)
 
-	require.Equal(t, 1, accessAndIdentity.callCounts["UpsertRole"], "expected two runs to update the role only once")
+	require.Equal(t, 1, accessAndIdentity.callCounts["CreateRole"], "expected two runs to create the role only once")
+	require.Equal(t, 0, accessAndIdentity.callCounts["UpdateRole"], "expected two runs to not update the role")
 	require.Equal(t, 1, accessAndIdentity.callCounts["UpdateUser"], "expected two runs to update the user only once")
+}
+
+func TestRoleSetupRun_RoleErrors(t *testing.T) {
+	existingRole, err := types.NewRole("connect-my-computer-alice", types.RoleSpecV6{})
+	require.NoError(t, err)
+
+	bogusErr := errors.New("something went wrong")
+
+	tests := []struct {
+		name          string
+		existingRole  types.Role
+		createRoleErr error
+		updateRoleErr error
+		wantErr       error
+	}{
+		{
+			name:          "creating role fails",
+			createRoleErr: bogusErr,
+			wantErr:       bogusErr,
+		},
+		{
+			name:          "updating role fails",
+			existingRole:  existingRole,
+			updateRoleErr: bogusErr,
+			wantErr:       bogusErr,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+
+			user, err := types.NewUser("alice")
+			require.NoError(t, err)
+
+			events := &mockEvents{}
+			certManager := &mockCertManager{}
+			accessAndIdentity := &mockAccessAndIdentity{
+				user:          user,
+				callCounts:    make(map[string]int),
+				events:        events,
+				role:          tt.existingRole,
+				createRoleErr: tt.createRoleErr,
+				updateRoleErr: tt.updateRoleErr,
+			}
+
+			roleSetup, err := NewRoleSetup(&RoleSetupConfig{})
+			require.NoError(t, err)
+
+			_, err = roleSetup.Run(ctx, accessAndIdentity, certManager, &clusters.Cluster{URI: uri.NewClusterURI("foo")})
+			require.Error(t, err)
+			require.ErrorIs(t, err, tt.wantErr)
+		})
+	}
 }
 
 const nodejoinWaitTestTimeout = 10 * time.Second
@@ -149,6 +210,8 @@ func TestNodeJoinWaitRun_WatchesForOpPutIfNodeWasNotFound(t *testing.T) {
 	accessAndIdentity := &mockAccessAndIdentity{
 		callCounts: make(map[string]int),
 		events:     events,
+		// Setting to true because we manually fire OpPut from test body.
+		requireManualOpInitFire: true,
 	}
 
 	nodeJoinWait, err := NewNodeJoinWait(&NodeJoinWaitConfig{AgentsDir: t.TempDir()})
@@ -175,6 +238,8 @@ func TestNodeJoinWaitRun_WatchesForOpPutIfNodeWasNotFound(t *testing.T) {
 
 	err = accessAndIdentity.events.WaitSomeWatchers(ctx)
 	require.NoError(t, err)
+	accessAndIdentity.events.Fire(types.Event{Type: types.OpInit})
+
 	// Fire an event with another node first to verify that NodeJoinWait does the comparison correctly.
 	accessAndIdentity.events.Fire(types.Event{
 		Type:     types.OpPut,
@@ -225,11 +290,25 @@ type mockAccessAndIdentity struct {
 	role       types.Role
 	callCounts map[string]int
 	events     *mockEvents
-	node       types.Server
-	nodeErr    error
+	// requireManualOpInitFire makes mockAccessAndIdentity.NewWatcher skip firing OpInit.
+	//
+	// In regular tests where this field is false, the code under tests calls
+	// mockAccessAndIdentity.NewWatcher (which fires OpInit), waits for OpInit, and then calls another
+	// method on mockAccessAndIdentity which fires an event.
+	//
+	// In tests where events such as OpPut are triggered directly from the test body and not as a
+	// result of the code under tests calling methods on mockAccessAndIdentity, setting it to true
+	// allows manually firing OpInit first before firing other events. This ensures that the first
+	// event that watchers observe is OpInit.
+	//
+	requireManualOpInitFire bool
+	node                    types.Server
+	nodeErr                 error
+	createRoleErr           error
+	updateRoleErr           error
 }
 
-func (m *mockAccessAndIdentity) GetUser(name string, withSecrets bool) (types.User, error) {
+func (m *mockAccessAndIdentity) GetUser(ctx context.Context, name string, withSecrets bool) (types.User, error) {
 	return m.user, nil
 }
 
@@ -240,14 +319,34 @@ func (m *mockAccessAndIdentity) GetRole(ctx context.Context, name string) (types
 	return nil, trace.NotFound("role not found")
 }
 
-func (m *mockAccessAndIdentity) UpsertRole(ctx context.Context, role types.Role) error {
-	m.callCounts["UpsertRole"]++
+func (m *mockAccessAndIdentity) CreateRole(ctx context.Context, role types.Role) (types.Role, error) {
+	m.callCounts["CreateRole"]++
+
+	if m.createRoleErr != nil {
+		return nil, m.createRoleErr
+	}
+
 	m.role = role
 	m.events.Fire(types.Event{
 		Type:     types.OpPut,
 		Resource: role,
 	})
-	return nil
+	return role, nil
+}
+
+func (m *mockAccessAndIdentity) UpdateRole(ctx context.Context, role types.Role) (types.Role, error) {
+	m.callCounts["UpdateRole"]++
+
+	if m.updateRoleErr != nil {
+		return nil, m.updateRoleErr
+	}
+
+	m.role = role
+	m.events.Fire(types.Event{
+		Type:     types.OpPut,
+		Resource: role,
+	})
+	return role, nil
 }
 
 func (m *mockAccessAndIdentity) NewWatcher(ctx context.Context, watch types.Watch) (types.Watcher, error) {
@@ -256,19 +355,21 @@ func (m *mockAccessAndIdentity) NewWatcher(ctx context.Context, watch types.Watc
 		return nil, trace.Wrap(err)
 	}
 
-	m.events.Fire(types.Event{Type: types.OpInit})
+	if !m.requireManualOpInitFire {
+		m.events.Fire(types.Event{Type: types.OpInit})
+	}
 
 	return watcher, nil
 }
 
-func (m *mockAccessAndIdentity) UpdateUser(ctx context.Context, user types.User) error {
+func (m *mockAccessAndIdentity) UpdateUser(ctx context.Context, user types.User) (types.User, error) {
 	m.callCounts["UpdateUser"]++
 	m.user = user
 	m.events.Fire(types.Event{
 		Type:     types.OpPut,
 		Resource: user,
 	})
-	return nil
+	return user, nil
 }
 
 func (m *mockAccessAndIdentity) GetNode(ctx context.Context, namespace, name string) (types.Server, error) {
@@ -371,7 +472,7 @@ func mustMakeHostUUIDFile(t *testing.T, agentsDir string, profileName string) st
 	err = os.MkdirAll(dataDir, agentsDirStat.Mode())
 	require.NoError(t, err)
 
-	hostUUID, err := utils.ReadOrMakeHostUUID(dataDir)
+	hostUUID, err := hostid.ReadOrCreateFile(dataDir)
 	require.NoError(t, err)
 
 	return hostUUID

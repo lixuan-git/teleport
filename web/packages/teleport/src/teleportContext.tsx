@@ -1,50 +1,57 @@
-/*
-Copyright 2019-2023 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+import { UserPreferences } from 'gen-proto-ts/teleport/userpreferences/v1/userpreferences_pb';
 
 import cfg from 'teleport/config';
 
-import { StoreNav, StoreUserContext } from './stores';
-import * as types from './types';
-import AuditService from './services/audit';
-import RecordingsService from './services/recordings';
-import NodeService from './services/nodes';
-import clusterService from './services/clusters';
-import sessionService from './services/session';
-import ResourceService from './services/resources';
-import userService from './services/user';
+import { notificationContentFactory } from './Notifications';
+import { agentService } from './services/agents';
 import appService from './services/apps';
-import JoinTokenService from './services/joinToken';
-import KubeService from './services/kube';
+import AuditService from './services/audit';
+import ClustersService from './services/clusters/clusters';
 import DatabaseService from './services/databases';
 import desktopService from './services/desktops';
-import userGroupService from './services/userGroups';
+import JoinTokenService from './services/joinToken';
+import KubeService from './services/kube';
 import MfaService from './services/mfa';
-import { agentService } from './services/agents';
-import localStorage from './services/localStorage';
+import NodeService from './services/nodes';
+import { NotificationService } from './services/notifications';
+import RecordingsService from './services/recordings';
+import ResourceService from './services/resources';
+import sessionService from './services/session';
+import { storageService } from './services/storageService';
+import userService from './services/user';
+import userGroupService from './services/userGroups';
+import { StoreNav, StoreNotifications, StoreUserContext } from './stores';
+import * as types from './types';
 
 class TeleportContext implements types.Context {
   // stores
   storeNav = new StoreNav();
   storeUser = new StoreUserContext();
+  storeNotifications = new StoreNotifications();
 
   // services
   auditService = new AuditService();
   recordingsService = new RecordingsService();
   nodeService = new NodeService();
-  clusterService = clusterService;
+  clusterService = new ClustersService();
   sshService = sessionService;
   resourceService = new ResourceService();
   userService = userService;
@@ -55,40 +62,68 @@ class TeleportContext implements types.Context {
   desktopService = desktopService;
   userGroupService = userGroupService;
   mfaService = new MfaService();
+  notificationService = new NotificationService();
+
+  notificationContentFactory = notificationContentFactory;
 
   isEnterprise = cfg.isEnterprise;
   isCloud = cfg.isCloud;
   automaticUpgradesEnabled = cfg.automaticUpgrades;
-  assistEnabled = cfg.assistEnabled;
+  automaticUpgradesTargetVersion = cfg.automaticUpgradesTargetVersion;
   agentService = agentService;
+  // redirectUrl is used to redirect the user to a specific page after init.
+  redirectUrl: string | null = null;
 
   // lockedFeatures are the features disabled in the user's cluster.
   // Mainly used to hide features and/or show CTAs when the user cluster doesn't support it.
-  // TODO(mcbattirola): use cluster features instead of only using `isUsageBasedBilling`
-  // to determine which feature is locked
   lockedFeatures: types.LockedFeatures = {
-    authConnectors: cfg.isUsageBasedBilling,
-    activeSessions: cfg.isUsageBasedBilling,
-    accessRequests: cfg.isUsageBasedBilling,
-    premiumSupport: cfg.isUsageBasedBilling,
-    trustedDevices: cfg.isUsageBasedBilling,
+    authConnectors: !(
+      cfg.entitlements.OIDC.enabled && cfg.entitlements.SAML.enabled
+    ),
+    accessRequests: !cfg.entitlements.AccessRequests.enabled,
+    trustedDevices: !cfg.entitlements.DeviceTrust.enabled,
   };
+  // entitlements define a customer’s access to a specific features
+  entitlements = cfg.entitlements;
+
+  // hasExternalAuditStorage indicates if an account has set up external audit storage. It is used to show or hide the External Audit Storage CTAs.
+  hasExternalAuditStorage = false;
 
   // init fetches data required for initial rendering of components.
   // The caller of this function provides the try/catch
   // block.
-  async init() {
+  // preferences are needed in TeleportContextE, but not in TeleportContext.
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  async init(preferences: UserPreferences) {
     const user = await userService.fetchUserContext();
     this.storeUser.setState(user);
 
     if (
       this.storeUser.hasPrereqAccessToAddAgents() &&
       this.storeUser.hasAccessToQueryAgent() &&
-      !localStorage.getOnboardDiscover()
+      !storageService.getOnboardDiscover()
     ) {
       const hasResource =
-        await userService.checkUserHasAccessToRegisteredResource();
-      localStorage.setOnboardDiscover({ hasResource });
+        await userService.checkUserHasAccessToAnyRegisteredResource();
+      storageService.setOnboardDiscover({ hasResource });
+    }
+
+    if (user.acl.accessGraph.list) {
+      // If access graph is enabled, check what features are enabled and store them in local storage.
+      // We await this so it is done by the time the page renders, otherwise the local storage event
+      // wouldn't trigger a re-render and Policy could end up not being displayed until the navigation
+      // is re-rendered.
+      await userService
+        .fetchAccessGraphFeatures()
+        .then(features => {
+          for (let key in features) {
+            window.localStorage.setItem(key, features[key]);
+          }
+        })
+        .catch(e => {
+          // If we fail to fetch access graph features, log the error and continue.
+          console.error('Failed to fetch access graph features', e);
+        });
     }
   }
 
@@ -96,34 +131,7 @@ class TeleportContext implements types.Context {
     const userContext = this.storeUser;
 
     if (!this.storeUser.state) {
-      return {
-        activeSessions: false,
-        applications: false,
-        audit: false,
-        authConnector: false,
-        billing: false,
-        databases: false,
-        desktops: false,
-        kubernetes: false,
-        nodes: false,
-        recordings: false,
-        roles: false,
-        trustedClusters: false,
-        users: false,
-        newAccessRequest: false,
-        accessRequests: false,
-        downloadCenter: false,
-        discover: false,
-        plugins: false,
-        integrations: false,
-        deviceTrust: false,
-        enrollIntegrationsOrPlugins: false,
-        enrollIntegrations: false,
-        locks: false,
-        newLocks: false,
-        assist: false,
-        managementSection: false,
-      };
+      return disabledFeatureFlags;
     }
 
     // If feature hiding is enabled in the license, this returns true if the user has no list access to any feature within the management section.
@@ -142,7 +150,12 @@ class TeleportContext implements types.Context {
         userContext.getIntegrationsAccess().list ||
         userContext.hasDiscoverAccess() ||
         userContext.getDeviceTrustAccess().list ||
-        userContext.getLockAccess().list
+        userContext.getLockAccess().list ||
+        userContext.getAccessListAccess().list ||
+        userContext.getAccessGraphAccess().list ||
+        hasAccessMonitoringAccess() ||
+        userContext.getTokenAccess().create ||
+        userContext.getBotsAccess().list
       );
     }
 
@@ -151,6 +164,7 @@ class TeleportContext implements types.Context {
       // having list access, requestable roles, or allowed search_as_roles.
       if (cfg.hideInaccessibleFeatures) {
         return !!(
+          userContext.getReviewRequests() ||
           userContext.getAccessRequestAccess().list ||
           userContext.getRequestableRoles().length ||
           userContext.getAllowedSearchAsRoles().length
@@ -161,6 +175,23 @@ class TeleportContext implements types.Context {
       return !cfg.isDashboard;
     }
 
+    function hasAccessMonitoringAccess() {
+      return (
+        userContext.getAuditQueryAccess().list ||
+        userContext.getSecurityReportAccess().list
+      );
+    }
+
+    function hasAccessGraphIntegrationsAccess() {
+      return (
+        userContext.getIntegrationsAccess().list &&
+        userContext.getIntegrationsAccess().read &&
+        userContext.getPluginsAccess().read &&
+        userContext.getDiscoveryConfigAccess().list &&
+        userContext.getDiscoveryConfigAccess().read
+      );
+    }
+
     return {
       audit: userContext.getEventAccess().list,
       recordings: userContext.getSessionsAccess().list,
@@ -168,31 +199,89 @@ class TeleportContext implements types.Context {
       roles: userContext.getRoleAccess().list,
       trustedClusters: userContext.getTrustedClusterAccess().list,
       users: userContext.getUserAccess().list,
-      applications: userContext.getAppServerAccess().list,
-      kubernetes: userContext.getKubeServerAccess().list,
+      applications:
+        userContext.getAppServerAccess().list &&
+        userContext.getAppServerAccess().read,
+      kubernetes:
+        userContext.getKubeServerAccess().list &&
+        userContext.getKubeServerAccess().read,
       billing: userContext.getBillingAccess().list,
-      databases: userContext.getDatabaseServerAccess().list,
-      desktops: userContext.getDesktopAccess().list,
+      databases:
+        userContext.getDatabaseServerAccess().list &&
+        userContext.getDatabaseServerAccess().read,
+      desktops:
+        userContext.getDesktopAccess().list &&
+        userContext.getDesktopAccess().read,
       nodes: userContext.getNodeAccess().list,
       activeSessions: userContext.getActiveSessionsAccess().list,
       accessRequests: hasAccessRequestsAccess(),
       newAccessRequest: userContext.getAccessRequestAccess().create,
       downloadCenter: userContext.hasDownloadCenterListAccess(),
+      supportLink: userContext.hasSupportPageLinkAccess(),
       discover: userContext.hasDiscoverAccess(),
       plugins: userContext.getPluginsAccess().list,
       integrations: userContext.getIntegrationsAccess().list,
-      enrollIntegrations: userContext.getIntegrationsAccess().create,
+      enrollIntegrations:
+        userContext.getIntegrationsAccess().create ||
+        userContext.getExternalAuditStorageAccess().create,
       enrollIntegrationsOrPlugins:
         userContext.getPluginsAccess().create ||
-        userContext.getIntegrationsAccess().create,
+        userContext.getIntegrationsAccess().create ||
+        userContext.getExternalAuditStorageAccess().create,
       deviceTrust: userContext.getDeviceTrustAccess().list,
       locks: userContext.getLockAccess().list,
       newLocks:
         userContext.getLockAccess().create && userContext.getLockAccess().edit,
-      assist: userContext.getAssistantAccess().list && this.assistEnabled,
+      accessMonitoring: hasAccessMonitoringAccess(),
       managementSection: hasManagementSectionAccess(),
+      accessGraph: userContext.getAccessGraphAccess().list,
+      accessGraphIntegrations: hasAccessGraphIntegrationsAccess(),
+      tokens: userContext.getTokenAccess().create,
+      externalAuditStorage: userContext.getExternalAuditStorageAccess().list,
+      listBots: userContext.getBotsAccess().list,
+      addBots: userContext.getBotsAccess().create,
+      editBots: userContext.getBotsAccess().edit,
+      removeBots: userContext.getBotsAccess().remove,
     };
   }
 }
+
+export const disabledFeatureFlags: types.FeatureFlags = {
+  activeSessions: false,
+  applications: false,
+  audit: false,
+  authConnector: false,
+  billing: false,
+  databases: false,
+  desktops: false,
+  kubernetes: false,
+  nodes: false,
+  recordings: false,
+  roles: false,
+  trustedClusters: false,
+  users: false,
+  newAccessRequest: false,
+  tokens: false,
+  accessRequests: false,
+  downloadCenter: false,
+  supportLink: false,
+  discover: false,
+  plugins: false,
+  integrations: false,
+  deviceTrust: false,
+  enrollIntegrationsOrPlugins: false,
+  enrollIntegrations: false,
+  locks: false,
+  newLocks: false,
+  managementSection: false,
+  accessMonitoring: false,
+  accessGraph: false,
+  accessGraphIntegrations: false,
+  externalAuditStorage: false,
+  addBots: false,
+  listBots: false,
+  editBots: false,
+  removeBots: false,
+};
 
 export default TeleportContext;

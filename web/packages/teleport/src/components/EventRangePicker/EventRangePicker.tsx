@@ -1,38 +1,51 @@
-/*
-Copyright 2019 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+import { useState } from 'react';
+import { components, ValueContainerProps } from 'react-select';
 
-    http://www.apache.org/licenses/LICENSE-2.0
+import 'react-day-picker/dist/style.css';
 
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+import styled from 'styled-components';
 
-import React, { useState } from 'react';
-import { components } from 'react-select';
-import 'react-day-picker/lib/style.css';
-import { Text, Box } from 'design';
+import { Box, Text } from 'design';
+import { displayDate } from 'design/datetime';
 import Dialog from 'design/DialogConfirmation';
-import { displayDate } from 'shared/services/loc';
-
 import Select, { Option } from 'shared/components/Select';
+import { useRefClickOutside } from 'shared/hooks/useRefClickOutside';
 
 import { State } from 'teleport/Audit/useAuditEvents';
 
-import CustomRange from './Custom';
+import { CustomRange } from './Custom';
 import { EventRange } from './utils';
+
+type RangeOption = Option<EventRange, string>;
 
 export default function DataRange({ ml, range, onChangeRange, ranges }: Props) {
   const [isPickerOpen, openDayPicker] = useState(false);
   const [rangeOptions] = useState(() =>
     ranges.map(range => ({ value: range, label: range.name }))
   );
+
+  const dayPickerRef = useRefClickOutside<HTMLDivElement>({
+    open: isPickerOpen,
+    setOpen: openDayPicker,
+  });
 
   function handleOnChange(option: Option<EventRange>) {
     if (option.value.isCustom) {
@@ -69,25 +82,27 @@ export default function DataRange({ ml, range, onChangeRange, ranges }: Props) {
         open={isPickerOpen}
       >
         <CustomRange
-          from={range.from}
-          to={range.to}
+          initialRange={{ from: range.from, to: range.to }}
           onChange={onSetCustomRange}
-          onClosePicker={onClosePicker}
+          ref={dayPickerRef}
         />
       </Dialog>
     </>
   );
 }
 
-const ValueContainer = ({ children, ...props }) => {
+const ValueContainer = ({
+  children,
+  ...props
+}: ValueContainerProps<RangeOption>) => {
   const { isCustom, from, to } = props.getValue()[0].value;
 
   if (isCustom) {
     return (
       <components.ValueContainer {...props}>
-        <Text color="text.main">
+        <ValueText color="text.main">
           {`${displayDate(from)} - ${displayDate(to)}`}
-        </Text>
+        </ValueText>
         {children}
       </components.ValueContainer>
     );
@@ -97,6 +112,11 @@ const ValueContainer = ({ children, ...props }) => {
     <components.ValueContainer {...props}>{children}</components.ValueContainer>
   );
 };
+
+/** Positions the value text on the internal react-select grid. */
+const ValueText = styled(Text)`
+  grid-area: 1/1/2/3;
+`;
 
 type Props = {
   ml?: string | number;

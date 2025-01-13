@@ -1,66 +1,58 @@
 /*
-Copyright 2015-2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package auth
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"net/url"
+	"os"
+	"slices"
 	"strings"
 	"time"
 
-	"github.com/coreos/go-semver/semver"
 	"github.com/google/uuid"
-	"github.com/gravitational/roundtrip"
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 	collectortracev1 "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	otlpcommonv1 "go.opentelemetry.io/proto/otlp/common/v1"
-	"golang.org/x/exp/slices"
 
 	"github.com/gravitational/teleport"
-	"github.com/gravitational/teleport/api"
 	"github.com/gravitational/teleport/api/client"
-	"github.com/gravitational/teleport/api/client/accesslist"
-	"github.com/gravitational/teleport/api/client/okta"
 	"github.com/gravitational/teleport/api/client/proto"
-	"github.com/gravitational/teleport/api/client/userloginstate"
 	"github.com/gravitational/teleport/api/constants"
 	apidefaults "github.com/gravitational/teleport/api/defaults"
-	"github.com/gravitational/teleport/api/gen/proto/go/assist/v1"
-	accesslistv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/accesslist/v1"
-	devicepb "github.com/gravitational/teleport/api/gen/proto/go/teleport/devicetrust/v1"
-	integrationpb "github.com/gravitational/teleport/api/gen/proto/go/teleport/integration/v1"
-	loginrulepb "github.com/gravitational/teleport/api/gen/proto/go/teleport/loginrule/v1"
-	oktapb "github.com/gravitational/teleport/api/gen/proto/go/teleport/okta/v1"
-	pluginspb "github.com/gravitational/teleport/api/gen/proto/go/teleport/plugins/v1"
-	resourceusagepb "github.com/gravitational/teleport/api/gen/proto/go/teleport/resourceusage/v1"
-	samlidppb "github.com/gravitational/teleport/api/gen/proto/go/teleport/samlidp/v1"
-	trustpb "github.com/gravitational/teleport/api/gen/proto/go/teleport/trust/v1"
-	userloginstatev1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/userloginstate/v1"
-	userpreferencespb "github.com/gravitational/teleport/api/gen/proto/go/userpreferences/v1"
+	auditlogpb "github.com/gravitational/teleport/api/gen/proto/go/teleport/auditlog/v1"
+	headerv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/header/v1"
+	identitycenterv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/identitycenter/v1"
+	mfav1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/mfa/v1"
 	"github.com/gravitational/teleport/api/internalutils/stream"
+	"github.com/gravitational/teleport/api/metadata"
 	"github.com/gravitational/teleport/api/types"
 	apievents "github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/api/types/wrappers"
 	apiutils "github.com/gravitational/teleport/api/utils"
 	"github.com/gravitational/teleport/api/utils/keys"
-	"github.com/gravitational/teleport/lib/auth/integration/integrationv1"
-	"github.com/gravitational/teleport/lib/auth/trust/trustv1"
+	"github.com/gravitational/teleport/entitlements"
+	"github.com/gravitational/teleport/lib/auth/authclient"
+	"github.com/gravitational/teleport/lib/auth/clusterconfig/clusterconfigv1"
+	"github.com/gravitational/teleport/lib/auth/okta"
 	"github.com/gravitational/teleport/lib/authz"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/defaults"
@@ -71,7 +63,8 @@ import (
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/services/local"
 	"github.com/gravitational/teleport/lib/session"
-	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/lib/tlsca"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
 // ServerWithRoles is a wrapper around auth service
@@ -88,95 +81,99 @@ func (a *ServerWithRoles) CloseContext() context.Context {
 	return a.authServer.closeCtx
 }
 
-func (a *ServerWithRoles) actionWithContext(ctx *services.Context, namespace, resource string, verbs ...string) error {
+// actionForResource will determine if a user has access to the given resource. This call respects where clauses.
+func (a *ServerWithRoles) actionForResource(resource types.Resource, kind string, verbs ...string) error {
+	sctx := &services.Context{User: a.context.User}
+	if resource != nil {
+		sctx.Resource = resource
+	}
+	return trace.Wrap(a.actionWithContext(sctx, kind, verbs...))
+}
+
+// actionWithContext will determine if a user has access given a services.Context. This call respects where clauses.
+func (a *ServerWithRoles) actionWithContext(ctx *services.Context, resource string, verbs ...string) error {
 	if len(verbs) == 0 {
 		return trace.BadParameter("no verbs provided for authorization check on resource %q", resource)
 	}
 	var errs []error
 	for _, verb := range verbs {
-		errs = append(errs, a.context.Checker.CheckAccessToRule(ctx, namespace, resource, verb, false))
+		errs = append(errs, a.context.Checker.CheckAccessToRule(ctx, apidefaults.Namespace, resource, verb))
 	}
-	// Convert generic aggregate error to AccessDenied.
 	if err := trace.NewAggregate(errs...); err != nil {
-		return trace.AccessDenied(err.Error())
+		return err
 	}
 	return nil
 }
 
-type actionConfig struct {
-	quiet   bool
-	context authz.Context
-}
-
-type actionOption func(*actionConfig)
-
-func quietAction(quiet bool) actionOption {
-	return func(cfg *actionConfig) {
-		cfg.quiet = quiet
-	}
-}
-
-func (a *ServerWithRoles) withOptions(opts ...actionOption) actionConfig {
-	cfg := actionConfig{context: a.context}
-	for _, opt := range opts {
-		opt(&cfg)
-	}
-	return cfg
-}
-
-func (c actionConfig) action(namespace, resource string, verbs ...string) error {
+func (a *ServerWithRoles) actionNamespace(namespace, resource string, verbs ...string) error {
 	if len(verbs) == 0 {
 		return trace.BadParameter("no verbs provided for authorization check on resource %q", resource)
 	}
 	var errs []error
 	for _, verb := range verbs {
-		errs = append(errs, c.context.Checker.CheckAccessToRule(&services.Context{User: c.context.User}, namespace, resource, verb, c.quiet))
+		errs = append(errs, a.context.Checker.CheckAccessToRule(&services.Context{User: a.context.User}, namespace, resource, verb))
 	}
-	// Convert generic aggregate error to AccessDenied.
 	if err := trace.NewAggregate(errs...); err != nil {
-		return trace.AccessDenied(err.Error())
+		return err
 	}
 	return nil
 }
 
-func (a *ServerWithRoles) action(namespace, resource string, verbs ...string) error {
-	return a.withOptions().action(namespace, resource, verbs...)
+func (a *ServerWithRoles) action(resource string, verbs ...string) error {
+	return a.actionNamespace(apidefaults.Namespace, resource, verbs...)
 }
 
 // currentUserAction is a special checker that allows certain actions for users
 // even if they are not admins, e.g. update their own passwords,
 // or generate certificates, otherwise it will require admin privileges
 func (a *ServerWithRoles) currentUserAction(username string) error {
-	if hasLocalUserRole(a.context) && username == a.context.User.GetName() {
+	if authz.IsCurrentUser(a.context, username) {
 		return nil
 	}
 	return a.context.Checker.CheckAccessToRule(&services.Context{User: a.context.User},
-		apidefaults.Namespace, types.KindUser, types.VerbCreate, true)
+		apidefaults.Namespace, types.KindUser, types.VerbCreate)
 }
 
 // authConnectorAction is a special checker that grants access to auth
 // connectors. It first checks if you have access to the specific connector.
 // If not, it checks if the requester has the meta KindAuthConnector access
 // (which grants access to all connectors).
-func (a *ServerWithRoles) authConnectorAction(namespace string, resource string, verb string) error {
-	if err := a.context.Checker.CheckAccessToRule(&services.Context{User: a.context.User}, namespace, resource, verb, true); err != nil {
-		if err := a.context.Checker.CheckAccessToRule(&services.Context{User: a.context.User}, namespace, types.KindAuthConnector, verb, false); err != nil {
+func (a *ServerWithRoles) authConnectorAction(resource string, verb string) error {
+	if err := a.context.Checker.CheckAccessToRule(&services.Context{User: a.context.User}, apidefaults.Namespace, resource, verb); err != nil {
+		if err := a.context.Checker.CheckAccessToRule(&services.Context{User: a.context.User}, apidefaults.Namespace, types.KindAuthConnector, verb); err != nil {
 			return trace.Wrap(err)
 		}
 	}
 	return nil
 }
 
+// identityCenterAction is a special checker that grants access to Identity Center
+// resources. In order to simplify the writing of role condition statements, the
+// various Identity Center resources are bundled up under an umbrella
+// `KindIdentityCenter` resource kind. This means that if access to the target
+// resource is not explicitly denied, then the user has a second chance to get
+// access via the generic resource kind.
+func (a *ServerWithRoles) identityCenterAction(namespace string, resource string, verbs ...string) error {
+	err := a.actionNamespace(namespace, resource, verbs...)
+	if err == nil || services.IsAccessExplicitlyDenied(err) {
+		return trace.Wrap(err)
+	}
+	return trace.Wrap(a.actionNamespace(namespace, types.KindIdentityCenter, verbs...))
+}
+
 // actionForListWithCondition extracts a restrictive filter condition to be
 // added to a list query after a simple resource check fails.
-func (a *ServerWithRoles) actionForListWithCondition(namespace, resource, identifier string) (*types.WhereExpr, error) {
-	origErr := a.withOptions(quietAction(true)).action(namespace, resource, types.VerbList)
+func (a *ServerWithRoles) actionForListWithCondition(ctx context.Context, resource, identifier string) (*types.WhereExpr, error) {
+	origErr := a.action(resource, types.VerbList)
 	if origErr == nil || !trace.IsAccessDenied(origErr) {
 		return nil, trace.Wrap(origErr)
 	}
-	cond, err := a.context.Checker.ExtractConditionForIdentifier(&services.Context{User: a.context.User}, namespace, resource, types.VerbList, identifier)
+	cond, err := a.context.Checker.ExtractConditionForIdentifier(&services.Context{User: a.context.User}, apidefaults.Namespace, resource, types.VerbList, identifier)
 	if trace.IsAccessDenied(err) {
-		log.WithError(err).Infof("Access to %v %v in namespace %v denied to %v.", types.VerbList, resource, namespace, a.context.Checker)
+		a.authServer.logger.InfoContext(ctx, "Access to list resource denied",
+			"error", err,
+			"resource", resource,
+		)
 		// Return the original AccessDenied to avoid leaking information.
 		return nil, trace.Wrap(origErr)
 	}
@@ -185,30 +182,31 @@ func (a *ServerWithRoles) actionForListWithCondition(namespace, resource, identi
 
 // actionWithExtendedContext performs an additional RBAC check with extended
 // rule context after a simple resource check fails.
-func (a *ServerWithRoles) actionWithExtendedContext(namespace, kind, verb string, extendContext func(*services.Context) error) error {
+func (a *ServerWithRoles) actionWithExtendedContext(ctx context.Context, kind, verb string, extendContext func(*services.Context) error) error {
 	ruleCtx := &services.Context{User: a.context.User}
-	origErr := a.context.Checker.CheckAccessToRule(ruleCtx, namespace, kind, verb, true)
+	origErr := a.context.Checker.CheckAccessToRule(ruleCtx, apidefaults.Namespace, kind, verb)
 	if origErr == nil || !trace.IsAccessDenied(origErr) {
 		return trace.Wrap(origErr)
 	}
 	if err := extendContext(ruleCtx); err != nil {
-		log.WithError(err).Warning("Failed to extend context for second RBAC check.")
+		a.authServer.logger.WarnContext(ctx, "Failed to extend context for second RBAC check", "error", err)
 		// Return the original AccessDenied to avoid leaking information.
 		return trace.Wrap(origErr)
 	}
-	return trace.Wrap(a.context.Checker.CheckAccessToRule(ruleCtx, namespace, kind, verb, false))
+	return trace.Wrap(a.context.Checker.CheckAccessToRule(ruleCtx, apidefaults.Namespace, kind, verb))
 }
 
 // actionForKindSession is a special checker that grants access to session
-// recordings.  It can allow access to a specific recording based on the
+// recordings. It can allow access to a specific recording based on the
 // `where` section of the user's access rule for kind `session`.
-func (a *ServerWithRoles) actionForKindSession(namespace string, sid session.ID) error {
-	extendContext := func(ctx *services.Context) error {
-		sessionEnd, err := a.findSessionEndEvent(namespace, sid)
-		ctx.Session = sessionEnd
+func (a *ServerWithRoles) actionForKindSession(ctx context.Context, sid session.ID) error {
+	extendContext := func(servicesCtx *services.Context) error {
+		sessionEnd, err := a.findSessionEndEvent(ctx, sid)
+		servicesCtx.Session = sessionEnd
 		return trace.Wrap(err)
 	}
-	return trace.Wrap(a.actionWithExtendedContext(namespace, types.KindSession, types.VerbRead, extendContext))
+
+	return trace.Wrap(a.actionWithExtendedContext(ctx, types.KindSession, types.VerbRead, extendContext))
 }
 
 // localServerAction returns an access denied error if the role is not one of the builtin server roles.
@@ -274,231 +272,6 @@ func (a *ServerWithRoles) hasRemoteBuiltinRole(name string) bool {
 	return HasRemoteBuiltinRole(a.context, name)
 }
 
-// hasRemoteUserRole checks if the identity is a remote user or not.
-func hasRemoteUserRole(authContext authz.Context) bool {
-	_, ok := authContext.UnmappedIdentity.(authz.RemoteUser)
-	return ok
-}
-
-// hasLocalUserRole checks if the identity is a local user or not.
-func hasLocalUserRole(authContext authz.Context) bool {
-	_, ok := authContext.UnmappedIdentity.(authz.LocalUser)
-	return ok
-}
-
-// DevicesClient allows ServerWithRoles to implement ClientI.
-// It should not be called through ServerWithRoles,
-// as it returns a dummy client that will always respond with "not implemented".
-func (a *ServerWithRoles) DevicesClient() devicepb.DeviceTrustServiceClient {
-	return devicepb.NewDeviceTrustServiceClient(
-		utils.NewGRPCDummyClientConnection("DevicesClient() should not be called on ServerWithRoles"),
-	)
-}
-
-// LoginRuleClient allows ServerWithRoles to implement ClientI.
-// It should not be called through ServerWithRoles,
-// as it returns a dummy client that will always respond with "not implemented".
-func (a *ServerWithRoles) LoginRuleClient() loginrulepb.LoginRuleServiceClient {
-	return loginrulepb.NewLoginRuleServiceClient(
-		utils.NewGRPCDummyClientConnection("LoginRuleClient() should not be called on ServerWithRoles"),
-	)
-}
-
-// OktaClient allows ServerWithRoles to implement ClientI.
-// It should not be called through ServerWithRoles,
-// as it returns a dummy client that will always respond with "not implemented".
-func (a *ServerWithRoles) OktaClient() services.Okta {
-	return okta.NewClient(oktapb.NewOktaServiceClient(
-		utils.NewGRPCDummyClientConnection("OktaClient() should not be called on ServerWithRoles")))
-}
-
-// PluginsClient allows ServerWithRoles to implement ClientI.
-// It should not be called through ServerWithRoles,
-// as it returns a dummy client that will always respond with "not implemented".
-func (a *ServerWithRoles) PluginsClient() pluginspb.PluginServiceClient {
-	return pluginspb.NewPluginServiceClient(
-		utils.NewGRPCDummyClientConnection("PluginsClient() should not be called on ServerWithRoles"),
-	)
-}
-
-// EmbeddingClient allows ServerWithRoles to implement ClientI.
-// It should not be called through ServerWithRoles,
-// as it returns a dummy client that will always respond with "not implemented".
-func (a *ServerWithRoles) EmbeddingClient() assist.AssistEmbeddingServiceClient {
-	return assist.NewAssistEmbeddingServiceClient(
-		utils.NewGRPCDummyClientConnection("EmbeddingClient() should not be called on ServerWithRoles"),
-	)
-}
-
-// SAMLIdPClient allows ServerWithRoles to implement ClientI.
-// It should not be called through ServerWithRoles,
-// as it returns a dummy client that will always respond with "not implemented".
-func (a *ServerWithRoles) SAMLIdPClient() samlidppb.SAMLIdPServiceClient {
-	return samlidppb.NewSAMLIdPServiceClient(
-		utils.NewGRPCDummyClientConnection("SAMLIdPClient() should not be called on ServerWithRoles"),
-	)
-}
-
-// AccessListClient allows ServerWithRoles to implement ClientI.
-// It should not be called through ServerWithRoles,
-// as it returns a dummy client that will always respond with "not implemented".
-func (a *ServerWithRoles) AccessListClient() services.AccessLists {
-	return accesslist.NewClient(accesslistv1.NewAccessListServiceClient(
-		utils.NewGRPCDummyClientConnection("AccessListClient() should not be called on ServerWithRoles")))
-}
-
-// ResourceUsageClient allows ServerWithRoles to implement ClientI.
-// It should not be called through ServerWithRoles,
-// as it returns a dummy client that will always respond with "not implemented".
-func (a *ServerWithRoles) ResourceUsageClient() resourceusagepb.ResourceUsageServiceClient {
-	return resourceusagepb.NewResourceUsageServiceClient(
-		utils.NewGRPCDummyClientConnection("ResourceUsageClient() should not be called on ServerWithRoles"),
-	)
-}
-
-// UserLoginStateClient allows ServerWithRoles to implement ClientI.
-// It should not be called through ServerWithRoles,
-// as it returns a dummy client that will always respond with "not implemented".
-func (a *ServerWithRoles) UserLoginStateClient() services.UserLoginStates {
-	return userloginstate.NewClient(userloginstatev1.NewUserLoginStateServiceClient(
-		utils.NewGRPCDummyClientConnection("UserLoginStateClient() should not be called on ServerWithRoles")))
-}
-
-// integrationsService returns an Integrations Service.
-func (a *ServerWithRoles) integrationsService() (*integrationv1.Service, error) {
-	igSvc, err := integrationv1.NewService(&integrationv1.ServiceConfig{
-		Authorizer: authz.AuthorizerFunc(func(context.Context) (*authz.Context, error) {
-			return &a.context, nil
-		}),
-		Cache:   a.authServer.Cache,
-		Backend: a.authServer.Services,
-	})
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	return igSvc, nil
-}
-
-// CreateIntegration creates an Integration.
-func (a *ServerWithRoles) CreateIntegration(ctx context.Context, ig types.Integration) (types.Integration, error) {
-	igSvc, err := a.integrationsService()
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	igv1, ok := ig.(*types.IntegrationV1)
-	if !ok {
-		return nil, trace.BadParameter("unexpected integration type %T", ig)
-	}
-
-	ig, err = igSvc.CreateIntegration(ctx, &integrationpb.CreateIntegrationRequest{Integration: igv1})
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return ig, nil
-}
-
-// GetIntegration returns an Integration by its name.
-func (a *ServerWithRoles) GetIntegration(ctx context.Context, name string) (types.Integration, error) {
-	igSvc, err := a.integrationsService()
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	ig, err := igSvc.GetIntegration(ctx, &integrationpb.GetIntegrationRequest{Name: name})
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return ig, nil
-}
-
-// ListIntegrations returns a list of Integrations.
-// A next page can be retreived by calling ListIntegrations again and passing the nextKey from the previous response.
-func (a *ServerWithRoles) ListIntegrations(ctx context.Context, pageSize int, nextKey string) ([]types.Integration, string, error) {
-	igSvc, err := a.integrationsService()
-	if err != nil {
-		return nil, "", trace.Wrap(err)
-	}
-
-	resp, err := igSvc.ListIntegrations(ctx, &integrationpb.ListIntegrationsRequest{
-		Limit:   int32(pageSize),
-		NextKey: nextKey,
-	})
-	if err != nil {
-		return nil, "", trace.Wrap(err)
-	}
-
-	integrations := make([]types.Integration, 0, len(resp.GetIntegrations()))
-	for _, ig := range resp.GetIntegrations() {
-		integrations = append(integrations, ig)
-	}
-
-	return integrations, resp.GetNextKey(), nil
-}
-
-// UpdateIntegration updates an Integration.
-func (a *ServerWithRoles) UpdateIntegration(ctx context.Context, ig types.Integration) (types.Integration, error) {
-	igSvc, err := a.integrationsService()
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	igv1, ok := ig.(*types.IntegrationV1)
-	if !ok {
-		return nil, trace.BadParameter("unexpected integration type %T", ig)
-	}
-
-	ig, err = igSvc.UpdateIntegration(ctx, &integrationpb.UpdateIntegrationRequest{Integration: igv1})
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return ig, nil
-}
-
-// DeleteAllIntegrations deletes all integrations.
-func (a *ServerWithRoles) DeleteAllIntegrations(ctx context.Context) error {
-	igSvc, err := a.integrationsService()
-	if err != nil {
-		return trace.Wrap(err)
-	}
-
-	_, err = igSvc.DeleteAllIntegrations(ctx, &integrationpb.DeleteAllIntegrationsRequest{})
-	return trace.Wrap(err)
-}
-
-// DeleteIntegration deletes an integration integrations.
-func (a *ServerWithRoles) DeleteIntegration(ctx context.Context, name string) error {
-	igSvc, err := a.integrationsService()
-	if err != nil {
-		return trace.Wrap(err)
-	}
-
-	_, err = igSvc.DeleteIntegration(ctx, &integrationpb.DeleteIntegrationRequest{Name: name})
-	return trace.Wrap(err)
-}
-
-// GenerateAWSOIDCToken generates a token to be used when executing an AWS OIDC Integration action.
-func (a *ServerWithRoles) GenerateAWSOIDCToken(ctx context.Context, req types.GenerateAWSOIDCTokenRequest) (string, error) {
-	igSvc, err := a.integrationsService()
-	if err != nil {
-		return "", trace.Wrap(err)
-	}
-
-	if err := req.CheckAndSetDefaults(); err != nil {
-		return "", trace.Wrap(err)
-	}
-
-	resp, err := igSvc.GenerateAWSOIDCToken(ctx, &integrationpb.GenerateAWSOIDCTokenRequest{
-		Issuer: req.Issuer,
-	})
-	if err != nil {
-		return "", trace.Wrap(err)
-	}
-
-	return resp.Token, nil
-}
-
 // CreateSessionTracker creates a tracker resource for an active session.
 func (a *ServerWithRoles) CreateSessionTracker(ctx context.Context, tracker types.SessionTracker) (types.SessionTracker, error) {
 	if err := a.localServerAction(); err != nil {
@@ -512,12 +285,12 @@ func (a *ServerWithRoles) CreateSessionTracker(ctx context.Context, tracker type
 	return tracker, nil
 }
 
-func (a *ServerWithRoles) filterSessionTracker(ctx context.Context, joinerRoles []types.Role, tracker types.SessionTracker, verb string) bool {
+func (a *ServerWithRoles) filterSessionTracker(joinerRoles []types.Role, tracker types.SessionTracker, verb string) bool {
 	// Apply RFD 45 RBAC rules to the session if it's SSH.
 	// This is a bit of a hack. It converts to the old legacy format
 	// which we don't have all data for, luckily the fields we don't have aren't made available
 	// to the RBAC filter anyway.
-	if tracker.GetKind() == types.KindSSHSession {
+	if tracker.GetSessionKind() == types.SSHSessionKind {
 		ruleCtx := &services.Context{User: a.context.User}
 		ruleCtx.SSHSession = &session.Session{
 			Kind:           tracker.GetSessionKind(),
@@ -540,13 +313,13 @@ func (a *ServerWithRoles) filterSessionTracker(ctx context.Context, joinerRoles 
 		}
 
 		// Skip past it if there's a deny rule in place blocking access.
-		if err := a.context.Checker.CheckAccessToRule(ruleCtx, apidefaults.Namespace, types.KindSSHSession, verb, true /* silent */); err != nil {
+		if err := a.context.Checker.CheckAccessToRule(ruleCtx, apidefaults.Namespace, types.KindSSHSession, verb); err != nil {
 			return false
 		}
 	}
 
 	ruleCtx := &services.Context{User: a.context.User, SessionTracker: tracker}
-	if a.context.Checker.CheckAccessToRule(ruleCtx, apidefaults.Namespace, types.KindSessionTracker, types.VerbList, true /* silent */) == nil {
+	if a.context.Checker.CheckAccessToRule(ruleCtx, apidefaults.Namespace, types.KindSessionTracker, types.VerbList) == nil {
 		return true
 	}
 
@@ -668,7 +441,7 @@ func (a *ServerWithRoles) GetSessionTracker(ctx context.Context, sessionID strin
 		return nil, trace.Wrap(err)
 	}
 
-	ok := a.filterSessionTracker(ctx, joinerRoles, tracker, types.VerbRead)
+	ok := a.filterSessionTracker(joinerRoles, tracker, types.VerbRead)
 	if !ok {
 		return nil, trace.NotFound("session %v not found", sessionID)
 	}
@@ -695,7 +468,7 @@ func (a *ServerWithRoles) GetActiveSessionTrackers(ctx context.Context) ([]types
 	}
 
 	for _, sess := range sessions {
-		ok := a.filterSessionTracker(ctx, joinerRoles, sess, types.VerbList)
+		ok := a.filterSessionTracker(joinerRoles, sess, types.VerbList)
 		if ok {
 			filteredSessions = append(filteredSessions, sess)
 		}
@@ -723,7 +496,7 @@ func (a *ServerWithRoles) GetActiveSessionTrackersWithFilter(ctx context.Context
 	}
 
 	for _, sess := range sessions {
-		ok := a.filterSessionTracker(ctx, joinerRoles, sess, types.VerbList)
+		ok := a.filterSessionTracker(joinerRoles, sess, types.VerbList)
 		if ok {
 			filteredSessions = append(filteredSessions, sess)
 		}
@@ -752,8 +525,8 @@ func (a *ServerWithRoles) UpdateSessionTracker(ctx context.Context, req *proto.U
 
 // AuthenticateWebUser authenticates web user, creates and returns a web session
 // in case authentication is successful
-func (a *ServerWithRoles) AuthenticateWebUser(ctx context.Context, req AuthenticateUserRequest) (types.WebSession, error) {
-	// authentication request has it's own authentication, however this limits the requests
+func (a *ServerWithRoles) AuthenticateWebUser(ctx context.Context, req authclient.AuthenticateUserRequest) (types.WebSession, error) {
+	// authentication request has its own authentication, however this limits the requests
 	// types to proxies to make it harder to break
 	if !a.hasBuiltinRole(types.RoleProxy) {
 		return nil, trace.AccessDenied("this request can be only executed by a proxy")
@@ -763,8 +536,8 @@ func (a *ServerWithRoles) AuthenticateWebUser(ctx context.Context, req Authentic
 
 // AuthenticateSSHUser authenticates SSH console user, creates and  returns a pair of signed TLS and SSH
 // short lived certificates as a result
-func (a *ServerWithRoles) AuthenticateSSHUser(ctx context.Context, req AuthenticateSSHRequest) (*SSHLoginResponse, error) {
-	// authentication request has it's own authentication, however this limits the requests
+func (a *ServerWithRoles) AuthenticateSSHUser(ctx context.Context, req authclient.AuthenticateSSHRequest) (*authclient.SSHLoginResponse, error) {
+	// authentication request has its own authentication, however this limits the requests
 	// types to proxies to make it harder to break
 	if !a.hasBuiltinRole(types.RoleProxy) {
 		return nil, trace.AccessDenied("this request can be only executed by a proxy")
@@ -782,114 +555,13 @@ func (a *ServerWithRoles) GenerateOpenSSHCert(ctx context.Context, req *proto.Op
 	return a.authServer.GenerateOpenSSHCert(ctx, req)
 }
 
-// CreateCertAuthority not implemented: can only be called locally.
-func (a *ServerWithRoles) CreateCertAuthority(ctx context.Context, ca types.CertAuthority) error {
-	return trace.NotImplemented(notImplementedMessage)
-}
-
-// RotateCertAuthority starts or restarts certificate authority rotation process.
-func (a *ServerWithRoles) RotateCertAuthority(ctx context.Context, req RotateRequest) error {
-	if err := req.CheckAndSetDefaults(a.authServer.clock); err != nil {
-		return trace.Wrap(err)
-	}
-	if err := a.action(apidefaults.Namespace, types.KindCertAuthority, types.VerbCreate, types.VerbUpdate); err != nil {
-		return trace.Wrap(err)
-	}
-	return a.authServer.RotateCertAuthority(ctx, req)
-}
-
-// RotateExternalCertAuthority rotates external certificate authority,
-// this method is called by a remote trusted cluster and is used to update
-// only public keys and certificates of the certificate authority.
-func (a *ServerWithRoles) RotateExternalCertAuthority(ctx context.Context, ca types.CertAuthority) error {
-	if ca == nil {
-		return trace.BadParameter("missing certificate authority")
-	}
-	sctx := &services.Context{User: a.context.User, Resource: ca}
-	if err := a.actionWithContext(sctx, apidefaults.Namespace, types.KindCertAuthority, types.VerbRotate); err != nil {
-		return trace.Wrap(err)
-	}
-	return a.authServer.RotateExternalCertAuthority(ctx, ca)
-}
-
-// UpsertCertAuthority updates existing cert authority or updates the existing one.
-func (a *ServerWithRoles) UpsertCertAuthority(ctx context.Context, ca types.CertAuthority) error {
-	trust, err := trustv1.NewService(&trustv1.ServiceConfig{
-		Authorizer: authz.AuthorizerFunc(func(context.Context) (*authz.Context, error) {
-			return &a.context, nil
-		}),
-		Cache:   a.authServer.Cache,
-		Backend: a.authServer.Services,
-	})
-	if err != nil {
-		return trace.Wrap(err)
-	}
-
-	cav2, ok := ca.(*types.CertAuthorityV2)
-	if !ok {
-		return trace.BadParameter("unexpected ca type %T", ca)
-	}
-
-	_, err = trust.UpsertCertAuthority(ctx, &trustpb.UpsertCertAuthorityRequest{CertAuthority: cav2})
-	return trace.Wrap(err)
-}
-
 // CompareAndSwapCertAuthority updates existing cert authority if the existing cert authority
 // value matches the value stored in the backend.
 func (a *ServerWithRoles) CompareAndSwapCertAuthority(new, existing types.CertAuthority) error {
-	if err := a.action(apidefaults.Namespace, types.KindCertAuthority, types.VerbCreate, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindCertAuthority, types.VerbCreate, types.VerbUpdate); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.CompareAndSwapCertAuthority(new, existing)
-}
-
-func (a *ServerWithRoles) GetCertAuthorities(ctx context.Context, caType types.CertAuthType, loadKeys bool) ([]types.CertAuthority, error) {
-	trust, err := trustv1.NewService(&trustv1.ServiceConfig{
-		Authorizer: authz.AuthorizerFunc(func(context.Context) (*authz.Context, error) {
-			return &a.context, nil
-		}),
-		Cache:   a.authServer.Cache,
-		Backend: a.authServer.Services,
-	})
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	resp, err := trust.GetCertAuthorities(ctx, &trustpb.GetCertAuthoritiesRequest{Type: string(caType), IncludeKey: loadKeys})
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	cas := make([]types.CertAuthority, 0, len(resp.CertAuthoritiesV2))
-	for _, ca := range resp.CertAuthoritiesV2 {
-		cas = append(cas, ca)
-	}
-
-	return cas, trace.Wrap(err)
-}
-
-func (a *ServerWithRoles) GetCertAuthority(ctx context.Context, id types.CertAuthID, loadKeys bool) (types.CertAuthority, error) {
-	trust, err := trustv1.NewService(&trustv1.ServiceConfig{
-		Authorizer: authz.AuthorizerFunc(func(context.Context) (*authz.Context, error) {
-			return &a.context, nil
-		}),
-		Cache:   a.authServer.Cache,
-		Backend: a.authServer.Services,
-	})
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	resp, err := trust.GetCertAuthority(ctx, &trustpb.GetCertAuthorityRequest{
-		Domain:     id.DomainName,
-		Type:       string(id.Type),
-		IncludeKey: loadKeys,
-	})
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	return resp, trace.Wrap(err)
 }
 
 func (a *ServerWithRoles) GetDomainName(ctx context.Context) (string, error) {
@@ -907,67 +579,51 @@ func (a *ServerWithRoles) GetClusterCACert(
 	return a.authServer.GetClusterCACert(ctx)
 }
 
-func (a *ServerWithRoles) DeleteCertAuthority(ctx context.Context, id types.CertAuthID) error {
-	trust, err := trustv1.NewService(&trustv1.ServiceConfig{
-		Authorizer: authz.AuthorizerFunc(func(context.Context) (*authz.Context, error) {
-			return &a.context, nil
-		}),
-		Cache:   a.authServer.Cache,
-		Backend: a.authServer.Services,
-	})
-	if err != nil {
-		return trace.Wrap(err)
-	}
-
-	if _, err := trust.DeleteCertAuthority(ctx, &trustpb.DeleteCertAuthorityRequest{Domain: id.DomainName, Type: string(id.Type)}); err != nil {
-		return trace.Wrap(err)
-	}
-
-	return nil
-}
-
-// ActivateCertAuthority not implemented: can only be called locally.
-func (a *ServerWithRoles) ActivateCertAuthority(id types.CertAuthID) error {
-	return trace.NotImplemented(notImplementedMessage)
-}
-
-// DeactivateCertAuthority not implemented: can only be called locally.
-func (a *ServerWithRoles) DeactivateCertAuthority(id types.CertAuthID) error {
-	return trace.NotImplemented(notImplementedMessage)
-}
-
-// UpdateUserCARoleMap not implemented: can only be called locally.
-func (a *ServerWithRoles) UpdateUserCARoleMap(ctx context.Context, name string, roleMap types.RoleMap, activated bool) error {
-	return trace.NotImplemented(notImplementedMessage)
-}
-
+// Deprecated: This method only exists to service the RegisterUsingToken HTTP
+// RPC, which has been replaced by an RPC on the JoinServiceServer.
+// JoinServiceServer directly invokes auth.Server and performs its own checks
+// on metadata.
+// TODO(strideynet): DELETE IN V18.0.0
 func (a *ServerWithRoles) RegisterUsingToken(ctx context.Context, req *types.RegisterUsingTokenRequest) (*proto.Certs, error) {
+	isProxy := a.hasBuiltinRole(types.RoleProxy)
+
+	// We do not trust remote addr in the request unless it's coming from the Proxy.
+	if !isProxy || req.RemoteAddr == "" {
+		if err := setRemoteAddrFromContext(ctx, req); err != nil {
+			return nil, trace.Wrap(err)
+		}
+	}
+
+	// Similarly, do not trust bot instance IDs or generation values in the
+	// request unless from a component with the proxy role (e.g. the join
+	// service). They will be derived from the client certificate otherwise.
+	if !isProxy {
+		if req.BotInstanceID != "" {
+			a.authServer.logger.WarnContext(ctx, "Untrusted client attempted to provide a bot instance ID, this will be ignored",
+				"bot_instance_id", req.BotInstanceID,
+			)
+
+			req.BotInstanceID = ""
+		}
+
+		if req.BotGeneration > 0 {
+			a.authServer.logger.WarnContext(ctx, "Untrusted client attempted to provide a bot generation, this will be ignored",
+				"bot_generation", req.BotGeneration,
+			)
+
+			req.BotGeneration = 0
+		}
+	}
+
+	// If the identity has a BotInstanceID or BotGeneration included, copy it
+	// onto the request - but only if one wasn't already passed along via the
+	// proxy.
+	ident := a.context.Identity.GetIdentity()
+	req.BotInstanceID = cmp.Or(req.BotInstanceID, ident.BotInstanceID)
+	req.BotGeneration = cmp.Or(req.BotGeneration, int32(ident.Generation))
+
 	// tokens have authz mechanism  on their own, no need to check
 	return a.authServer.RegisterUsingToken(ctx, req)
-}
-
-// RegisterUsingIAMMethod registers the caller using the IAM join method and
-// returns signed certs to join the cluster.
-//
-// See (*Server).RegisterUsingIAMMethod for further documentation.
-//
-// This wrapper does not do any extra authz checks, as the register method has
-// its own authz mechanism.
-func (a *ServerWithRoles) RegisterUsingIAMMethod(ctx context.Context, challengeResponse client.RegisterIAMChallengeResponseFunc) (*proto.Certs, error) {
-	certs, err := a.authServer.RegisterUsingIAMMethod(ctx, challengeResponse)
-	return certs, trace.Wrap(err)
-}
-
-// RegisterUsingAzureMethod registers the caller using the Azure join method and
-// returns signed certs to join the cluster.
-//
-// See (*Server).RegisterUsingAzureMethod for further documentation.
-//
-// This wrapper does not do any extra authz checks, as the register method has
-// its own authz mechanism.
-func (a *ServerWithRoles) RegisterUsingAzureMethod(ctx context.Context, challengeResponse client.RegisterAzureChallengeResponseFunc) (*proto.Certs, error) {
-	certs, err := a.authServer.RegisterUsingAzureMethod(ctx, challengeResponse)
-	return certs, trace.Wrap(err)
 }
 
 // GenerateHostCerts generates new host certificates (signed
@@ -978,8 +634,8 @@ func (a *ServerWithRoles) GenerateHostCerts(ctx context.Context, req *proto.Host
 		return nil, trace.Wrap(err)
 	}
 	// username is hostID + cluster name, so make sure server requests new keys for itself
-	if a.context.User.GetName() != HostFQDN(req.HostID, clusterName) {
-		return nil, trace.AccessDenied("username mismatch %q and %q", a.context.User.GetName(), HostFQDN(req.HostID, clusterName))
+	if a.context.User.GetName() != authclient.HostFQDN(req.HostID, clusterName) {
+		return nil, trace.AccessDenied("username mismatch %q and %q", a.context.User.GetName(), authclient.HostFQDN(req.HostID, clusterName))
 	}
 
 	if req.Role == types.RoleInstance {
@@ -1023,17 +679,67 @@ func (a *ServerWithRoles) checkAdditionalSystemRoles(ctx context.Context, req *p
 		}
 	}
 
+	// load system role assertions if relevant
+	var assertions proto.SystemRoleAssertionSet
+	var err error
+	if req.SystemRoleAssertionID != "" {
+		assertions, err = a.authServer.GetSystemRoleAssertions(ctx, req.HostID, req.SystemRoleAssertionID)
+		if err != nil {
+			// include this error in the logs, since it might be indicative of a bug if it occurs outside of the context
+			// of a general backend outage.
+			a.authServer.logger.WarnContext(ctx, "Failed to load system role assertion set for instance",
+				"system_role_assertion", req.SystemRoleAssertionID,
+				"instance", req.HostID,
+				"error", err,
+			)
+			return trace.AccessDenied("failed to load system role assertion set with ID %q", req.SystemRoleAssertionID)
+		}
+	}
+
 	// check if additional system roles are permissible
+Outer:
 	for _, requestedRole := range req.SystemRoles {
 		if a.hasBuiltinRole(requestedRole) {
 			// instance is already known to hold this role
-			continue
+			continue Outer
+		}
+
+		for _, assertedRole := range assertions.SystemRoles {
+			if requestedRole == assertedRole {
+				// instance recently demonstrated that it holds this role
+				continue Outer
+			}
 		}
 
 		return trace.AccessDenied("additional system role %q cannot be applied (not authorized)", requestedRole)
 	}
 
 	return nil
+}
+
+// AssertSystemRole is used by agents to prove that they have a given system role when their credentials
+// originate from multiple separate join tokens so that they can be issued an instance certificate that
+// encompasses all of their capabilities. This method will be deprecated once we have a more comprehensive
+// model for join token joining/replacement.
+func (a *ServerWithRoles) AssertSystemRole(ctx context.Context, req proto.SystemRoleAssertion) error {
+	role, ok := a.context.Identity.(authz.BuiltinRole)
+	if !ok || !role.IsServer() {
+		return trace.AccessDenied("system role assertions can only be executed by a teleport built-in server")
+	}
+
+	if req.ServerID != role.GetServerID() {
+		return trace.AccessDenied("system role assertions do not support impersonation (%q -> %q)", role.GetServerID(), req.ServerID)
+	}
+
+	if !a.hasBuiltinRole(req.SystemRole) {
+		return trace.AccessDenied("cannot assert unheld system role %q", req.SystemRole)
+	}
+
+	if !req.SystemRole.IsLocalService() {
+		return trace.AccessDenied("cannot assert non-service system role %q", req.SystemRole)
+	}
+
+	return a.authServer.AssertSystemRole(ctx, req)
 }
 
 // RegisterInventoryControlStream handles the upstream half of the control stream handshake, then passes the control stream to
@@ -1074,7 +780,10 @@ func (a *ServerWithRoles) RegisterInventoryControlStream(ics client.UpstreamInve
 	var filteredServices []types.SystemRole
 	for _, service := range hello.Services {
 		if !a.hasBuiltinRole(service) {
-			log.Warnf("Omitting service %q for control stream of instance %q (unknown or unauthorized).", service, role.GetServerID())
+			a.authServer.logger.WarnContext(a.CloseContext(), "Omitting unknown or unauthorized service for instance control stream",
+				"omitted_service", service,
+				"instance", role.GetServerID(),
+			)
 			continue
 		}
 		filteredServices = append(filteredServices, service)
@@ -1086,7 +795,7 @@ func (a *ServerWithRoles) RegisterInventoryControlStream(ics client.UpstreamInve
 }
 
 func (a *ServerWithRoles) GetInventoryStatus(ctx context.Context, req proto.InventoryStatusRequest) (proto.InventoryStatusSummary, error) {
-	if err := a.action(apidefaults.Namespace, types.KindInstance, types.VerbList, types.VerbRead); err != nil {
+	if err := a.action(types.KindInstance, types.VerbList, types.VerbRead); err != nil {
 		return proto.InventoryStatusSummary{}, trace.Wrap(err)
 	}
 
@@ -1119,20 +828,11 @@ func (a *ServerWithRoles) PingInventory(ctx context.Context, req proto.Inventory
 }
 
 func (a *ServerWithRoles) GetInstances(ctx context.Context, filter types.InstanceFilter) stream.Stream[types.Instance] {
-	if err := a.action(apidefaults.Namespace, types.KindInstance, types.VerbList, types.VerbRead); err != nil {
+	if err := a.action(types.KindInstance, types.VerbList, types.VerbRead); err != nil {
 		return stream.Fail[types.Instance](trace.Wrap(err))
 	}
 
 	return a.authServer.GetInstances(ctx, filter)
-}
-
-// GetNodeStream returns a stream of nodes.
-func (a *ServerWithRoles) GetNodeStream(ctx context.Context, namespace string) stream.Stream[types.Server] {
-	if err := a.action(namespace, types.KindNode, types.VerbList, types.VerbRead); err != nil {
-		return stream.Fail[types.Server](trace.Wrap(err))
-	}
-
-	return a.authServer.GetNodeStream(ctx, namespace)
 }
 
 func (a *ServerWithRoles) GetClusterAlerts(ctx context.Context, query types.GetClusterAlertsRequest) ([]types.ClusterAlert, error) {
@@ -1155,7 +855,7 @@ func (a *ServerWithRoles) GetClusterAlerts(ctx context.Context, query types.GetC
 		if err != nil {
 			// we don't fail here since users are allowed to see acknowledged alerts, acks
 			// are intended only as a tool for reducing noise.
-			log.Warnf("Failed to load alert acks: %v", err)
+			a.authServer.logger.WarnContext(ctx, "Failed to load alert acks", "error", err)
 		}
 	}
 
@@ -1163,7 +863,7 @@ func (a *ServerWithRoles) GetClusterAlerts(ctx context.Context, query types.GetC
 	// with permissions to view all resources of kind 'cluster_alert' can opt into viewing all alerts
 	// regardless of labels for management/debug purposes.
 	var resourceLevelPermit bool
-	if query.WithUntargeted && a.withOptions(quietAction(true)).action(apidefaults.Namespace, types.KindClusterAlert, types.VerbRead, types.VerbList) == nil {
+	if query.WithUntargeted && a.action(types.KindClusterAlert, types.VerbRead, types.VerbList) == nil {
 		resourceLevelPermit = true
 	}
 
@@ -1202,7 +902,7 @@ Outer:
 				continue Verbs
 			}
 
-			if a.withOptions(quietAction(true)).action(apidefaults.Namespace, rv[0], rv[1]) == nil {
+			if a.action(rv[0], rv[1]) == nil {
 				// user holds at least one of the resource:verb pairs specified by
 				// the verb-permit label.
 				filtered = append(filtered, alert)
@@ -1242,7 +942,7 @@ Outer:
 }
 
 func (a *ServerWithRoles) UpsertClusterAlert(ctx context.Context, alert types.ClusterAlert) error {
-	if err := a.action(apidefaults.Namespace, types.KindClusterAlert, types.VerbCreate, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindClusterAlert, types.VerbCreate, types.VerbUpdate); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -1251,7 +951,7 @@ func (a *ServerWithRoles) UpsertClusterAlert(ctx context.Context, alert types.Cl
 
 func (a *ServerWithRoles) CreateAlertAck(ctx context.Context, ack types.AlertAcknowledgement) error {
 	// we treat alert acks as an extension of the cluster alert resource rather than its own resource
-	if err := a.action(apidefaults.Namespace, types.KindClusterAlert, types.VerbCreate, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindClusterAlert, types.VerbCreate, types.VerbUpdate); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -1260,7 +960,7 @@ func (a *ServerWithRoles) CreateAlertAck(ctx context.Context, ack types.AlertAck
 
 func (a *ServerWithRoles) GetAlertAcks(ctx context.Context) ([]types.AlertAcknowledgement, error) {
 	// we treat alert acks as an extension of the cluster alert resource rather than its own resource.
-	if err := a.action(apidefaults.Namespace, types.KindClusterAlert, types.VerbRead, types.VerbList); err != nil {
+	if err := a.action(types.KindClusterAlert, types.VerbRead, types.VerbList); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
@@ -1269,7 +969,7 @@ func (a *ServerWithRoles) GetAlertAcks(ctx context.Context) ([]types.AlertAcknow
 
 func (a *ServerWithRoles) ClearAlertAcks(ctx context.Context, req proto.ClearAlertAcksRequest) error {
 	// we treat alert acks as an extension of the cluster alert resource rather than its own resource
-	if err := a.action(apidefaults.Namespace, types.KindClusterAlert, types.VerbDelete); err != nil {
+	if err := a.action(types.KindClusterAlert, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -1277,7 +977,8 @@ func (a *ServerWithRoles) ClearAlertAcks(ctx context.Context, req proto.ClearAle
 }
 
 func (a *ServerWithRoles) UpsertNode(ctx context.Context, s types.Server) (*types.KeepAlive, error) {
-	if err := a.action(s.GetNamespace(), types.KindNode, types.VerbCreate, types.VerbUpdate); err != nil {
+	// Note: UpsertNode doesn't allow any namespaces but "default".
+	if err := a.action(types.KindNode, types.VerbCreate, types.VerbUpdate); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return a.authServer.UpsertNode(ctx, s)
@@ -1302,7 +1003,7 @@ func (a *ServerWithRoles) KeepAliveServer(ctx context.Context, handle types.Keep
 		if !a.hasBuiltinRole(types.RoleNode) {
 			return trace.AccessDenied("access denied")
 		}
-		if err := a.action(apidefaults.Namespace, types.KindNode, types.VerbUpdate); err != nil {
+		if err := a.action(types.KindNode, types.VerbUpdate); err != nil {
 			return trace.Wrap(err)
 		}
 	case constants.KeepAliveApp:
@@ -1318,7 +1019,7 @@ func (a *ServerWithRoles) KeepAliveServer(ctx context.Context, handle types.Keep
 		if !a.hasBuiltinRole(types.RoleApp) && !a.hasBuiltinRole(types.RoleOkta) {
 			return trace.AccessDenied("access denied")
 		}
-		if err := a.action(apidefaults.Namespace, types.KindAppServer, types.VerbUpdate); err != nil {
+		if err := a.action(types.KindAppServer, types.VerbUpdate); err != nil {
 			return trace.Wrap(err)
 		}
 	case constants.KeepAliveDatabase:
@@ -1331,7 +1032,7 @@ func (a *ServerWithRoles) KeepAliveServer(ctx context.Context, handle types.Keep
 		if !a.hasBuiltinRole(types.RoleDatabase) {
 			return trace.AccessDenied("access denied")
 		}
-		if err := a.action(apidefaults.Namespace, types.KindDatabaseServer, types.VerbUpdate); err != nil {
+		if err := a.action(types.KindDatabaseServer, types.VerbUpdate); err != nil {
 			return trace.Wrap(err)
 		}
 	case constants.KeepAliveWindowsDesktopService:
@@ -1341,7 +1042,7 @@ func (a *ServerWithRoles) KeepAliveServer(ctx context.Context, handle types.Keep
 		if !a.hasBuiltinRole(types.RoleWindowsDesktop) {
 			return trace.AccessDenied("access denied")
 		}
-		if err := a.action(apidefaults.Namespace, types.KindWindowsDesktopService, types.VerbUpdate); err != nil {
+		if err := a.action(types.KindWindowsDesktopService, types.VerbUpdate); err != nil {
 			return trace.Wrap(err)
 		}
 	case constants.KeepAliveKube:
@@ -1355,7 +1056,7 @@ func (a *ServerWithRoles) KeepAliveServer(ctx context.Context, handle types.Keep
 		if !a.hasBuiltinRole(types.RoleKube, types.RoleProxy) {
 			return trace.AccessDenied("access denied")
 		}
-		if err := a.action(apidefaults.Namespace, types.KindKubeServer, types.VerbUpdate); err != nil {
+		if err := a.action(types.KindKubeServer, types.VerbUpdate); err != nil {
 			return trace.Wrap(err)
 		}
 	case constants.KeepAliveDatabaseService:
@@ -1365,7 +1066,7 @@ func (a *ServerWithRoles) KeepAliveServer(ctx context.Context, handle types.Keep
 		if !a.hasBuiltinRole(types.RoleDatabase) {
 			return trace.AccessDenied("access denied")
 		}
-		if err := a.action(apidefaults.Namespace, types.KindDatabaseService, types.VerbUpdate); err != nil {
+		if err := a.action(types.KindDatabaseService, types.VerbUpdate); err != nil {
 			return trace.Wrap(err)
 		}
 	default:
@@ -1375,10 +1076,27 @@ func (a *ServerWithRoles) KeepAliveServer(ctx context.Context, handle types.Keep
 	return a.authServer.KeepAliveServer(ctx, handle)
 }
 
+// NewStream returns a new event stream (equivalent to NewWatcher, but with slightly different
+// performance characteristics).
+func (a *ServerWithRoles) NewStream(ctx context.Context, watch types.Watch) (stream.Stream[types.Event], error) {
+	if err := a.authorizeWatchRequest(&watch); err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return a.authServer.NewStream(ctx, watch)
+}
+
 // NewWatcher returns a new event watcher
 func (a *ServerWithRoles) NewWatcher(ctx context.Context, watch types.Watch) (types.Watcher, error) {
+	if err := a.authorizeWatchRequest(&watch); err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return a.authServer.NewWatcher(ctx, watch)
+}
+
+// authorizeWatchRequest performs permission checks and filtering on incoming watch requests.
+func (a *ServerWithRoles) authorizeWatchRequest(watch *types.Watch) error {
 	if len(watch.Kinds) == 0 {
-		return nil, trace.AccessDenied("can't setup global watch")
+		return trace.AccessDenied("can't setup global watch")
 	}
 
 	validKinds := make([]types.WatchKind, 0, len(watch.Kinds))
@@ -1388,14 +1106,14 @@ func (a *ServerWithRoles) NewWatcher(ctx context.Context, watch types.Watch) (ty
 			if watch.AllowPartialSuccess {
 				continue
 			}
-			return nil, trace.Wrap(err)
+			return trace.Wrap(err)
 		}
 
 		validKinds = append(validKinds, kind)
 	}
 
 	if len(validKinds) == 0 {
-		return nil, trace.BadParameter("none of the requested kinds can be watched")
+		return trace.BadParameter("none of the requested kinds can be watched")
 	}
 
 	watch.Kinds = validKinds
@@ -1405,7 +1123,8 @@ func (a *ServerWithRoles) NewWatcher(ctx context.Context, watch types.Watch) (ty
 	case a.hasBuiltinRole(types.RoleNode):
 		watch.QueueSize = defaults.NodeQueueSize
 	}
-	return a.authServer.NewWatcher(ctx, watch)
+
+	return nil
 }
 
 // hasWatchPermissionForKind checks the permissions for data of each kind.
@@ -1429,6 +1148,10 @@ func (a *ServerWithRoles) hasWatchPermissionForKind(kind types.WatchKind) error 
 			return nil
 		}
 	case types.KindWebSession:
+		if !kind.LoadSecrets {
+			verb = types.VerbReadNoSecrets
+		}
+
 		var filter types.WebSessionFilter
 		if err := filter.FromMap(kind.Filter); err != nil {
 			return trace.Wrap(err)
@@ -1439,8 +1162,8 @@ func (a *ServerWithRoles) hasWatchPermissionForKind(kind types.WatchKind) error 
 			return nil
 		}
 
-		// Users can watch their own web sessions.
-		if filter.User != "" && a.currentUserAction(filter.User) == nil {
+		// Users can watch their own web sessions without secrets.
+		if filter.User != "" && !kind.LoadSecrets && a.currentUserAction(filter.User) == nil {
 			return nil
 		}
 	case types.KindHeadlessAuthentication:
@@ -1451,7 +1174,7 @@ func (a *ServerWithRoles) hasWatchPermissionForKind(kind types.WatchKind) error 
 
 		// Users can only watch their own headless authentications, meaning we don't fallback to
 		// the generalized verb-kind-action check below.
-		if !hasLocalUserRole(a.context) {
+		if !authz.IsLocalUser(a.context) {
 			return trace.AccessDenied("non-local user roles cannot watch headless authentications")
 		} else if filter.Username == "" {
 			return trace.AccessDenied("user cannot watch headless authentications without a filter for their username")
@@ -1461,12 +1184,12 @@ func (a *ServerWithRoles) hasWatchPermissionForKind(kind types.WatchKind) error 
 
 		return nil
 	}
-	return trace.Wrap(a.action(apidefaults.Namespace, kind.Kind, verb))
+	return trace.Wrap(a.action(kind.Kind, verb))
 }
 
 // DeleteAllNodes deletes all nodes in a given namespace
 func (a *ServerWithRoles) DeleteAllNodes(ctx context.Context, namespace string) error {
-	if err := a.action(namespace, types.KindNode, types.VerbDelete); err != nil {
+	if err := a.actionNamespace(namespace, types.KindNode, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.DeleteAllNodes(ctx, namespace)
@@ -1474,7 +1197,7 @@ func (a *ServerWithRoles) DeleteAllNodes(ctx context.Context, namespace string) 
 
 // DeleteNode deletes node in the namespace
 func (a *ServerWithRoles) DeleteNode(ctx context.Context, namespace, node string) error {
-	if err := a.action(namespace, types.KindNode, types.VerbDelete); err != nil {
+	if err := a.actionNamespace(namespace, types.KindNode, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.DeleteNode(ctx, namespace, node)
@@ -1482,7 +1205,7 @@ func (a *ServerWithRoles) DeleteNode(ctx context.Context, namespace, node string
 
 // GetNode gets a node by name and namespace.
 func (a *ServerWithRoles) GetNode(ctx context.Context, namespace, name string) (types.Server, error) {
-	if err := a.action(namespace, types.KindNode, types.VerbRead); err != nil {
+	if err := a.actionNamespace(namespace, types.KindNode, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	node, err := a.authServer.GetNode(ctx, namespace, name)
@@ -1501,244 +1224,341 @@ func (a *ServerWithRoles) GetNode(ctx context.Context, namespace, name string) (
 	return node, nil
 }
 
-func (s *ServerWithRoles) MakePaginatedResources(requestType string, resources []types.ResourceWithLabels) ([]*proto.PaginatedResource, error) {
-	paginatedResources := make([]*proto.PaginatedResource, 0, len(resources))
-	for _, resource := range resources {
-		var protoResource *proto.PaginatedResource
-		resourceKind := requestType
-		if requestType == types.KindUnifiedResource {
-			resourceKind = resource.GetKind()
+// resourceAccess is used for different rbac results when filtering items
+type resourceAccess struct {
+	// accessChecker is used to check a user's access to resources. This can
+	// be extended to include SearchAsRoles
+	accessChecker resourceAccessChecker
+	// baseAuthChecker is set when a user's auth context is extended during a
+	// searchAsRoles request
+	baseAuthChecker resourceAccessChecker
+	// kindAccessMap is used to check errors for list/read verbs per kind
+	kindAccessMap map[string]error
+	// requestableMap is used to track if a resource matches a filter but is only
+	// available after an access request. This map is of Resource.GetName()
+	requestableMap map[string]struct{}
+}
+
+func (c *resourceAccess) checkAccess(resource types.ResourceWithLabels, filter services.MatchResourceFilter) (bool, error) {
+	resourceKind := resource.GetKind()
+
+	if canAccessErr := c.kindAccessMap[resourceKind]; canAccessErr != nil {
+		// skip access denied error. It is expected that resources won't be available
+		// to some users and we want to keep iterating until we've reached the request limit
+		// of resources they have access to
+		if trace.IsAccessDenied(canAccessErr) {
+			return false, nil
 		}
-		switch resourceKind {
-		case types.KindDatabaseServer:
-			database, ok := resource.(*types.DatabaseServerV3)
-			if !ok {
-				return nil, trace.BadParameter("%s has invalid type %T", resourceKind, resource)
-			}
-
-			protoResource = &proto.PaginatedResource{Resource: &proto.PaginatedResource_DatabaseServer{DatabaseServer: database}}
-		case types.KindDatabaseService:
-			databaseService, ok := resource.(*types.DatabaseServiceV1)
-			if !ok {
-				return nil, trace.BadParameter("%s has invalid type %T", resourceKind, resource)
-			}
-
-			protoResource = &proto.PaginatedResource{Resource: &proto.PaginatedResource_DatabaseService{DatabaseService: databaseService}}
-		case types.KindAppServer:
-			app, ok := resource.(*types.AppServerV3)
-			if !ok {
-				return nil, trace.BadParameter("%s has invalid type %T", resourceKind, resource)
-			}
-
-			protoResource = &proto.PaginatedResource{Resource: &proto.PaginatedResource_AppServer{AppServer: app}}
-		case types.KindNode:
-			srv, ok := resource.(*types.ServerV2)
-			if !ok {
-				return nil, trace.BadParameter("%s has invalid type %T", resourceKind, resource)
-			}
-
-			protoResource = &proto.PaginatedResource{Resource: &proto.PaginatedResource_Node{Node: srv}}
-		case types.KindKubeServer:
-			srv, ok := resource.(*types.KubernetesServerV3)
-			if !ok {
-				return nil, trace.BadParameter("%s has invalid type %T", resourceKind, resource)
-			}
-
-			protoResource = &proto.PaginatedResource{Resource: &proto.PaginatedResource_KubernetesServer{KubernetesServer: srv}}
-		case types.KindWindowsDesktop:
-			desktop, ok := resource.(*types.WindowsDesktopV3)
-			if !ok {
-				return nil, trace.BadParameter("%s has invalid type %T", resourceKind, resource)
-			}
-
-			protoResource = &proto.PaginatedResource{Resource: &proto.PaginatedResource_WindowsDesktop{WindowsDesktop: desktop}}
-		case types.KindWindowsDesktopService:
-			desktopService, ok := resource.(*types.WindowsDesktopServiceV3)
-			if !ok {
-				return nil, trace.BadParameter("%s has invalid type %T", resourceKind, resource)
-			}
-
-			protoResource = &proto.PaginatedResource{Resource: &proto.PaginatedResource_WindowsDesktopService{WindowsDesktopService: desktopService}}
-		case types.KindKubernetesCluster:
-			cluster, ok := resource.(*types.KubernetesClusterV3)
-			if !ok {
-				return nil, trace.BadParameter("%s has invalid type %T", resourceKind, resource)
-			}
-
-			protoResource = &proto.PaginatedResource{Resource: &proto.PaginatedResource_KubeCluster{KubeCluster: cluster}}
-		case types.KindUserGroup:
-			userGroup, ok := resource.(*types.UserGroupV1)
-			if !ok {
-				return nil, trace.BadParameter("%s has invalid type %T", resourceKind, resource)
-			}
-
-			protoResource = &proto.PaginatedResource{Resource: &proto.PaginatedResource_UserGroup{UserGroup: userGroup}}
-		case types.KindSAMLIdPServiceProvider, types.KindAppOrSAMLIdPServiceProvider:
-			switch appOrSP := resource.(type) {
-			case *types.AppServerV3:
-				protoResource = &proto.PaginatedResource{
-					Resource: &proto.PaginatedResource_AppServerOrSAMLIdPServiceProvider{
-						AppServerOrSAMLIdPServiceProvider: &types.AppServerOrSAMLIdPServiceProviderV1{
-							Resource: &types.AppServerOrSAMLIdPServiceProviderV1_AppServer{
-								AppServer: appOrSP,
-							},
-						},
-					}}
-			case *types.SAMLIdPServiceProviderV1:
-				protoResource = &proto.PaginatedResource{
-					Resource: &proto.PaginatedResource_AppServerOrSAMLIdPServiceProvider{
-						AppServerOrSAMLIdPServiceProvider: &types.AppServerOrSAMLIdPServiceProviderV1{
-							Resource: &types.AppServerOrSAMLIdPServiceProviderV1_SAMLIdPServiceProvider{
-								SAMLIdPServiceProvider: appOrSP,
-							},
-						},
-					}}
-			default:
-				return nil, trace.BadParameter("%s has invalid type %T", resourceKind, resource)
-			}
-
-		default:
-			return nil, trace.NotImplemented("resource type %s doesn't support pagination", resource.GetKind())
-		}
-
-		paginatedResources = append(paginatedResources, protoResource)
+		return false, trace.Wrap(canAccessErr)
 	}
-	return paginatedResources, nil
+
+	// Filter first and only check RBAC if there is a match to improve perf.
+	match, err := services.MatchResourceByFilters(resource, filter, nil)
+	if err != nil {
+		logger.WarnContext(context.Background(), "Unable to determine access to resource, matching with filter failed",
+			"resource_name", resource.GetName(),
+			"resource_kind", resourceKind,
+			"error", err,
+		)
+		return false, nil
+	}
+
+	if !match {
+		return false, nil
+	}
+
+	// check access normally if base checker doesn't exist
+	if c.baseAuthChecker == nil {
+		if err := c.accessChecker.CanAccess(resource); err != nil {
+			if trace.IsAccessDenied(err) {
+				return false, nil
+			}
+			return false, trace.Wrap(err)
+		}
+		return true, nil
+	}
+
+	// baseAuthChecker exists if the current auth context has been extended for a includeRequestable request.
+	// if true, we should check with the base auth checker first and if that returns false, check the extended context
+	// so we know if a resource is being matched because they have access to it currently, or only to be added
+	// to an access request
+	if err := c.baseAuthChecker.CanAccess(resource); err != nil {
+		if !trace.IsAccessDenied(err) {
+			return false, trace.Wrap(err)
+		}
+
+		// user does not have access with their base context
+		// check if they would have access with the extended context
+		if err := c.accessChecker.CanAccess(resource); err != nil {
+			if trace.IsAccessDenied(err) {
+				return false, nil
+			}
+			return false, trace.Wrap(err)
+		}
+		c.requestableMap[resource.GetName()] = struct{}{}
+	}
+
+	return true, nil
+}
+
+type actionChecker func(namespace, resourceKind string, verbs ...string) error
+
+func (a *ServerWithRoles) selectActionChecker(resourceKind string) actionChecker {
+	switch resourceKind {
+	case types.KindIdentityCenterAccount, types.KindIdentityCenterAccountAssignment:
+		// Identity Center resources can be specified multiple ways in a Role
+		// Condition statement, so we need a special checker to handle it.
+		return a.identityCenterAction
+	}
+	return a.actionNamespace
 }
 
 // ListUnifiedResources returns a paginated list of unified resources filtered by user access.
 func (a *ServerWithRoles) ListUnifiedResources(ctx context.Context, req *proto.ListUnifiedResourcesRequest) (*proto.ListUnifiedResourcesResponse, error) {
-	// Fetch full list of resources in the backend.
-	var (
-		elapsedFetch      time.Duration
-		elapsedFilter     time.Duration
-		unifiedResources  types.ResourcesWithLabels
-		filteredResources types.ResourcesWithLabels
-	)
-
-	defer func() {
-		log.WithFields(logrus.Fields{
-			"user":           a.context.User.GetName(),
-			"elapsed_fetch":  elapsedFetch,
-			"elapsed_filter": elapsedFilter,
-		}).Debugf(
-			"ListUnifiedResources(%v->%v) in %v.",
-			len(unifiedResources), len(filteredResources), elapsedFetch+elapsedFilter)
-	}()
-
-	startFetch := time.Now()
-	unifiedResources, err := a.authServer.UnifiedResourceCache.GetUnifiedResources(ctx)
-	if err != nil {
-		return nil, trace.Wrap(err)
+	filter := services.MatchResourceFilter{
+		Labels:         req.Labels,
+		SearchKeywords: req.SearchKeywords,
+		Kinds:          req.Kinds,
 	}
 
-	elapsedFetch = time.Since(startFetch)
+	if req.PredicateExpression != "" {
+		expression, err := services.NewResourceExpression(req.PredicateExpression)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		filter.PredicateExpression = expression
+	}
 
-	startFilter := time.Now()
-	for _, resource := range unifiedResources {
-		switch r := resource.(type) {
-		case types.Server:
-			{
-				if err := a.checkAccessToNode(r); err != nil {
-					if trace.IsAccessDenied(err) {
-						continue
-					}
+	resourceAccess := &resourceAccess{
+		// Populate kindAccessMap with any access errors the user has for each possible
+		// resource kind. This allows the access check to occur a single time per resource
+		// kind instead of once per matching resource.
+		kindAccessMap: make(map[string]error, len(services.UnifiedResourceKinds)),
+		// requestableMap is populated with resources that are being returned but can only
+		// be accessed to the user via an access request
+		requestableMap: make(map[string]struct{}),
+	}
 
-					return nil, trace.Wrap(err)
-				}
+	for _, kind := range services.UnifiedResourceKinds {
+		actionVerbs := []string{types.VerbList, types.VerbRead}
+		if kind == types.KindNode {
+			// We are checking list only for Nodes to keep backwards compatibility.
+			// The read verb got added to GetNodes initially in:
+			//   https://github.com/gravitational/teleport/pull/1209
+			// but got removed shortly afterwards in:
+			//   https://github.com/gravitational/teleport/pull/1224
+			actionVerbs = []string{types.VerbList}
+		}
 
-				filteredResources = append(filteredResources, resource)
-			}
-		case types.DatabaseServer:
-			{
-				if err := a.checkAccessToDatabase(r.GetDatabase()); err != nil {
-					if trace.IsAccessDenied(err) {
-						continue
-					}
+		checkAction := a.selectActionChecker(kind)
+		resourceAccess.kindAccessMap[kind] = checkAction(apidefaults.Namespace, kind, actionVerbs...)
+	}
 
-					return nil, trace.Wrap(err)
-				}
+	// Before doing any listing, verify that the user is allowed to list
+	// at least one of the requested kinds. If no access is permitted, then
+	// return an access denied error.
+	requested := req.Kinds
+	if len(req.Kinds) == 0 {
+		requested = services.UnifiedResourceKinds
+	}
+	var rbacErrors int
+	for _, kind := range requested {
+		if err, ok := resourceAccess.kindAccessMap[kind]; ok && err != nil {
+			rbacErrors++
+		}
+	}
 
-				filteredResources = append(filteredResources, resource)
-			}
+	if rbacErrors == len(requested) {
+		return nil, trace.AccessDenied("User does not have access to any of the requested kinds: %v", requested)
+	}
 
-		case types.AppServer:
-			{
-				if err := a.checkAccessToApp(r.GetApp()); err != nil {
-					if trace.IsAccessDenied(err) {
-						continue
-					}
-
-					return nil, trace.Wrap(err)
-				}
-
-				filteredResources = append(filteredResources, resource)
-			}
-		case types.SAMLIdPServiceProvider:
-			{
-				if err := a.action(apidefaults.Namespace, types.KindSAMLIdPServiceProvider, types.VerbList); err == nil {
-					filteredResources = append(filteredResources, resource)
-				}
-			}
-		case types.KubeServer:
-			kube := r.GetCluster()
-			if err := a.checkAccessToKubeCluster(kube); err != nil {
-				if trace.IsAccessDenied(err) {
-					continue
-				}
-
+	// Apply any requested additional search_as_roles and/or preview_as_roles
+	// for the duration of the search.
+	if req.UseSearchAsRoles || req.UsePreviewAsRoles || req.IncludeRequestable {
+		extendedContext, err := a.authContextForSearch(ctx, &proto.ListResourcesRequest{
+			UseSearchAsRoles:    req.UseSearchAsRoles || req.IncludeRequestable,
+			UsePreviewAsRoles:   req.UsePreviewAsRoles,
+			ResourceType:        types.KindUnifiedResource,
+			Namespace:           apidefaults.Namespace,
+			Labels:              req.Labels,
+			PredicateExpression: req.PredicateExpression,
+			SearchKeywords:      req.SearchKeywords,
+		})
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		baseContext := a.context
+		// If IncludeRequestable is true, we will create a baseChecker to
+		// use during RBAC to determine if a resource would be available only after extending
+		if req.IncludeRequestable {
+			baseChecker, err := a.newResourceAccessChecker(types.KindUnifiedResource)
+			if err != nil {
 				return nil, trace.Wrap(err)
 			}
-
-			filteredResources = append(filteredResources, kube)
-		case types.WindowsDesktop:
-			{
-				if err := a.checkAccessToWindowsDesktop(r); err != nil {
-					if trace.IsAccessDenied(err) {
-						continue
-					}
-
-					return nil, trace.Wrap(err)
-				}
-
-				filteredResources = append(filteredResources, resource)
-			}
+			resourceAccess.baseAuthChecker = baseChecker
 		}
-	}
-	elapsedFilter = time.Since(startFilter)
 
-	if req.SortBy.Field != "" {
-		if err := filteredResources.SortByCustom(req.SortBy); err != nil {
-			return nil, trace.Wrap(err, "sorting unified resources")
-		}
+		a.context = *extendedContext
+		defer func() {
+			a.context = baseContext
+		}()
 	}
 
-	// Apply request filters and get pagination info.
-	resp, err := local.FakePaginate(filteredResources, local.FakePaginateParams{
-		Limit:               req.Limit,
-		Labels:              req.Labels,
-		SearchKeywords:      req.SearchKeywords,
-		PredicateExpression: req.PredicateExpression,
-		StartKey:            req.StartKey,
-		Kinds:               req.Kinds,
-	})
+	checker, err := a.newResourceAccessChecker(types.KindUnifiedResource)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	paginatedResources, err := a.MakePaginatedResources(types.KindUnifiedResource, resp.Resources)
+	resourceAccess.accessChecker = checker
+
+	var (
+		unifiedResources types.ResourcesWithLabels
+		nextKey          string
+	)
+	if req.PinnedOnly {
+		prefs, err := a.authServer.GetUserPreferences(ctx, a.context.User.GetName())
+		if err != nil {
+			return nil, trace.Wrap(err, "getting user preferences")
+		}
+		if len(prefs.ClusterPreferences.PinnedResources.ResourceIds) == 0 {
+			return &proto.ListUnifiedResourcesResponse{}, nil
+		}
+		unifiedResources, err = a.authServer.UnifiedResourceCache.GetUnifiedResourcesByIDs(ctx, prefs.ClusterPreferences.PinnedResources.GetResourceIds(), func(resource types.ResourceWithLabels) (bool, error) {
+			match, err := resourceAccess.checkAccess(resource, filter)
+			return match, trace.Wrap(err)
+		})
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+
+		// we need to sort pinned resources manually because they are fetched in the order they were pinned
+		if req.SortBy.Field != "" {
+			if err := unifiedResources.SortByCustom(req.SortBy); err != nil {
+				return nil, trace.Wrap(err, "sorting unified resources")
+			}
+		}
+	} else {
+		unifiedResources, nextKey, err = a.authServer.UnifiedResourceCache.IterateUnifiedResources(ctx, func(resource types.ResourceWithLabels) (bool, error) {
+			match, err := resourceAccess.checkAccess(resource, filter)
+			return match, trace.Wrap(err)
+		}, req)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+	}
+
+	paginatedResources, err := services.MakePaginatedResources(ctx, types.KindUnifiedResource, unifiedResources, resourceAccess.requestableMap)
 	if err != nil {
 		return nil, trace.Wrap(err, "making paginated unified resources")
 	}
 
+	if req.IncludeLogins {
+		for _, r := range paginatedResources {
+			if n := r.GetNode(); n != nil {
+				logins, err := checker.GetAllowedLoginsForResource(n)
+				if err != nil {
+					a.authServer.logger.WarnContext(ctx, "Unable to determine logins for node",
+						"error", err,
+						"resource", n.GetName(),
+					)
+					continue
+				}
+				r.Logins = logins
+			} else if d := r.GetWindowsDesktop(); d != nil {
+				logins, err := checker.GetAllowedLoginsForResource(d)
+				if err != nil {
+					a.authServer.logger.WarnContext(ctx, "Unable to determine logins for desktop",
+						"error", err,
+						"resource", d.GetName(),
+					)
+					continue
+				}
+				r.Logins = logins
+			} else if d := r.GetAppServer(); d != nil {
+				// Apps representing an Identity Center Account have a collection of Permission Sets
+				// that can be thought of as individually-addressable sub-resources. To present a consitent
+				// view of the account we check access for each Permission Set, filter out those that have
+				// no access and treat the whole app as requiring an access request if _any_ of the contained
+				// permission sets require one.
+				if err := a.filterICPermissionSets(r, d.GetApp(), resourceAccess); err != nil {
+					a.authServer.logger.WarnContext(ctx, "Unable to filter",
+						"error", err,
+						"resource", d.GetApp().GetName(),
+					)
+					continue
+				}
+
+				logins, err := checker.GetAllowedLoginsForResource(d.GetApp())
+				if err != nil {
+					a.authServer.logger.WarnContext(ctx, "Unable to determine logins for app",
+						"error", err,
+						"resource", d.GetApp().GetName(),
+					)
+					continue
+				}
+				r.Logins = logins
+			}
+		}
+	}
+
 	return &proto.ListUnifiedResourcesResponse{
-		NextKey:   resp.NextKey,
+		NextKey:   nextKey,
 		Resources: paginatedResources,
 	}, nil
 }
 
+func (a *ServerWithRoles) filterICPermissionSets(r *proto.PaginatedResource, app types.Application, checker *resourceAccess) error {
+	appV3, ok := app.(*types.AppV3)
+	if !ok {
+		return trace.BadParameter("resource must be an app")
+	}
+
+	pss := appV3.Spec.IdentityCenter.GetPermissionSets()
+	if pss == nil {
+		return nil
+	}
+
+	assignment := services.IdentityCenterAccountAssignment{
+		AccountAssignment: &identitycenterv1.AccountAssignment{
+			Kind:     types.KindIdentityCenterAccountAssignment,
+			Version:  types.V1,
+			Metadata: &headerv1.Metadata{},
+			Spec: &identitycenterv1.AccountAssignmentSpec{
+				AccountId:     appV3.GetName(),
+				PermissionSet: &identitycenterv1.PermissionSetInfo{},
+			},
+		},
+	}
+	permissionSetQuery := assignment.Spec.PermissionSet
+	checkable := types.Resource153ToResourceWithLabels(assignment)
+
+	var output []*types.IdentityCenterPermissionSet
+	for _, ps := range pss {
+		assignment.Metadata.Name = ps.AssignmentID
+		permissionSetQuery.Arn = ps.ARN
+
+		hasAccess, err := checker.checkAccess(checkable, services.MatchResourceFilter{
+			ResourceKind: types.KindIdentityCenterAccountAssignment,
+		})
+		if err != nil {
+			return trace.Wrap(err)
+		}
+
+		if !hasAccess {
+			continue
+		}
+		output = append(output, ps)
+		if _, requestable := checker.requestableMap[ps.AssignmentID]; requestable {
+			r.RequiresRequest = true
+		}
+	}
+	appV3.Spec.IdentityCenter.PermissionSets = output
+
+	return nil
+}
+
 func (a *ServerWithRoles) GetNodes(ctx context.Context, namespace string) ([]types.Server, error) {
-	if err := a.action(namespace, types.KindNode, types.VerbList); err != nil {
+	if err := a.actionNamespace(namespace, types.KindNode, types.VerbList); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
@@ -1766,13 +1586,14 @@ func (a *ServerWithRoles) GetNodes(ctx context.Context, namespace string) ([]typ
 	}
 	elapsedFilter := time.Since(startFilter)
 
-	log.WithFields(logrus.Fields{
-		"user":           a.context.User.GetName(),
-		"elapsed_fetch":  elapsedFetch,
-		"elapsed_filter": elapsedFilter,
-	}).Debugf(
-		"GetServers(%v->%v) in %v.",
-		len(nodes), len(filteredNodes), elapsedFetch+elapsedFilter)
+	a.authServer.logger.DebugContext(ctx, "Retrieved servers",
+		"node_count", len(nodes),
+		"filtered_node_count", len(filteredNodes),
+		"user", a.context.User.GetName(),
+		"elapsed_fetch", elapsedFetch,
+		"elapsed_filter", elapsedFilter,
+		"elapsed_total", elapsedFetch+elapsedFilter,
+	)
 
 	return filteredNodes, nil
 }
@@ -1806,26 +1627,10 @@ func (a *ServerWithRoles) authContextForSearch(ctx context.Context, req *proto.L
 		return nil, trace.Wrap(err)
 	}
 
-	// Only emit the event if the role list actually changed
-	if len(extendedContext.Checker.RoleNames()) != len(a.context.Checker.RoleNames()) {
-		if err := a.authServer.emitter.EmitAuditEvent(a.authServer.closeCtx, &apievents.AccessRequestResourceSearch{
-			Metadata: apievents.Metadata{
-				Type: events.AccessRequestResourceSearch,
-				Code: events.AccessRequestResourceSearchCode,
-			},
-			UserMetadata:        authz.ClientUserMetadata(ctx),
-			SearchAsRoles:       extendedContext.Checker.RoleNames(),
-			ResourceType:        req.ResourceType,
-			Namespace:           req.Namespace,
-			Labels:              req.Labels,
-			PredicateExpression: req.PredicateExpression,
-			SearchKeywords:      req.SearchKeywords,
-		}); err != nil {
-			return nil, trace.Wrap(err)
-		}
-	}
 	return extendedContext, nil
 }
+
+var disableUnqualifiedLookups = os.Getenv("TELEPORT_UNSTABLE_DISABLE_UNQUALIFIED_LOOKUPS") == "yes"
 
 // GetSSHTargets gets all servers that would match an equivalent ssh dial request. Note that this method
 // returns all resources directly accessible to the user *and* all resources available via 'SearchAsRoles',
@@ -1835,29 +1640,40 @@ func (a *ServerWithRoles) GetSSHTargets(ctx context.Context, req *proto.GetSSHTa
 	// try to detect case-insensitive routing setting, but default to false if we can't load
 	// networking config (equivalent to proxy routing behavior).
 	var caseInsensitiveRouting bool
-	if cfg, err := a.authServer.GetClusterNetworkingConfig(ctx); err == nil {
+	if cfg, err := a.authServer.GetReadOnlyClusterNetworkingConfig(ctx); err == nil {
 		caseInsensitiveRouting = cfg.GetCaseInsensitiveRouting()
 	}
 
-	matcher := apiutils.NewSSHRouteMatcher(req.Host, req.Port, caseInsensitiveRouting)
+	matcher, err := apiutils.NewSSHRouteMatcherFromConfig(apiutils.SSHRouteMatcherConfig{
+		Host:                      req.Host,
+		Port:                      req.Port,
+		CaseInsensitive:           caseInsensitiveRouting,
+		DisableUnqualifiedLookups: disableUnqualifiedLookups,
+	})
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
 
-	lreq := proto.ListResourcesRequest{
-		ResourceType:     types.KindNode,
+	lreq := &proto.ListUnifiedResourcesRequest{
+		Kinds:            []string{types.KindNode},
+		SortBy:           types.SortBy{Field: types.ResourceMetadataName},
 		UseSearchAsRoles: true,
 	}
 	var servers []*types.ServerV2
 	for {
-		// note that we're calling ServerWithRoles.ListResources here rather than some internal method. This method
+		// note that we're calling ServerWithRoles.ListUnifiedResources here rather than some internal method. This method
 		// delegates all RBAC filtering to ListResources, and then performs additional filtering on top of that.
-		lrsp, err := a.ListResources(ctx, lreq)
+		lrsp, err := a.ListUnifiedResources(ctx, lreq)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
 
 		for _, rsc := range lrsp.Resources {
-			srv, ok := rsc.(*types.ServerV2)
-			if !ok {
-				log.Warnf("Unexpected resource type %T, expected *types.ServerV2 (skipping)", rsc)
+			srv := rsc.GetNode()
+			if srv == nil {
+				a.authServer.logger.WarnContext(ctx, "Skipping unexpected resource type, expected *types.ServerV2",
+					"resource_type", logutils.TypeAttr(rsc),
+				)
 				continue
 			}
 
@@ -1878,6 +1694,94 @@ func (a *ServerWithRoles) GetSSHTargets(ctx context.Context, req *proto.GetSSHTa
 	return &proto.GetSSHTargetsResponse{
 		Servers: servers,
 	}, nil
+}
+
+// ResolveSSHTarget gets a server that would match an equivalent ssh dial request.
+func (a *ServerWithRoles) ResolveSSHTarget(ctx context.Context, req *proto.ResolveSSHTargetRequest) (*proto.ResolveSSHTargetResponse, error) {
+	// try to detect case-insensitive routing setting, but default to false if we can't load
+	// networking config (equivalent to proxy routing behavior).
+	var routeToMostRecent bool
+	if cfg, err := a.authServer.GetReadOnlyClusterNetworkingConfig(ctx); err == nil {
+		routeToMostRecent = cfg.GetRoutingStrategy() == types.RoutingStrategy_MOST_RECENT
+	}
+
+	var servers []*types.ServerV2
+	switch {
+	case req.Host != "":
+		if len(req.Labels) > 0 || req.PredicateExpression != "" || len(req.SearchKeywords) > 0 {
+			a.authServer.logger.WarnContext(ctx, "ssh target resolution request contained both host and a resource matcher - ignoring resource matcher")
+		}
+
+		resp, err := a.GetSSHTargets(ctx, &proto.GetSSHTargetsRequest{
+			Host: req.Host,
+			Port: req.Port,
+		})
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+
+		servers = resp.Servers
+	case len(req.Labels) > 0 || req.PredicateExpression != "" || len(req.SearchKeywords) > 0:
+		lreq := &proto.ListUnifiedResourcesRequest{
+			Kinds:               []string{types.KindNode},
+			SortBy:              types.SortBy{Field: types.ResourceMetadataName},
+			Labels:              req.Labels,
+			PredicateExpression: req.PredicateExpression,
+			SearchKeywords:      req.SearchKeywords,
+		}
+		for {
+			// note that we're calling ServerWithRoles.ListUnifiedResources here rather than some internal method. This method
+			// delegates all RBAC filtering to ListResources, and then performs additional filtering on top of that.
+			lrsp, err := a.ListUnifiedResources(ctx, lreq)
+			if err != nil {
+				return nil, trace.Wrap(err)
+			}
+
+			for _, rsc := range lrsp.Resources {
+				srv := rsc.GetNode()
+				if srv == nil {
+					a.authServer.logger.WarnContext(ctx, "Skipping unexpected resource type, expected *types.ServerV2",
+						"resource_type", logutils.TypeAttr(rsc),
+					)
+					continue
+				}
+
+				servers = append(servers, srv)
+			}
+
+			// If the routing strategy doesn't permit ambiguous matches, then abort
+			// early if more than one server has been found already
+			if !routeToMostRecent && len(servers) > 1 {
+				break
+			}
+
+			if lrsp.NextKey == "" || len(lrsp.Resources) == 0 {
+				break
+			}
+
+			lreq.StartKey = lrsp.NextKey
+
+		}
+	default:
+		return nil, trace.BadParameter("request did not contain any host information or resource matcher")
+	}
+
+	switch len(servers) {
+	case 1:
+		return &proto.ResolveSSHTargetResponse{Server: servers[0]}, nil
+	case 0:
+		return nil, trace.NotFound("no matching hosts")
+	default:
+		if !routeToMostRecent {
+			return nil, trace.Wrap(teleport.ErrNodeIsAmbiguous)
+		}
+
+		// Return the most recent version of the resource.
+		server := slices.MaxFunc(servers, func(a, b *types.ServerV2) int {
+			return a.Expiry().Compare(b.Expiry())
+		})
+		return &proto.ResolveSSHTargetResponse{Server: server}, nil
+	}
 }
 
 // ListResources returns a paginated list of resources filtered by user access.
@@ -1941,13 +1845,23 @@ func (a *ServerWithRoles) ListResources(ctx context.Context, req proto.ListResou
 		//   https://github.com/gravitational/teleport/pull/1224
 		actionVerbs = []string{types.VerbList}
 
-	case types.KindDatabaseServer, types.KindDatabaseService, types.KindAppServer, types.KindKubeServer, types.KindWindowsDesktop, types.KindWindowsDesktopService, types.KindUserGroup:
+	case types.KindDatabaseServer,
+		types.KindDatabaseService,
+		types.KindAppServer,
+		types.KindKubeServer,
+		types.KindWindowsDesktop,
+		types.KindWindowsDesktopService,
+		types.KindUserGroup,
+		types.KindSAMLIdPServiceProvider,
+		types.KindIdentityCenterAccount,
+		types.KindIdentityCenterAccountAssignment:
 
 	default:
 		return nil, trace.NotImplemented("resource type %s does not support pagination", req.ResourceType)
 	}
 
-	if err := a.action(req.Namespace, req.ResourceType, actionVerbs...); err != nil {
+	checkAction := a.selectActionChecker(req.ResourceType)
+	if err := checkAction(req.Namespace, req.ResourceType, actionVerbs...); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
@@ -1955,11 +1869,19 @@ func (a *ServerWithRoles) ListResources(ctx context.Context, req proto.ListResou
 	// `ListResources`) to ensure that it will be applied only to resources
 	// the user has access to.
 	filter := services.MatchResourceFilter{
-		ResourceKind:        req.ResourceType,
-		Labels:              req.Labels,
-		SearchKeywords:      req.SearchKeywords,
-		PredicateExpression: req.PredicateExpression,
+		ResourceKind:   req.ResourceType,
+		Labels:         req.Labels,
+		SearchKeywords: req.SearchKeywords,
 	}
+
+	if req.PredicateExpression != "" {
+		expression, err := services.NewResourceExpression(req.PredicateExpression)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		filter.PredicateExpression = expression
+	}
+
 	req.Labels = nil
 	req.SearchKeywords = nil
 	req.PredicateExpression = ""
@@ -1993,6 +1915,25 @@ func (a *ServerWithRoles) ListResources(ctx context.Context, req proto.ListResou
 		case err != nil:
 			return trace.Wrap(err)
 		case match:
+			if req.IncludeLogins {
+				var checkableResource services.AccessCheckable = resource
+				if appServer, ok := resource.(types.AppServer); ok {
+					checkableResource = appServer.GetApp()
+				}
+
+				logins, err := resourceChecker.GetAllowedLoginsForResource(checkableResource)
+				if err != nil {
+					a.authServer.logger.WarnContext(ctx, "Unable to determine logins for resource",
+						"error", err,
+						"resource", resource.GetName(),
+					)
+				}
+
+				resource = &types.EnrichedResource{
+					ResourceWithLabels: resource,
+					Logins:             logins,
+				}
+			}
 			resp.Resources = append(resp.Resources, resource)
 			return nil
 		}
@@ -2008,6 +1949,7 @@ func (a *ServerWithRoles) ListResources(ctx context.Context, req proto.ListResou
 // resourceAccessChecker allows access to be checked differently per resource type.
 type resourceAccessChecker interface {
 	CanAccess(resource types.Resource) error
+	GetAllowedLoginsForResource(resource services.AccessCheckable) ([]string, error)
 }
 
 // resourceChecker is a pass through checker that utilizes the provided
@@ -2047,15 +1989,43 @@ func (r resourceChecker) CanAccess(resource types.Resource) error {
 		if rr.GetKind() == types.KindUserGroup {
 			return r.CheckAccess(rr, state)
 		}
+	case types.SAMLIdPServiceProvider:
+		return r.CheckAccess(rr, state)
+
+	case types.Resource153Unwrapper:
+		checkable, isCheckable := rr.(services.AccessCheckable)
+		if isCheckable {
+			switch unwrapped := rr.Unwrap().(type) {
+			case services.IdentityCenterAccount:
+				return r.CheckAccess(checkable, state, services.NewIdentityCenterAccountMatcher(unwrapped))
+
+			case services.IdentityCenterAccountAssignment:
+				return r.CheckAccess(checkable, state, services.NewIdentityCenterAccountAssignmentMatcher(unwrapped))
+
+			default:
+				return r.CheckAccess(checkable, state)
+			}
+		}
 	}
 
-	return trace.BadParameter("could not check access to resource type %T", r)
+	return trace.BadParameter("could not check access to resource type %T", resource)
 }
 
 // newResourceAccessChecker creates a resourceAccessChecker for the provided resource type
 func (a *ServerWithRoles) newResourceAccessChecker(resource string) (resourceAccessChecker, error) {
 	switch resource {
-	case types.KindAppServer, types.KindDatabaseServer, types.KindDatabaseService, types.KindWindowsDesktop, types.KindWindowsDesktopService, types.KindNode, types.KindKubeServer, types.KindUserGroup:
+	case types.KindAppServer,
+		types.KindDatabaseServer,
+		types.KindDatabaseService,
+		types.KindWindowsDesktop,
+		types.KindWindowsDesktopService,
+		types.KindNode,
+		types.KindKubeServer,
+		types.KindUserGroup,
+		types.KindUnifiedResource,
+		types.KindSAMLIdPServiceProvider,
+		types.KindIdentityCenterAccount,
+		types.KindIdentityCenterAccountAssignment:
 		return &resourceChecker{AccessChecker: a.context.Checker}, nil
 	default:
 		return nil, trace.BadParameter("could not check access to resource type %s", resource)
@@ -2095,6 +2065,7 @@ func (a *ServerWithRoles) listResourcesWithSort(ctx context.Context, req proto.L
 		}
 		resources = servers.AsResources()
 
+	// TODO(sshah) DELETE IN 17.0
 	case types.KindAppOrSAMLIdPServiceProvider:
 		appsAndServiceProviders, err := a.GetAppServersAndSAMLIdPServiceProviders(ctx, req.Namespace)
 		if err != nil {
@@ -2108,6 +2079,32 @@ func (a *ServerWithRoles) listResourcesWithSort(ctx context.Context, req proto.L
 		}
 
 		resources = appsOrSPs.AsResources()
+
+	case types.KindSAMLIdPServiceProvider:
+		// Only add SAMLIdPServiceProviders to the list if the caller has an enterprise license.
+		if modules.GetModules().BuildType() == modules.BuildEnterprise {
+			// Only attempt to list SAMLIdPServiceProviders if the caller has the permission to.
+			if err := a.action(types.KindSAMLIdPServiceProvider, types.VerbList); err == nil {
+				var serviceProviders []types.SAMLIdPServiceProvider
+				var startKey string
+				for {
+					sps, nextKey, err := a.ListSAMLIdPServiceProviders(ctx, int(req.Limit), startKey)
+					if err != nil {
+						return nil, trace.Wrap(err)
+					}
+					serviceProviders = append(serviceProviders, sps...)
+					if nextKey == "" {
+						break
+					}
+					startKey = nextKey
+				}
+				sps := types.SAMLIdPServiceProviders(serviceProviders)
+				if err := sps.SortByCustom(req.SortBy); err != nil {
+					return nil, trace.Wrap(err)
+				}
+				resources = sps.AsResources()
+			}
+		}
 
 	case types.KindDatabaseServer:
 		dbservers, err := a.GetDatabaseServers(ctx, req.Namespace)
@@ -2188,15 +2185,49 @@ func (a *ServerWithRoles) listResourcesWithSort(ctx context.Context, req proto.L
 		return nil, trace.NotImplemented("resource type %q is not supported for listResourcesWithSort", req.ResourceType)
 	}
 
+	params := local.FakePaginateParams{
+		ResourceType:   req.ResourceType,
+		Limit:          req.Limit,
+		Labels:         req.Labels,
+		SearchKeywords: req.SearchKeywords,
+		StartKey:       req.StartKey,
+		EnrichResourceFn: func(r types.ResourceWithLabels) (types.ResourceWithLabels, error) {
+			if !req.IncludeLogins && (r.GetKind() != types.KindNode || r.GetKind() != types.KindWindowsDesktop || r.GetKind() != types.KindAppServer) {
+				return r, nil
+			}
+
+			resourceChecker, err := a.newResourceAccessChecker(req.ResourceType)
+			if err != nil {
+				return nil, trace.Wrap(err)
+			}
+
+			var checkableResource services.AccessCheckable = r
+			if appServer, ok := r.(types.AppServer); ok {
+				checkableResource = appServer.GetApp()
+			}
+
+			logins, err := resourceChecker.GetAllowedLoginsForResource(checkableResource)
+			if err != nil {
+				a.authServer.logger.WarnContext(ctx, "Unable to determine logins for resource",
+					"error", err,
+					"resource", r.GetName(),
+				)
+			}
+
+			return &types.EnrichedResource{ResourceWithLabels: r, Logins: logins}, nil
+		},
+	}
+
+	if req.PredicateExpression != "" {
+		expression, err := services.NewResourceExpression(req.PredicateExpression)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		params.PredicateExpression = expression
+	}
+
 	// Apply request filters and get pagination info.
-	resp, err := local.FakePaginate(resources, local.FakePaginateParams{
-		ResourceType:        req.ResourceType,
-		Limit:               req.Limit,
-		Labels:              req.Labels,
-		SearchKeywords:      req.SearchKeywords,
-		PredicateExpression: req.PredicateExpression,
-		StartKey:            req.StartKey,
-	})
+	resp, err := local.FakePaginate(resources, params)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -2204,25 +2235,15 @@ func (a *ServerWithRoles) listResourcesWithSort(ctx context.Context, req proto.L
 	return resp, nil
 }
 
-// ListWindowsDesktops not implemented: can only be called locally.
-func (a *ServerWithRoles) ListWindowsDesktops(ctx context.Context, req types.ListWindowsDesktopsRequest) (*types.ListWindowsDesktopsResponse, error) {
-	return nil, trace.NotImplemented(notImplementedMessage)
-}
-
-// ListWindowsDesktopServices not implemented: can only be called locally.
-func (a *ServerWithRoles) ListWindowsDesktopServices(ctx context.Context, req types.ListWindowsDesktopServicesRequest) (*types.ListWindowsDesktopServicesResponse, error) {
-	return nil, trace.NotImplemented(notImplementedMessage)
-}
-
 func (a *ServerWithRoles) UpsertAuthServer(ctx context.Context, s types.Server) error {
-	if err := a.action(apidefaults.Namespace, types.KindAuthServer, types.VerbCreate, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindAuthServer, types.VerbCreate, types.VerbUpdate); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.UpsertAuthServer(ctx, s)
 }
 
 func (a *ServerWithRoles) GetAuthServers() ([]types.Server, error) {
-	if err := a.action(apidefaults.Namespace, types.KindAuthServer, types.VerbList, types.VerbRead); err != nil {
+	if err := a.action(types.KindAuthServer, types.VerbList, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return a.authServer.GetAuthServers()
@@ -2230,7 +2251,7 @@ func (a *ServerWithRoles) GetAuthServers() ([]types.Server, error) {
 
 // DeleteAllAuthServers deletes all auth servers
 func (a *ServerWithRoles) DeleteAllAuthServers() error {
-	if err := a.action(apidefaults.Namespace, types.KindAuthServer, types.VerbDelete); err != nil {
+	if err := a.action(types.KindAuthServer, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.DeleteAllAuthServers()
@@ -2238,21 +2259,21 @@ func (a *ServerWithRoles) DeleteAllAuthServers() error {
 
 // DeleteAuthServer deletes auth server by name
 func (a *ServerWithRoles) DeleteAuthServer(name string) error {
-	if err := a.action(apidefaults.Namespace, types.KindAuthServer, types.VerbDelete); err != nil {
+	if err := a.action(types.KindAuthServer, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.DeleteAuthServer(name)
 }
 
 func (a *ServerWithRoles) UpsertProxy(ctx context.Context, s types.Server) error {
-	if err := a.action(apidefaults.Namespace, types.KindProxy, types.VerbCreate, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindProxy, types.VerbCreate, types.VerbUpdate); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.UpsertProxy(ctx, s)
 }
 
 func (a *ServerWithRoles) GetProxies() ([]types.Server, error) {
-	if err := a.action(apidefaults.Namespace, types.KindProxy, types.VerbList, types.VerbRead); err != nil {
+	if err := a.action(types.KindProxy, types.VerbList, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return a.authServer.GetProxies()
@@ -2260,7 +2281,7 @@ func (a *ServerWithRoles) GetProxies() ([]types.Server, error) {
 
 // DeleteAllProxies deletes all proxies
 func (a *ServerWithRoles) DeleteAllProxies() error {
-	if err := a.action(apidefaults.Namespace, types.KindProxy, types.VerbDelete); err != nil {
+	if err := a.action(types.KindProxy, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.DeleteAllProxies()
@@ -2268,51 +2289,57 @@ func (a *ServerWithRoles) DeleteAllProxies() error {
 
 // DeleteProxy deletes proxy by name
 func (a *ServerWithRoles) DeleteProxy(ctx context.Context, name string) error {
-	if err := a.action(apidefaults.Namespace, types.KindProxy, types.VerbDelete); err != nil {
+	if err := a.action(types.KindProxy, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.DeleteProxy(ctx, name)
 }
 
-func (a *ServerWithRoles) UpsertReverseTunnel(r types.ReverseTunnel) error {
-	if err := a.action(apidefaults.Namespace, types.KindReverseTunnel, types.VerbCreate, types.VerbUpdate); err != nil {
+// TODO(noah): DELETE IN 18.0.0 - all these methods are now gRPC.
+func (a *ServerWithRoles) UpsertReverseTunnel(ctx context.Context, r types.ReverseTunnel) error {
+	if err := a.action(types.KindReverseTunnel, types.VerbCreate, types.VerbUpdate); err != nil {
 		return trace.Wrap(err)
 	}
-	return a.authServer.UpsertReverseTunnel(r)
+	return a.authServer.UpsertReverseTunnel(ctx, r)
 }
 
-func (a *ServerWithRoles) GetReverseTunnel(name string, opts ...services.MarshalOption) (types.ReverseTunnel, error) {
-	if err := a.action(apidefaults.Namespace, types.KindReverseTunnel, types.VerbRead); err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return a.authServer.GetReverseTunnel(name, opts...)
-}
-
+// TODO(noah): DELETE IN 18.0.0 - all these methods are now gRPC.
 func (a *ServerWithRoles) GetReverseTunnels(ctx context.Context, opts ...services.MarshalOption) ([]types.ReverseTunnel, error) {
-	if err := a.action(apidefaults.Namespace, types.KindReverseTunnel, types.VerbList, types.VerbRead); err != nil {
+	if err := a.action(types.KindReverseTunnel, types.VerbList, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	return a.authServer.GetReverseTunnels(ctx, opts...)
+	return a.authServer.GetReverseTunnels(ctx)
 }
 
-func (a *ServerWithRoles) DeleteReverseTunnel(domainName string) error {
-	if err := a.action(apidefaults.Namespace, types.KindReverseTunnel, types.VerbDelete); err != nil {
+// TODO(noah): DELETE IN 18.0.0 - all these methods are now gRPC.
+func (a *ServerWithRoles) DeleteReverseTunnel(ctx context.Context, domainName string) error {
+	if err := a.action(types.KindReverseTunnel, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
-	return a.authServer.DeleteReverseTunnel(domainName)
+	return a.authServer.DeleteReverseTunnel(ctx, domainName)
 }
 
 func (a *ServerWithRoles) DeleteToken(ctx context.Context, token string) error {
-	if err := a.action(apidefaults.Namespace, types.KindToken, types.VerbDelete); err != nil {
+	if err := a.action(types.KindToken, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
+
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return trace.Wrap(err)
+	}
+
 	return a.authServer.DeleteToken(ctx, token)
 }
 
 func (a *ServerWithRoles) GetTokens(ctx context.Context) ([]types.ProvisionToken, error) {
-	if err := a.action(apidefaults.Namespace, types.KindToken, types.VerbList, types.VerbRead); err != nil {
+	if err := a.action(types.KindToken, types.VerbList, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
+
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
 	return a.authServer.GetTokens(ctx)
 }
 
@@ -2320,10 +2347,15 @@ func (a *ServerWithRoles) GetToken(ctx context.Context, token string) (types.Pro
 	// The Proxy has permission to look up tokens by name in order to validate
 	// attempts to use the node join script.
 	if isProxy := a.hasBuiltinRole(types.RoleProxy); !isProxy {
-		if err := a.action(apidefaults.Namespace, types.KindToken, types.VerbRead); err != nil {
+		if err := a.action(types.KindToken, types.VerbRead); err != nil {
 			return nil, trace.Wrap(err)
 		}
 	}
+
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
 	return a.authServer.GetToken(ctx, token)
 }
 
@@ -2337,22 +2369,32 @@ func enforceEnterpriseJoinMethodCreation(token types.ProvisionToken) error {
 		return trace.BadParameter("unexpected token type %T", token)
 	}
 
-	if v.Spec.GitHub != nil && v.Spec.GitHub.EnterpriseServerHost != "" {
-		return fmt.Errorf(
-			"github enterprise server joining: %w",
+	switch v.Spec.JoinMethod {
+	case types.JoinMethodGitHub:
+		if v.Spec.GitHub != nil && v.Spec.GitHub.EnterpriseServerHost != "" {
+			return trace.Wrap(
+				ErrRequiresEnterprise,
+				"github enterprise server joining",
+			)
+		}
+	case types.JoinMethodSpacelift:
+		return trace.Wrap(
 			ErrRequiresEnterprise,
+			"spacelift joining",
+		)
+	case types.JoinMethodTPM:
+		return trace.Wrap(
+			ErrRequiresEnterprise,
+			"tpm joining",
 		)
 	}
+
 	return nil
 }
 
 // emitTokenEvent is called by Create/Upsert Token in order to emit any relevant
 // events.
-func emitTokenEvent(
-	ctx context.Context,
-	e apievents.Emitter,
-	roles types.SystemRoles,
-	joinMethod types.JoinMethod,
+func emitTokenEvent(ctx context.Context, e apievents.Emitter, token types.ProvisionToken,
 ) {
 	userMetadata := authz.ClientUserMetadata(ctx)
 	if err := e.EmitAuditEvent(ctx, &apievents.ProvisionTokenCreate{
@@ -2360,40 +2402,59 @@ func emitTokenEvent(
 			Type: events.ProvisionTokenCreateEvent,
 			Code: events.ProvisionTokenCreateCode,
 		},
+		ResourceMetadata: apievents.ResourceMetadata{
+			Name:      token.GetSafeName(),
+			Expires:   token.Expiry(),
+			UpdatedBy: userMetadata.GetUser(),
+		},
 		UserMetadata: userMetadata,
-		Roles:        roles,
-		JoinMethod:   joinMethod,
+		Roles:        token.GetRoles(),
+		JoinMethod:   token.GetJoinMethod(),
 	}); err != nil {
-		log.WithError(err).Warn("Failed to emit join token create event.")
+		logger.WarnContext(ctx, "Failed to emit join token create event", "error", err)
 	}
 }
 
 func (a *ServerWithRoles) UpsertToken(ctx context.Context, token types.ProvisionToken) error {
-	if err := a.action(apidefaults.Namespace, types.KindToken, types.VerbCreate, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindToken, types.VerbCreate, types.VerbUpdate); err != nil {
 		return trace.Wrap(err)
 	}
+
+	// Support reused MFA for bulk tctl create requests.
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return trace.Wrap(err)
+	}
+
 	if err := enforceEnterpriseJoinMethodCreation(token); err != nil {
 		return trace.Wrap(err)
 	}
+
 	if err := a.authServer.UpsertToken(ctx, token); err != nil {
 		return trace.Wrap(err)
 	}
-	emitTokenEvent(ctx, a.authServer.emitter, token.GetRoles(), token.GetJoinMethod())
+
+	emitTokenEvent(ctx, a.authServer.emitter, token)
 	return nil
 }
 
 func (a *ServerWithRoles) CreateToken(ctx context.Context, token types.ProvisionToken) error {
-	jm := token.GetJoinMethod()
-	if err := a.action(apidefaults.Namespace, types.KindToken, types.VerbCreate); err != nil {
+	if err := a.action(types.KindToken, types.VerbCreate); err != nil {
 		return trace.Wrap(err)
 	}
+
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return trace.Wrap(err)
+	}
+
 	if err := enforceEnterpriseJoinMethodCreation(token); err != nil {
 		return trace.Wrap(err)
 	}
+
 	if err := a.authServer.CreateToken(ctx, token); err != nil {
 		return trace.Wrap(err)
 	}
-	emitTokenEvent(ctx, a.authServer.emitter, token.GetRoles(), jm)
+
+	emitTokenEvent(ctx, a.authServer.emitter, token)
 	return nil
 }
 
@@ -2408,13 +2469,6 @@ func (a *ServerWithRoles) ChangePassword(
 	return a.authServer.ChangePassword(ctx, req)
 }
 
-func (a *ServerWithRoles) PreAuthenticatedSignIn(ctx context.Context, user string) (types.WebSession, error) {
-	if err := a.currentUserAction(user); err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return a.authServer.PreAuthenticatedSignIn(ctx, user, a.context.Identity.GetIdentity())
-}
-
 // CreateWebSession creates a new web session for the specified user
 func (a *ServerWithRoles) CreateWebSession(ctx context.Context, user string) (types.WebSession, error) {
 	if err := a.currentUserAction(user); err != nil {
@@ -2426,7 +2480,7 @@ func (a *ServerWithRoles) CreateWebSession(ctx context.Context, user string) (ty
 // ExtendWebSession creates a new web session for a user based on a valid previous session.
 // Additional roles are appended to initial roles if there is an approved access request.
 // The new session expiration time will not exceed the expiration time of the old session.
-func (a *ServerWithRoles) ExtendWebSession(ctx context.Context, req WebSessionReq) (types.WebSession, error) {
+func (a *ServerWithRoles) ExtendWebSession(ctx context.Context, req authclient.WebSessionReq) (types.WebSession, error) {
 	if err := a.currentUserAction(req.User); err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -2457,24 +2511,26 @@ func (a *ServerWithRoles) WebSessions() types.WebSessionInterface {
 
 // Get returns the web session specified with req.
 func (r *webSessionsWithRoles) Get(ctx context.Context, req types.GetWebSessionRequest) (types.WebSession, error) {
-	if err := r.c.currentUserAction(req.User); err != nil {
-		if err := r.c.action(apidefaults.Namespace, types.KindWebSession, types.VerbRead); err != nil {
-			return nil, trace.Wrap(err)
-		}
+	if err := r.c.action(types.KindWebSession, types.VerbRead); err != nil {
+		return nil, trace.Wrap(err)
 	}
 	return r.ws.Get(ctx, req)
 }
 
 // List returns the list of all web sessions.
 func (r *webSessionsWithRoles) List(ctx context.Context) ([]types.WebSession, error) {
-	if err := r.c.action(apidefaults.Namespace, types.KindWebSession, types.VerbList); err != nil {
+	if err := r.c.action(types.KindWebSession, types.VerbList); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	if err := r.c.action(apidefaults.Namespace, types.KindWebSession, types.VerbRead); err != nil {
+	if err := r.c.action(types.KindWebSession, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return r.ws.List(ctx)
 }
+
+// notImplementedMessage is the message to return for endpoints that are not
+// implemented. This is due to how service interfaces are used with Teleport.
+const notImplementedMessage = "not implemented: can only be called by auth locally"
 
 // Upsert creates a new or updates the existing web session from the specified session.
 // TODO(dmitri): this is currently only implemented for local invocations. This needs to be
@@ -2493,10 +2549,10 @@ func (r *webSessionsWithRoles) Delete(ctx context.Context, req types.DeleteWebSe
 
 // DeleteAll removes all web sessions.
 func (r *webSessionsWithRoles) DeleteAll(ctx context.Context) error {
-	if err := r.c.action(apidefaults.Namespace, types.KindWebSession, types.VerbList); err != nil {
+	if err := r.c.action(types.KindWebSession, types.VerbList); err != nil {
 		return trace.Wrap(err)
 	}
-	if err := r.c.action(apidefaults.Namespace, types.KindWebSession, types.VerbDelete); err != nil {
+	if err := r.c.action(types.KindWebSession, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	return r.ws.DeleteAll(ctx)
@@ -2522,7 +2578,7 @@ func (a *ServerWithRoles) WebTokens() types.WebTokenInterface {
 // Get returns the web token specified with req.
 func (r *webTokensWithRoles) Get(ctx context.Context, req types.GetWebTokenRequest) (types.WebToken, error) {
 	if err := r.c.currentUserAction(req.User); err != nil {
-		if err := r.c.action(apidefaults.Namespace, types.KindWebToken, types.VerbRead); err != nil {
+		if err := r.c.action(types.KindWebToken, types.VerbRead); err != nil {
 			return nil, trace.Wrap(err)
 		}
 	}
@@ -2531,7 +2587,7 @@ func (r *webTokensWithRoles) Get(ctx context.Context, req types.GetWebTokenReque
 
 // List returns the list of all web tokens.
 func (r *webTokensWithRoles) List(ctx context.Context) ([]types.WebToken, error) {
-	if err := r.c.action(apidefaults.Namespace, types.KindWebToken, types.VerbList); err != nil {
+	if err := r.c.action(types.KindWebToken, types.VerbList); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return r.t.List(ctx)
@@ -2547,7 +2603,7 @@ func (*webTokensWithRoles) Upsert(ctx context.Context, session types.WebToken) e
 // Delete removes the web token specified with req.
 func (r *webTokensWithRoles) Delete(ctx context.Context, req types.DeleteWebTokenRequest) error {
 	if err := r.c.currentUserAction(req.User); err != nil {
-		if err := r.c.action(apidefaults.Namespace, types.KindWebToken, types.VerbDelete); err != nil {
+		if err := r.c.action(types.KindWebToken, types.VerbDelete); err != nil {
 			return trace.Wrap(err)
 		}
 	}
@@ -2556,10 +2612,10 @@ func (r *webTokensWithRoles) Delete(ctx context.Context, req types.DeleteWebToke
 
 // DeleteAll removes all web tokens.
 func (r *webTokensWithRoles) DeleteAll(ctx context.Context) error {
-	if err := r.c.action(apidefaults.Namespace, types.KindWebToken, types.VerbList); err != nil {
+	if err := r.c.action(types.KindWebToken, types.VerbList); err != nil {
 		return trace.Wrap(err)
 	}
-	if err := r.c.action(apidefaults.Namespace, types.KindWebToken, types.VerbDelete); err != nil {
+	if err := r.c.action(types.KindWebToken, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	return r.t.DeleteAll(ctx)
@@ -2571,30 +2627,77 @@ type webTokensWithRoles struct {
 }
 
 type accessChecker interface {
-	action(namespace, resource string, verbs ...string) error
+	action(resource string, verbs ...string) error
 	currentUserAction(user string) error
 	canDeleteWebSession(username string) error
 }
 
 func (a *ServerWithRoles) GetAccessRequests(ctx context.Context, filter types.AccessRequestFilter) ([]types.AccessRequest, error) {
-	// users can always view their own access requests
-	if filter.User != "" && a.currentUserAction(filter.User) == nil {
-		return a.authServer.GetAccessRequests(ctx, filter)
+	// delegate all access-control logic to ListAccessRequests to reduce duplicate maintenance.
+	req := proto.ListAccessRequestsRequest{
+		Filter: &filter,
+	}
+	var requests []types.AccessRequest
+	for {
+		rsp, err := a.ListAccessRequests(ctx, &req)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+
+		for _, r := range rsp.AccessRequests {
+			requests = append(requests, r)
+		}
+
+		req.StartKey = rsp.NextKey
+		if req.StartKey == "" {
+			break
+		}
 	}
 
-	// users with read + list permissions can get all requests
-	if a.withOptions(quietAction(true)).action(apidefaults.Namespace, types.KindAccessRequest, types.VerbList) == nil {
-		if a.withOptions(quietAction(true)).action(apidefaults.Namespace, types.KindAccessRequest, types.VerbRead) == nil {
-			return a.authServer.GetAccessRequests(ctx, filter)
+	return requests, nil
+}
+
+// ListAccessRequests is an access request getter with pagination and sorting options.
+func (a *ServerWithRoles) ListAccessRequests(ctx context.Context, req *proto.ListAccessRequestsRequest) (*proto.ListAccessRequestsResponse, error) {
+	// ensure filter is non-nil
+	if req.Filter == nil {
+		req.Filter = &types.AccessRequestFilter{}
+	}
+	// set the requesting user to be used in the filter match. This is only meant to be set here
+	// and will be overwritten if set elsewhere
+	req.Filter.Requester = a.context.User.GetName()
+
+	if err := a.action(types.KindAccessRequest, types.VerbList, types.VerbRead); err != nil {
+		// Users are allowed to read + list their own access requests and
+		// requests they are allowed to review, unless access was *explicitly*
+		// denied. This means deny rules block the action but allow rules are
+		// not required.
+		if services.IsAccessExplicitlyDenied(err) {
+			return nil, trace.Wrap(err)
 		}
+	} else {
+		// nil err means the user has explicit read + list permissions and can
+		// get all requests.
+		return a.authServer.ListAccessRequests(ctx, req)
+	}
+
+	// users can always view their own access requests unless the read or list
+	// verbs are explicitly denied
+	if req.Filter.User != "" && a.currentUserAction(req.Filter.User) == nil {
+		return a.authServer.ListAccessRequests(ctx, req)
 	}
 
 	// user does not have read/list permissions and is not specifically requesting only
 	// their own requests.  we therefore subselect the filter results to show only those requests
 	// that the user *is* allowed to see (specifically, their own requests + requests that they
 	// are allowed to review).
-
-	checker, err := services.NewReviewPermissionChecker(ctx, a.authServer, a.context.User.GetName())
+	identity := a.context.Identity.GetIdentity()
+	checker, err := services.NewReviewPermissionChecker(
+		ctx,
+		a.authServer,
+		a.context.User.GetName(),
+		&identity,
+	)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -2602,88 +2705,160 @@ func (a *ServerWithRoles) GetAccessRequests(ctx context.Context, filter types.Ac
 	// unless the user has allow directives for reviewing, they will never be able to
 	// see any requests other than their own.
 	if !checker.HasAllowDirectives() {
-		if filter.User != "" {
+		if req.Filter.User != "" {
 			// filter specifies a user, but it wasn't caught by the preceding exception,
 			// so just return nothing.
-			return nil, nil
+			return &proto.ListAccessRequestsResponse{}, nil
 		}
-		filter.User = a.context.User.GetName()
-		return a.authServer.GetAccessRequests(ctx, filter)
+		req.Filter.User = a.context.User.GetName()
+		return a.authServer.ListAccessRequests(ctx, req)
 	}
 
-	reqs, err := a.authServer.GetAccessRequests(ctx, filter)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	// filter in place
-	filtered := reqs[:0]
-	for _, req := range reqs {
-		if req.GetUser() == a.context.User.GetName() {
-			filtered = append(filtered, req)
-			continue
+	// aggregate all requests that the caller owns and/or is able to review. Note that we perform all filtering via the
+	// passed-in matcher since the pagination key format varies by sort index and is an internal implementation detail
+	// of the access request cache.
+	rsp, err := a.authServer.ListMatchingAccessRequests(ctx, req, func(accessRequest *types.AccessRequestV3) (matches bool) {
+		if accessRequest.GetUser() == a.context.User.GetName() {
+			return true
 		}
 
-		ok, err := checker.CanReviewRequest(req)
+		canReview, err := checker.CanReviewRequest(accessRequest)
 		if err != nil {
-			return nil, trace.Wrap(err)
+			a.authServer.logger.WarnContext(ctx, "Failed to evaluate review permissions for user against access request",
+				"user", a.context.User.GetName(),
+				"access_request", accessRequest.GetName(),
+				"error", err,
+			)
+			return false
 		}
-		if ok {
-			filtered = append(filtered, req)
-			continue
-		}
-	}
-	return filtered, nil
+
+		return canReview
+	})
+
+	return rsp, trace.Wrap(err)
 }
 
 func (a *ServerWithRoles) CreateAccessRequestV2(ctx context.Context, req types.AccessRequest) (types.AccessRequest, error) {
-	// An exception is made to allow users to create access *pending* requests for themselves.
-	if !req.GetState().IsPending() || a.currentUserAction(req.GetUser()) != nil {
-		if err := a.action(apidefaults.Namespace, types.KindAccessRequest, types.VerbCreate); err != nil {
+	if err := a.action(types.KindAccessRequest, types.VerbCreate); err != nil {
+		// An exception is made to allow users to create *pending* access requests
+		// for themselves unless the create verb was explicitly denied.
+		if services.IsAccessExplicitlyDenied(err) || !req.GetState().IsPending() || a.currentUserAction(req.GetUser()) != nil {
+			return nil, trace.Wrap(err)
+		}
+	}
+
+	if !req.GetState().IsPending() {
+		if authz.IsCurrentUser(a.context, req.GetUser()) {
+			return nil, trace.AccessDenied("cannot create access request for self in non-pending state")
+		}
+
+		if len(a.context.Identity.GetIdentity().ActiveRequests) != 0 {
+			return nil, trace.AccessDenied("cannot create access requests in non-pending state while using an access request")
+		}
+
+		a.authServer.logger.WarnContext(ctx, "Use of resource-level access request 'create' permission by user to create non-pending access request for user. Creation of non-pending requests will be deprecated in future version of teleport. Consider migrating to a workflow with a separate approval step.",
+			"user", a.context.User.GetName(),
+			"request_user", req.GetUser(),
+		)
+	}
+
+	if !authz.IsCurrentUser(a.context, req.GetUser()) {
+		// If this request was authorized by allow rules and not ownership, require MFA.
+		if err := a.context.AuthorizeAdminAction(); err != nil {
 			return nil, trace.Wrap(err)
 		}
 	}
 
 	// ensure request ID is set server-side
-	req.SetName(uuid.NewString())
+	req.SetName(uuid.Must(uuid.NewV7()).String())
 
 	resp, err := a.authServer.CreateAccessRequestV2(ctx, req, a.context.Identity.GetIdentity())
 	return resp, trace.Wrap(err)
 }
 
 func (a *ServerWithRoles) SetAccessRequestState(ctx context.Context, params types.AccessRequestUpdate) error {
-	if err := a.action(apidefaults.Namespace, types.KindAccessRequest, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindAccessRequest, types.VerbUpdate); err != nil {
 		return trace.Wrap(err)
 	}
+
+	if len(a.context.Identity.GetIdentity().ActiveRequests) != 0 {
+		return trace.AccessDenied("cannot directly update the state of an access request while using an access request")
+	}
+
+	if err := a.context.AuthorizeAdminAction(); err != nil {
+		return trace.Wrap(err)
+	}
+
+	if params.State.IsPromoted() {
+		return trace.BadParameter("state promoted can be only set when promoting to access list")
+	}
+
+	// load the request to verify additional access-control limits
+	reqs, err := a.GetAccessRequests(ctx, types.AccessRequestFilter{
+		ID: params.RequestID,
+	})
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	if len(reqs) < 1 {
+		return trace.NotFound("cannot set state of access request %q (not found)", params.RequestID)
+	}
+
+	if authz.IsCurrentUser(a.context, reqs[0].GetUser()) {
+		return trace.AccessDenied("directly updating the state of your own access requests is not permitted")
+	}
+
 	return a.authServer.SetAccessRequestState(ctx, params)
 }
 
-func (a *ServerWithRoles) SubmitAccessReview(ctx context.Context, params types.AccessReviewSubmission) (types.AccessRequest, error) {
-	// review author defaults to username of caller.
-	if params.Review.Author == "" {
-		params.Review.Author = a.context.User.GetName()
-	}
-
-	// review author must match calling user, except in the case of the builtin admin role.  we make this
+// AuthorizeAccessReviewRequest checks if the current user is allowed to submit the given access review request.
+func AuthorizeAccessReviewRequest(context authz.Context, params types.AccessReviewSubmission) error {
+	// review author must match calling user, except in the case of the builtin admin role. we make this
 	// exception in order to allow for convenient testing with local tctl connections.
-	if !a.hasBuiltinRole(types.RoleAdmin) {
-		if params.Review.Author != a.context.User.GetName() {
-			return nil, trace.AccessDenied("user %q cannot submit reviews on behalf of %q", a.context.User.GetName(), params.Review.Author)
+	if !authz.HasBuiltinRole(context, string(types.RoleAdmin)) {
+		if params.Review.Author != context.User.GetName() {
+			return trace.AccessDenied("user %q cannot submit reviews on behalf of %q", context.User.GetName(), params.Review.Author)
 		}
 
 		// MaybeCanReviewRequests returns false positives, but it will tell us
 		// if the user definitely can't review requests, which saves a lot of work.
-		if !a.context.Checker.MaybeCanReviewRequests() {
-			return nil, trace.AccessDenied("user %q cannot submit reviews", a.context.User.GetName())
+		if !context.Checker.MaybeCanReviewRequests() {
+			return trace.AccessDenied("user %q cannot submit reviews", context.User.GetName())
 		}
+	}
+
+	return nil
+}
+
+func (a *ServerWithRoles) SubmitAccessReview(ctx context.Context, submission types.AccessReviewSubmission) (types.AccessRequest, error) {
+	// Prevent users from submitting access reviews with the "promoted" state.
+	// Promotion is only allowed by SubmitAccessReviewAllowPromotion API in the Enterprise module.
+	if submission.Review.ProposedState.IsPromoted() {
+		return nil, trace.BadParameter("state promoted can be only set when promoting to access list")
+	}
+
+	// review author defaults to username of caller.
+	if submission.Review.Author == "" {
+		submission.Review.Author = a.context.User.GetName()
+	}
+
+	// Check if the current user is allowed to submit the given access review request.
+	if err := AuthorizeAccessReviewRequest(a.context, submission); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	if err := a.context.AuthorizeAdminAction(); err != nil {
+		return nil, trace.Wrap(err)
 	}
 
 	// note that we haven't actually enforced any access-control other than requiring
 	// the author field to match the calling user.  fine-grained permissions are evaluated
 	// under optimistic locking at the level of the backend service.  the correctness of the
-	// author field is all that need be enforced at this level.
+	// author field is all that needs to be enforced at this level.
 
-	return a.authServer.SubmitAccessReview(ctx, params)
+	identity := a.context.Identity.GetIdentity()
+	return a.authServer.submitAccessReview(ctx, submission, &identity)
 }
 
 func (a *ServerWithRoles) GetAccessCapabilities(ctx context.Context, req types.AccessCapabilitiesRequest) (*types.AccessCapabilities, error) {
@@ -2694,10 +2869,10 @@ func (a *ServerWithRoles) GetAccessCapabilities(ctx context.Context, req types.A
 
 	// all users can check their own capabilities
 	if a.currentUserAction(req.User) != nil {
-		if err := a.action(apidefaults.Namespace, types.KindUser, types.VerbRead); err != nil {
+		if err := a.action(types.KindUser, types.VerbRead); err != nil {
 			return nil, trace.Wrap(err)
 		}
-		if err := a.action(apidefaults.Namespace, types.KindRole, types.VerbList, types.VerbRead); err != nil {
+		if err := a.action(types.KindRole, types.VerbList, types.VerbRead); err != nil {
 			return nil, trace.Wrap(err)
 		}
 	}
@@ -2708,16 +2883,16 @@ func (a *ServerWithRoles) GetAccessCapabilities(ctx context.Context, req types.A
 // GetPluginData loads all plugin data matching the supplied filter.
 func (a *ServerWithRoles) GetPluginData(ctx context.Context, filter types.PluginDataFilter) ([]types.PluginData, error) {
 	switch filter.Kind {
-	case types.KindAccessRequest:
-		// for backwards compatibility, we allow list/read against access requests to also grant list/read for
+	case types.KindAccessRequest, types.KindAccessList:
+		// for backwards compatibility, we allow list/read against kinds to also grant list/read for
 		// access request related plugin data.
-		if a.withOptions(quietAction(true)).action(apidefaults.Namespace, types.KindAccessRequest, types.VerbList) != nil {
-			if err := a.action(apidefaults.Namespace, types.KindAccessPluginData, types.VerbList); err != nil {
+		if a.action(filter.Kind, types.VerbList) != nil {
+			if err := a.action(types.KindAccessPluginData, types.VerbList); err != nil {
 				return nil, trace.Wrap(err)
 			}
 		}
-		if a.withOptions(quietAction(true)).action(apidefaults.Namespace, types.KindAccessRequest, types.VerbRead) != nil {
-			if err := a.action(apidefaults.Namespace, types.KindAccessPluginData, types.VerbRead); err != nil {
+		if a.action(filter.Kind, types.VerbRead) != nil {
+			if err := a.action(types.KindAccessPluginData, types.VerbRead); err != nil {
 				return nil, trace.Wrap(err)
 			}
 		}
@@ -2730,11 +2905,11 @@ func (a *ServerWithRoles) GetPluginData(ctx context.Context, filter types.Plugin
 // UpdatePluginData updates a per-resource PluginData entry.
 func (a *ServerWithRoles) UpdatePluginData(ctx context.Context, params types.PluginDataUpdateParams) error {
 	switch params.Kind {
-	case types.KindAccessRequest:
+	case types.KindAccessRequest, types.KindAccessList:
 		// for backwards compatibility, we allow update against access requests to also grant update for
 		// access request related plugin data.
-		if a.withOptions(quietAction(true)).action(apidefaults.Namespace, types.KindAccessRequest, types.VerbUpdate) != nil {
-			if err := a.action(apidefaults.Namespace, types.KindAccessPluginData, types.VerbUpdate); err != nil {
+		if a.action(params.Kind, types.VerbUpdate) != nil {
+			if err := a.action(types.KindAccessPluginData, types.VerbUpdate); err != nil {
 				return trace.Wrap(err)
 			}
 		}
@@ -2753,95 +2928,15 @@ func (a *ServerWithRoles) Ping(ctx context.Context) (proto.PingResponse, error) 
 }
 
 func (a *ServerWithRoles) DeleteAccessRequest(ctx context.Context, name string) error {
-	if err := a.action(apidefaults.Namespace, types.KindAccessRequest, types.VerbDelete); err != nil {
+	if err := a.action(types.KindAccessRequest, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
+
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return trace.Wrap(err)
+	}
+
 	return a.authServer.DeleteAccessRequest(ctx, name)
-}
-
-func (a *ServerWithRoles) GetUsers(withSecrets bool) ([]types.User, error) {
-	if withSecrets {
-		// TODO(fspmarshall): replace admin requirement with VerbReadWithSecrets once we've
-		// migrated to that model.
-		if !a.hasBuiltinRole(types.RoleAdmin) {
-			err := trace.AccessDenied("user %q requested access to all users with secrets", a.context.User.GetName())
-			log.Warning(err)
-			if err := a.authServer.emitter.EmitAuditEvent(a.authServer.closeCtx, &apievents.UserLogin{
-				Metadata: apievents.Metadata{
-					Type: events.UserLoginEvent,
-					Code: events.UserLocalLoginFailureCode,
-				},
-				Method: events.LoginMethodClientCert,
-				Status: apievents.Status{
-					Success:     false,
-					Error:       trace.Unwrap(err).Error(),
-					UserMessage: err.Error(),
-				},
-			}); err != nil {
-				log.WithError(err).Warn("Failed to emit local login failure event.")
-			}
-			return nil, trace.AccessDenied("this request can be only executed by an admin")
-		}
-	} else {
-		if err := a.action(apidefaults.Namespace, types.KindUser, types.VerbList, types.VerbRead); err != nil {
-			return nil, trace.Wrap(err)
-		}
-	}
-	return a.authServer.GetUsers(withSecrets)
-}
-
-func (a *ServerWithRoles) GetUser(name string, withSecrets bool) (types.User, error) {
-	if withSecrets {
-		// TODO(fspmarshall): replace admin requirement with VerbReadWithSecrets once we've
-		// migrated to that model.
-		if !a.hasBuiltinRole(types.RoleAdmin) {
-			err := trace.AccessDenied("user %q requested access to user %q with secrets", a.context.User.GetName(), name)
-			log.Warning(err)
-			if err := a.authServer.emitter.EmitAuditEvent(a.authServer.closeCtx, &apievents.UserLogin{
-				Metadata: apievents.Metadata{
-					Type: events.UserLoginEvent,
-					Code: events.UserLocalLoginFailureCode,
-				},
-				Method: events.LoginMethodClientCert,
-				Status: apievents.Status{
-					Success:     false,
-					Error:       trace.Unwrap(err).Error(),
-					UserMessage: err.Error(),
-				},
-			}); err != nil {
-				log.WithError(err).Warn("Failed to emit local login failure event.")
-			}
-			return nil, trace.AccessDenied("this request can be only executed by an admin")
-		}
-	} else {
-		// if secrets are not being accessed, let users always read
-		// their own info.
-		if err := a.currentUserAction(name); err != nil {
-			// not current user, perform normal permission check.
-			if err := a.action(apidefaults.Namespace, types.KindUser, types.VerbRead); err != nil {
-				return nil, trace.Wrap(err)
-			}
-		}
-	}
-	return a.authServer.GetUser(name, withSecrets)
-}
-
-// GetCurrentUser returns current user as seen by the server.
-// Useful especially in the context of remote clusters which perform role and trait mapping.
-func (a *ServerWithRoles) GetCurrentUser(ctx context.Context) (types.User, error) {
-	// check access to roles
-	for _, role := range a.context.User.GetRoles() {
-		_, err := a.GetRole(ctx, role)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-	}
-
-	usrRes := a.context.User.WithoutSecrets()
-	if usr, ok := usrRes.(types.User); ok {
-		return usr, nil
-	}
-	return nil, trace.BadParameter("expected types.User when fetching current user information, got %T", usrRes)
 }
 
 // GetCurrentUserRoles returns current user's roles.
@@ -2858,48 +2953,6 @@ func (a *ServerWithRoles) GetCurrentUserRoles(ctx context.Context) ([]types.Role
 	return roles, nil
 }
 
-// DeleteUser deletes an existng user in a backend by username.
-func (a *ServerWithRoles) DeleteUser(ctx context.Context, user string) error {
-	if err := a.action(apidefaults.Namespace, types.KindUser, types.VerbDelete); err != nil {
-		return trace.Wrap(err)
-	}
-
-	return a.authServer.DeleteUser(ctx, user)
-}
-
-func (a *ServerWithRoles) GenerateHostCert(
-	ctx context.Context, key []byte, hostID, nodeName string, principals []string, clusterName string, role types.SystemRole, ttl time.Duration,
-) ([]byte, error) {
-	serviceContext := services.Context{
-		User: a.context.User,
-		HostCert: &services.HostCertContext{
-			HostID:      hostID,
-			NodeName:    nodeName,
-			Principals:  principals,
-			ClusterName: clusterName,
-			Role:        role,
-			TTL:         ttl,
-		},
-	}
-
-	// Instead of the usual RBAC checks, we'll manually call CheckAccessToRule
-	// here as we'll be evaluating `where` predicates with a custom RuleContext
-	// to expose cert request fields.
-	// We've only got a single verb to check so luckily it's pretty concise.
-	if err := a.withOptions().context.Checker.CheckAccessToRule(
-		&serviceContext, apidefaults.Namespace, types.KindHostCert, types.VerbCreate, false,
-	); err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	return a.authServer.GenerateHostCert(ctx, key, hostID, nodeName, principals, clusterName, role, ttl)
-}
-
-// NewKeepAliver not implemented: can only be called locally.
-func (a *ServerWithRoles) NewKeepAliver(ctx context.Context) (types.KeepAliver, error) {
-	return nil, trace.NotImplemented(notImplementedMessage)
-}
-
 // desiredAccessInfo inspects the current request to determine which access
 // information (roles, traits, and allowed resource IDs) the requesting user
 // wants to be present on the resulting certificate. This does not attempt to
@@ -2909,22 +2962,25 @@ func (a *ServerWithRoles) NewKeepAliver(ctx context.Context) (types.KeepAliver, 
 func (a *ServerWithRoles) desiredAccessInfo(ctx context.Context, req *proto.UserCertsRequest, user types.User) (*services.AccessInfo, error) {
 	if req.Username != a.context.User.GetName() {
 		if isRoleImpersonation(*req) {
-			err := trace.AccessDenied("User %v tried to issue a cert for %v and added role requests. This is not supported.", a.context.User.GetName(), req.Username)
-			log.WithError(err).Warn()
-			return nil, err
+			a.authServer.logger.WarnContext(ctx, "User tried to issue a cert for another user while adding role requests",
+				"user", a.context.User.GetName(),
+				"requested_user", req.Username,
+			)
+			return nil, trace.AccessDenied("User %v tried to issue a cert for %v and added role requests. This is not supported.", a.context.User.GetName(), req.Username)
 		}
 		if len(req.AccessRequests) > 0 {
-			err := trace.AccessDenied("User %v tried to issue a cert for %v and added access requests. This is not supported.", a.context.User.GetName(), req.Username)
-			log.WithError(err).Warn()
-			return nil, err
+			a.authServer.logger.WarnContext(ctx, "User tried to issue a cert for another user while adding access requests",
+				"user", a.context.User.GetName(),
+				"requested_user", req.Username,
+			)
+			return nil, trace.AccessDenied("User %v tried to issue a cert for %v and added access requests. This is not supported.", a.context.User.GetName(), req.Username)
 		}
-		return a.desiredAccessInfoForImpersonation(req, user)
+		return a.desiredAccessInfoForImpersonation(user)
 	}
 	if isRoleImpersonation(*req) {
 		if len(req.AccessRequests) > 0 {
-			err := trace.AccessDenied("User %v tried to issue a cert with both role and access requests. This is not supported.", a.context.User.GetName())
-			log.WithError(err).Warn()
-			return nil, err
+			a.authServer.logger.WarnContext(ctx, "User tried to issue a cert with both role and access requests", "user", a.context.User.GetName())
+			return nil, trace.AccessDenied("User %v tried to issue a cert with both role and access requests. This is not supported.", a.context.User.GetName())
 		}
 		return a.desiredAccessInfoForRoleRequest(req, user.GetTraits())
 	}
@@ -2933,7 +2989,7 @@ func (a *ServerWithRoles) desiredAccessInfo(ctx context.Context, req *proto.User
 
 // desiredAccessInfoForImpersonation returns the desired AccessInfo for an
 // impersonation request.
-func (a *ServerWithRoles) desiredAccessInfoForImpersonation(req *proto.UserCertsRequest, user types.User) (*services.AccessInfo, error) {
+func (a *ServerWithRoles) desiredAccessInfoForImpersonation(user types.User) (*services.AccessInfo, error) {
 	return &services.AccessInfo{
 		Roles:  user.GetRoles(),
 		Traits: user.GetTraits(),
@@ -2971,7 +3027,7 @@ func (a *ServerWithRoles) desiredAccessInfoForUser(ctx context.Context, req *pro
 	// considering new or dropped access requests. This will include roles from
 	// currently assumed role access requests, and allowed resources from
 	// currently assumed resource access requests.
-	accessInfo, err := services.AccessInfoFromLocalIdentity(currentIdentity, a)
+	accessInfo, err := services.AccessInfoFromLocalIdentity(currentIdentity, a.authServer)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -3061,24 +3117,35 @@ func isRoleImpersonation(req proto.UserCertsRequest) bool {
 	return req.UseRoleRequests || len(req.RoleRequests) > 0
 }
 
+// getBotName returns the name of the bot embedded in the user metadata, if any.
+// For non-bot users, returns "".
+func getBotName(user types.User) string {
+	name, ok := user.GetLabel(types.BotLabel)
+	if ok {
+		return name
+	}
+
+	return ""
+}
+
 func (a *ServerWithRoles) generateUserCerts(ctx context.Context, req proto.UserCertsRequest, opts ...certRequestOption) (*proto.Certs, error) {
 	// Device trust: authorize device before issuing certificates.
-	authPref, err := a.authServer.GetAuthPreference(ctx)
+	readOnlyAuthPref, err := a.authServer.GetReadOnlyAuthPreference(ctx)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	if err := a.verifyUserDeviceForCertIssuance(req.Usage, authPref.GetDeviceTrust()); err != nil {
+	if err := a.verifyUserDeviceForCertIssuance(ctx, req.Usage, readOnlyAuthPref.GetDeviceTrust()); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	var verifiedMFADeviceID string
 	if req.MFAResponse != nil {
-		dev, _, err := a.authServer.validateMFAAuthResponse(
-			ctx, req.GetMFAResponse(), req.Username, false /* passwordless */)
+		requiredExt := &mfav1.ChallengeExtensions{Scope: mfav1.ChallengeScope_CHALLENGE_SCOPE_USER_SESSION}
+		mfaData, err := a.authServer.ValidateMFAAuthResponse(ctx, req.GetMFAResponse(), req.Username, requiredExt)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
-		verifiedMFADeviceID = dev.Id
+		verifiedMFADeviceID = mfaData.Device.Id
 	}
 
 	// this prevents clients who have no chance at getting a cert and impersonating anyone
@@ -3126,15 +3193,21 @@ func (a *ServerWithRoles) generateUserCerts(ctx context.Context, req proto.UserC
 	// This call bypasses RBAC check for users read on purpose.
 	// Users who are allowed to impersonate other users might not have
 	// permissions to read user data.
-	user, err := a.authServer.GetUser(req.Username, false)
+	user, err := a.authServer.GetUser(ctx, req.Username, false)
 	if err != nil {
-		log.WithError(err).Debugf("Could not impersonate user %v. The user could not be fetched from local store.", req.Username)
+		a.authServer.logger.DebugContext(ctx, "Could not impersonate user, the user could not be fetched from local store",
+			"error", err,
+			"user", req.Username,
+		)
 		return nil, trace.AccessDenied("access denied")
 	}
 
 	// Do not allow SSO users to be impersonated.
 	if req.Username != a.context.User.GetName() && user.GetUserType() == types.UserTypeSSO {
-		log.Warningf("User %v tried to issue a cert for externally managed user %v, this is not supported.", a.context.User.GetName(), req.Username)
+		a.authServer.logger.WarnContext(ctx, "User tried to issue a cert for externally managed user",
+			"user", a.context.User.GetName(),
+			"external_user", req.Username,
+		)
 		return nil, trace.AccessDenied("access denied")
 	}
 
@@ -3144,26 +3217,53 @@ func (a *ServerWithRoles) generateUserCerts(ctx context.Context, req proto.UserC
 		identity := a.context.Identity.GetIdentity()
 		sessionExpires := identity.Expires
 		if sessionExpires.IsZero() {
-			log.Warningf("Encountered identity with no expiry: %v and denied request. Must be internal logic error.", a.context.Identity)
+			a.authServer.logger.WarnContext(ctx, "Denied cert issuance for identity with no expiry",
+				"identity", identity.Username,
+			)
 			return nil, trace.AccessDenied("access denied")
 		}
 		if req.Expires.Before(a.authServer.GetClock().Now()) {
-			return nil, trace.AccessDenied("access denied: client credentials have expired, please relogin.")
+			return nil, trace.Wrap(client.ErrClientCredentialsHaveExpired)
 		}
 
 		if identity.Renewable || isRoleImpersonation(req) {
 			// Bot self-renewal or role impersonation can request certs with an
 			// expiry up to the global maximum allowed value.
-			if max := a.authServer.GetClock().Now().Add(defaults.MaxRenewableCertTTL); req.Expires.After(max) {
-				req.Expires = max
+			if maxTime := a.authServer.GetClock().Now().Add(defaults.MaxRenewableCertTTL); req.Expires.After(maxTime) {
+				req.Expires = maxTime
 			}
-		} else {
+		} else if isLocalProxyCertReq(&req) {
+			// If requested certificate is for headless Kubernetes access of local proxy it is limited by max session ttl
+			// or mfa_verification_interval or req.Expires.
+
+			// Calculate the expiration time.
+			roleSet, err := services.FetchRoles(user.GetRoles(), a, user.GetTraits())
+			if err != nil {
+				return nil, trace.Wrap(err)
+			}
+			// [roleSet.AdjustMFAVerificationInterval] will reduce the adjusted sessionTTL if any of the roles requires
+			// MFA tap and `mfa_verification_interval` is set and lower than [roleSet.AdjustSessionTTL].
+			sessionTTL := roleSet.AdjustMFAVerificationInterval(
+				roleSet.AdjustSessionTTL(readOnlyAuthPref.GetDefaultSessionTTL().Duration()),
+				readOnlyAuthPref.GetRequireMFAType().IsSessionMFARequired())
+			adjustedSessionExpires := a.authServer.GetClock().Now().UTC().Add(sessionTTL)
+			if req.Expires.After(adjustedSessionExpires) {
+				req.Expires = adjustedSessionExpires
+			}
+		} else if req.Expires.After(sessionExpires) {
 			// Standard user impersonation has an expiry limited to the expiry
 			// of the current session. This prevents a user renewing their
 			// own certificates indefinitely to avoid re-authenticating.
-			if req.Expires.After(sessionExpires) {
-				req.Expires = sessionExpires
-			}
+			req.Expires = sessionExpires
+		}
+	}
+
+	// If the user is not a user cert renewal (impersonation, etc.), this is an
+	// admin action and requires MFA.
+	if req.Username != a.context.User.GetName() {
+		// Admin action MFA is not used to create mfa verified certs.
+		if err := a.context.AuthorizeAdminAction(); err != nil {
+			return nil, trace.Wrap(err)
 		}
 	}
 
@@ -3207,7 +3307,10 @@ func (a *ServerWithRoles) generateUserCerts(ctx context.Context, req proto.UserC
 			// certificates with alternate RoleRequests.
 			err = a.context.Checker.CheckImpersonateRoles(a.context.User, parsedRoles)
 			if err != nil {
-				log.Warning(err)
+				a.authServer.logger.WarnContext(ctx, "user request for role impersonation denied",
+					"user", a.context.User.GetName(),
+					"error", err,
+				)
 				err := trace.AccessDenied("user %q has requested role impersonation for %q", a.context.User.GetName(), accessInfo.Roles)
 				if err := a.authServer.emitter.EmitAuditEvent(a.CloseContext(), &apievents.UserLogin{
 					Metadata: apievents.Metadata{
@@ -3221,7 +3324,7 @@ func (a *ServerWithRoles) generateUserCerts(ctx context.Context, req proto.UserC
 						UserMessage: err.Error(),
 					},
 				}); err != nil {
-					log.WithError(err).Warn("Failed to emit local login failure event.")
+					a.authServer.logger.WarnContext(ctx, "Failed to emit local login failure event", "error", err)
 				}
 				return nil, trace.Wrap(err)
 			}
@@ -3234,7 +3337,10 @@ func (a *ServerWithRoles) generateUserCerts(ctx context.Context, req proto.UserC
 		ttl = checker.AdjustSessionTTL(ttl)
 		req.Expires = a.authServer.GetClock().Now().Add(ttl)
 		if err != nil {
-			log.Warning(err)
+			a.authServer.logger.WarnContext(ctx, "user request for user impersonation denied",
+				"user", a.context.User.GetName(),
+				"error", err,
+			)
 			err := trace.AccessDenied("user %q has requested to generate certs for %q.", a.context.User.GetName(), accessInfo.Roles)
 			if err := a.authServer.emitter.EmitAuditEvent(a.CloseContext(), &apievents.UserLogin{
 				Metadata: apievents.Metadata{
@@ -3248,35 +3354,90 @@ func (a *ServerWithRoles) generateUserCerts(ctx context.Context, req proto.UserC
 					UserMessage: err.Error(),
 				},
 			}); err != nil {
-				log.WithError(err).Warn("Failed to emit local login failure event.")
+				a.authServer.logger.WarnContext(ctx, "Failed to emit local login failure event", "error", err)
 			}
 			return nil, trace.Wrap(err)
 		}
 	}
 
+	var appSessionID string
+	if req.RouteToApp.Name != "" {
+		// Create a new app session using the same cert request. The user certs
+		// generated below will be linked to this session by the session ID.
+		ws, err := a.authServer.CreateAppSessionFromReq(ctx, NewAppSessionRequest{
+			NewWebSessionRequest: NewWebSessionRequest{
+				User:           req.Username,
+				LoginIP:        a.context.Identity.GetIdentity().LoginIP,
+				SessionTTL:     req.Expires.Sub(a.authServer.GetClock().Now()),
+				Traits:         accessInfo.Traits,
+				Roles:          accessInfo.Roles,
+				AccessRequests: req.AccessRequests,
+				// App sessions created through generateUserCerts are securely contained
+				// to the Proxy and Auth roles, and thus should pass hardware key requirements
+				// through the "web_session" attestation. User's will be required to provide
+				// MFA instead.
+				AttestWebSession: true,
+			},
+			PublicAddr:        req.RouteToApp.PublicAddr,
+			ClusterName:       req.RouteToApp.ClusterName,
+			AWSRoleARN:        req.RouteToApp.AWSRoleARN,
+			AzureIdentity:     req.RouteToApp.AzureIdentity,
+			GCPServiceAccount: req.RouteToApp.GCPServiceAccount,
+			MFAVerified:       verifiedMFADeviceID,
+			DeviceExtensions:  DeviceExtensions(a.context.Identity.GetIdentity().DeviceExtensions),
+			AppName:           req.RouteToApp.Name,
+			AppURI:            req.RouteToApp.URI,
+			AppTargetPort:     int(req.RouteToApp.TargetPort),
+		})
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		appSessionID = ws.GetName()
+	}
+
+	sshPublicKey, tlsPublicKey, err := authclient.UserPublicKeys(
+		req.PublicKey, //nolint:staticcheck // SA1019. Checking deprecated field that may be sent by older clients.
+		req.SSHPublicKey,
+		req.TLSPublicKey,
+	)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	sshAttestationStatement, tlsAttestationStatement := authclient.UserAttestationStatements(
+		keys.AttestationStatementFromProto(req.AttestationStatement), //nolint:staticcheck // SA1019. Checking deprecated field that may be sent by older clients.
+		keys.AttestationStatementFromProto(req.SSHPublicKeyAttestationStatement),
+		keys.AttestationStatementFromProto(req.TLSPublicKeyAttestationStatement),
+	)
+
 	// Generate certificate, note that the roles TTL will be ignored because
 	// the request is coming from "tctl auth sign" itself.
 	certReq := certRequest{
-		mfaVerified:       verifiedMFADeviceID,
-		user:              user,
-		ttl:               req.Expires.Sub(a.authServer.GetClock().Now()),
-		compatibility:     req.Format,
-		publicKey:         req.PublicKey,
-		overrideRoleTTL:   a.hasBuiltinRole(types.RoleAdmin),
-		routeToCluster:    req.RouteToCluster,
-		kubernetesCluster: req.KubernetesCluster,
-		dbService:         req.RouteToDatabase.ServiceName,
-		dbProtocol:        req.RouteToDatabase.Protocol,
-		dbUser:            req.RouteToDatabase.Username,
-		dbName:            req.RouteToDatabase.Database,
-		appName:           req.RouteToApp.Name,
-		appSessionID:      req.RouteToApp.SessionID,
-		appPublicAddr:     req.RouteToApp.PublicAddr,
-		appClusterName:    req.RouteToApp.ClusterName,
-		awsRoleARN:        req.RouteToApp.AWSRoleARN,
-		azureIdentity:     req.RouteToApp.AzureIdentity,
-		gcpServiceAccount: req.RouteToApp.GCPServiceAccount,
-		checker:           checker,
+		mfaVerified:                      verifiedMFADeviceID,
+		user:                             user,
+		ttl:                              req.Expires.Sub(a.authServer.GetClock().Now()),
+		compatibility:                    req.Format,
+		sshPublicKey:                     sshPublicKey,
+		tlsPublicKey:                     tlsPublicKey,
+		sshPublicKeyAttestationStatement: sshAttestationStatement,
+		tlsPublicKeyAttestationStatement: tlsAttestationStatement,
+		overrideRoleTTL:                  a.hasBuiltinRole(types.RoleAdmin),
+		routeToCluster:                   req.RouteToCluster,
+		kubernetesCluster:                req.KubernetesCluster,
+		dbService:                        req.RouteToDatabase.ServiceName,
+		dbProtocol:                       req.RouteToDatabase.Protocol,
+		dbUser:                           req.RouteToDatabase.Username,
+		dbName:                           req.RouteToDatabase.Database,
+		dbRoles:                          req.RouteToDatabase.Roles,
+		appSessionID:                     appSessionID,
+		appName:                          req.RouteToApp.Name,
+		appPublicAddr:                    req.RouteToApp.PublicAddr,
+		appURI:                           req.RouteToApp.URI,
+		appTargetPort:                    int(req.RouteToApp.TargetPort),
+		appClusterName:                   req.RouteToApp.ClusterName,
+		awsRoleARN:                       req.RouteToApp.AWSRoleARN,
+		azureIdentity:                    req.RouteToApp.AzureIdentity,
+		gcpServiceAccount:                req.RouteToApp.GCPServiceAccount,
+		checker:                          checker,
 		// Copy IP from current identity to the generated certificate, if present,
 		// to avoid generateUserCerts() being used to drop IP pinning in the new certificates.
 		loginIP: a.context.Identity.GetIdentity().LoginIP,
@@ -3285,8 +3446,18 @@ func (a *ServerWithRoles) generateUserCerts(ctx context.Context, req proto.UserC
 			AccessRequests: req.AccessRequests,
 		},
 		connectionDiagnosticID: req.ConnectionDiagnosticID,
-		attestationStatement:   keys.AttestationStatementFromProto(req.AttestationStatement),
+		botName:                getBotName(user),
+
+		// Always pass through a bot instance ID if available. Legacy bots
+		// joining without an instance ID may have one generated when
+		// `updateBotInstance()` is called below, and this (empty) value will be
+		// overridden.
+		botInstanceID: a.context.Identity.GetIdentity().BotInstanceID,
+		// Propagate any join attributes from the current identity to the new
+		// identity.
+		joinAttributes: a.context.Identity.GetIdentity().JoinAttributes,
 	}
+
 	if user.GetName() != a.context.User.GetName() {
 		certReq.impersonator = a.context.User.GetName()
 	} else if isRoleImpersonation(req) {
@@ -3332,15 +3503,29 @@ func (a *ServerWithRoles) generateUserCerts(ctx context.Context, req proto.UserC
 		certReq.renewable = true
 	}
 
-	// If the cert is renewable, process any certificate generation counter.
+	// If the cert is renewable, process any bot instance updates (generation
+	// counter, auth records, etc). `updateBotInstance()` may modify certain
+	// `certReq` attributes (generation, botInstanceID).
 	if certReq.renewable {
 		currentIdentityGeneration := a.context.Identity.GetIdentity().Generation
-		if err := a.authServer.validateGenerationLabel(ctx, user.GetName(), &certReq, currentIdentityGeneration); err != nil {
+
+		// If we're handling a renewal for a bot, we want to return the
+		// Host CAs as well as the User CAs.
+		if certReq.botName != "" {
+			certReq.includeHostCA = true
+		}
+
+		// Update the bot instance based on this authentication. This may create
+		// a new bot instance record if the identity is missing an instance ID.
+		if err := a.authServer.updateBotInstance(
+			ctx, &certReq, user.GetName(), certReq.botName,
+			certReq.botInstanceID, nil, int32(currentIdentityGeneration),
+		); err != nil {
 			return nil, trace.Wrap(err)
 		}
 	}
 
-	certs, err := a.authServer.generateUserCert(certReq)
+	certs, err := a.authServer.generateUserCert(ctx, certReq)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -3362,63 +3547,30 @@ func (a *ServerWithRoles) GetAccessRequestAllowedPromotions(ctx context.Context,
 // is not paramount to the access system itself, but it stops bad attempts from
 // progressing further and provides better feedback than other protocol-specific
 // failures.
-func (a *ServerWithRoles) verifyUserDeviceForCertIssuance(usage proto.UserCertsRequest_CertUsage, dt *types.DeviceTrust) error {
+func (a *ServerWithRoles) verifyUserDeviceForCertIssuance(ctx context.Context, usage proto.UserCertsRequest_CertUsage, dt *types.DeviceTrust) error {
 	// Ignore App or WindowsDeskop requests, they do not support device trust.
 	if usage == proto.UserCertsRequest_App || usage == proto.UserCertsRequest_WindowsDesktop {
 		return nil
 	}
 
 	identity := a.context.Identity.GetIdentity()
-	return trace.Wrap(dtauthz.VerifyTLSUser(dt, identity))
+	return trace.Wrap(dtauthz.VerifyTLSUser(ctx, dt, identity))
 }
 
-// CreateBot creates a new certificate renewal bot and returns a join token.
-func (a *ServerWithRoles) CreateBot(ctx context.Context, req *proto.CreateBotRequest) (*proto.CreateBotResponse, error) {
-	// Note: this creates a role with role impersonation privileges for all
-	// roles listed in the request and doesn't attempt to verify that the
-	// current user has permissions for those embedded roles. We assume that
-	// "create role" is effectively root already and validate only that.
-	if err := a.action(apidefaults.Namespace, types.KindUser, types.VerbRead, types.VerbCreate); err != nil {
-		return nil, trace.Wrap(err)
-	}
-	if err := a.action(apidefaults.Namespace, types.KindRole, types.VerbRead, types.VerbCreate); err != nil {
-		return nil, trace.Wrap(err)
-	}
-	if err := a.action(apidefaults.Namespace, types.KindToken, types.VerbRead, types.VerbCreate); err != nil {
+func (a *ServerWithRoles) CreateResetPasswordToken(ctx context.Context, req authclient.CreateUserTokenRequest) (types.UserToken, error) {
+	if err := a.action(types.KindUser, types.VerbUpdate); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	return a.authServer.createBot(ctx, req)
-}
-
-// DeleteBot removes a certificate renewal bot by name.
-func (a *ServerWithRoles) DeleteBot(ctx context.Context, botName string) error {
-	// Requires read + delete on users and roles. We do verify the user and
-	// role are explicitly associated with a bot before doing anything (must
-	// match bot-$name and have a matching teleport.dev/bot label set).
-	if err := a.action(apidefaults.Namespace, types.KindUser, types.VerbRead, types.VerbDelete); err != nil {
-		return trace.Wrap(err)
+	if a.hasBuiltinRole(types.RoleOkta) {
+		return nil, trace.AccessDenied("access denied")
 	}
-	if err := a.action(apidefaults.Namespace, types.KindRole, types.VerbRead, types.VerbDelete); err != nil {
-		return trace.Wrap(err)
-	}
-	return a.authServer.deleteBot(ctx, botName)
-}
 
-// GetBotUsers fetches all users with bot labels. It does not fetch users with
-// secrets.
-func (a *ServerWithRoles) GetBotUsers(ctx context.Context) ([]types.User, error) {
-	if err := a.action(apidefaults.Namespace, types.KindUser, types.VerbList, types.VerbRead); err != nil {
+	// Allow reused MFA responses to allow creating a reset token after creating a user.
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	return a.authServer.getBotUsers(ctx)
-}
-
-func (a *ServerWithRoles) CreateResetPasswordToken(ctx context.Context, req CreateUserTokenRequest) (types.UserToken, error) {
-	if err := a.action(apidefaults.Namespace, types.KindUser, types.VerbUpdate); err != nil {
-		return nil, trace.Wrap(err)
-	}
 	return a.authServer.CreateResetPasswordToken(ctx, req)
 }
 
@@ -3429,55 +3581,102 @@ func (a *ServerWithRoles) GetResetPasswordToken(ctx context.Context, tokenID str
 
 // ChangeUserAuthentication is implemented by AuthService.ChangeUserAuthentication.
 func (a *ServerWithRoles) ChangeUserAuthentication(ctx context.Context, req *proto.ChangeUserAuthenticationRequest) (*proto.ChangeUserAuthenticationResponse, error) {
-	// Token is it's own authentication, no need to double check.
-	return a.authServer.ChangeUserAuthentication(ctx, req)
+	// Token is its own authentication, no need to double check.
+	resp, err := a.authServer.ChangeUserAuthentication(ctx, req)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	// We use the presence of a WebAuthn response, along with the absence of a
+	// password, as a proxy to determine that a passwordless registration took
+	// place, as it is not possible to infer that just from the WebAuthn response.
+	isPasswordless := req.NewMFARegisterResponse != nil && len(req.NewPassword) == 0
+	if isPasswordless && modules.GetModules().Features().Cloud {
+		if err := a.trySettingConnectorNameToPasswordless(ctx); err != nil {
+			a.authServer.logger.ErrorContext(ctx, "Failed to set passwordless as connector name", "error", err)
+		}
+	}
+
+	return resp, nil
 }
 
-// CreateUser inserts a new user entry in a backend.
-func (a *ServerWithRoles) CreateUser(ctx context.Context, user types.User) error {
-	if err := a.action(apidefaults.Namespace, types.KindUser, types.VerbCreate); err != nil {
+// trySettingConnectorNameToPasswordless sets cluster_auth_preference connectorName to `passwordless` when the first cloud user chooses passwordless as the authentication method.
+// This simplifies UX for cloud users, as they will not need to select a passwordless connector when logging in.
+func (a *ServerWithRoles) trySettingConnectorNameToPasswordless(ctx context.Context) error {
+	users, err := a.authServer.GetUsers(ctx, false)
+	if err != nil {
 		return trace.Wrap(err)
 	}
-	return a.authServer.CreateUser(ctx, user)
-}
 
-// UpdateUser updates an existing user in a backend.
-// Captures the auth user who modified the user record.
-func (a *ServerWithRoles) UpdateUser(ctx context.Context, user types.User) error {
-	if err := a.action(apidefaults.Namespace, types.KindUser, types.VerbUpdate); err != nil {
+	// Only set the connector name on the first user registration.
+	if !hasOneNonPresetUser(users) {
+		return nil
+	}
+
+	authPreference, err := a.authServer.GetAuthPreference(ctx)
+	if err != nil {
 		return trace.Wrap(err)
 	}
 
-	return a.authServer.UpdateUser(ctx, user)
-}
-
-func (a *ServerWithRoles) UpsertUser(u types.User) error {
-	if err := a.action(apidefaults.Namespace, types.KindUser, types.VerbCreate, types.VerbUpdate); err != nil {
-		return trace.Wrap(err)
+	// Don't overwrite an existing connector name.
+	if connector := authPreference.GetConnectorName(); connector != "" && connector != constants.LocalConnector {
+		return nil
 	}
 
-	createdBy := u.GetCreatedBy()
-	if createdBy.IsEmpty() {
-		u.SetCreatedBy(types.CreatedBy{
-			User: types.UserRef{Name: a.context.User.GetName()},
-		})
-	}
-	return a.authServer.UpsertUser(u)
+	authPreference.SetConnectorName(constants.PasswordlessConnector)
+	_, err = a.authServer.UpdateAuthPreference(ctx, authPreference)
+	return trace.Wrap(err)
 }
 
-// UpdateAndSwapUser exists on [ServerWithRoles] only for compatibility with
-// [ClientI], it is not implemented here.
-// See [local.IdentityService.UpdateAndSwapUser].
-func (a *ServerWithRoles) UpdateAndSwapUser(ctx context.Context, user string, withSecrets bool, fn func(types.User) (changed bool, err error)) (types.User, error) {
-	// To the reader: consider writing this function if it's useful to you.
-	return nil, trace.NotImplemented("func UpdateAndSwapUser is not implemented by ServerWithRoles")
+// hasOneNonPresetUser returns true only if there is exactly one non-preset user in the provided list of users.
+// This method always compare with the original preset users, and take into account that some preset users may
+// have been removed.
+func hasOneNonPresetUser(users []types.User) bool {
+	presets := getPresetUsers()
+
+	// Exit early if the number of users is greater than the number of presets + 1.
+	if len(users) > len(presets)+1 {
+		return false
+	}
+
+	// We can't simply compare the number of existing users to presets because presets may have been deleted.
+	// Hence, we need to check each user to determine if they are a preset user.
+	presetMap := make(map[string]struct{}, len(presets))
+	for _, preset := range presets {
+		presetMap[preset.GetName()] = struct{}{}
+	}
+
+	qtyNonPreset := 0
+	for _, user := range users {
+		if _, isPreset := presetMap[user.GetName()]; !isPreset {
+			qtyNonPreset++
+		}
+		if qtyNonPreset > 1 {
+			return false
+		}
+	}
+
+	return qtyNonPreset == 1
 }
 
 // CompareAndSwapUser updates an existing user in a backend, but fails if the
 // backend's value does not match the expected value.
 // Captures the auth user who modified the user record.
 func (a *ServerWithRoles) CompareAndSwapUser(ctx context.Context, new, existing types.User) error {
-	if err := a.action(apidefaults.Namespace, types.KindUser, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindUser, types.VerbUpdate); err != nil {
+		return trace.Wrap(err)
+	}
+
+	if err := okta.CheckOrigin(&a.context, new); err != nil {
+		return trace.Wrap(err)
+	}
+
+	// Checking the `existing` origin should be enough to assert that okta has
+	// write access to the user, because if the backend record says something
+	// different then the `CompareAndSwap()` will fail anyway, and this way we
+	// save ourselves a backend user lookup.
+
+	if err := okta.CheckAccess(&a.context, existing, types.VerbUpdate); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -3485,29 +3684,76 @@ func (a *ServerWithRoles) CompareAndSwapUser(ctx context.Context, new, existing 
 }
 
 // UpsertOIDCConnector creates or updates an OIDC connector.
-func (a *ServerWithRoles) UpsertOIDCConnector(ctx context.Context, connector types.OIDCConnector) error {
-	if err := a.authConnectorAction(apidefaults.Namespace, types.KindOIDC, types.VerbCreate); err != nil {
-		return trace.Wrap(err)
+func (a *ServerWithRoles) UpsertOIDCConnector(ctx context.Context, connector types.OIDCConnector) (types.OIDCConnector, error) {
+	if err := a.authConnectorAction(types.KindOIDC, types.VerbCreate); err != nil {
+		return nil, trace.Wrap(err)
 	}
-	if err := a.authConnectorAction(apidefaults.Namespace, types.KindOIDC, types.VerbUpdate); err != nil {
-		return trace.Wrap(err)
+	if err := a.authConnectorAction(types.KindOIDC, types.VerbUpdate); err != nil {
+		return nil, trace.Wrap(err)
 	}
-	if !modules.GetModules().Features().OIDC {
+	if !modules.GetModules().Features().GetEntitlement(entitlements.OIDC).Enabled {
 		// TODO(zmb3): ideally we would wrap ErrRequiresEnterprise here, but
 		// we can't currently propagate wrapped errors across the gRPC boundary,
 		// and we want tctl to display a clean user-facing message in this case
-		return trace.AccessDenied("OIDC is only available in Teleport Enterprise")
+		return nil, trace.AccessDenied("OIDC is only available in Teleport Enterprise")
 	}
 
-	return a.authServer.UpsertOIDCConnector(ctx, connector)
+	// Support reused MFA for bulk tctl create requests.
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	upserted, err := a.authServer.UpsertOIDCConnector(ctx, connector)
+	return upserted, trace.Wrap(err)
+}
+
+// UpdateOIDCConnector updates an existing OIDC connector.
+func (a *ServerWithRoles) UpdateOIDCConnector(ctx context.Context, connector types.OIDCConnector) (types.OIDCConnector, error) {
+	if err := a.authConnectorAction(types.KindOIDC, types.VerbUpdate); err != nil {
+		return nil, trace.Wrap(err)
+	}
+	if !modules.GetModules().Features().GetEntitlement(entitlements.OIDC).Enabled {
+		// TODO(zmb3): ideally we would wrap ErrRequiresEnterprise here, but
+		// we can't currently propagate wrapped errors across the gRPC boundary,
+		// and we want tctl to display a clean user-facing message in this case
+		return nil, trace.AccessDenied("OIDC is only available in Teleport Enterprise")
+	}
+
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	updated, err := a.authServer.UpdateOIDCConnector(ctx, connector)
+	return updated, trace.Wrap(err)
+}
+
+// CreateOIDCConnector creates a new OIDC connector.
+func (a *ServerWithRoles) CreateOIDCConnector(ctx context.Context, connector types.OIDCConnector) (types.OIDCConnector, error) {
+	if err := a.authConnectorAction(types.KindOIDC, types.VerbCreate); err != nil {
+		return nil, trace.Wrap(err)
+	}
+	if !modules.GetModules().Features().GetEntitlement(entitlements.OIDC).Enabled {
+		// TODO(zmb3): ideally we would wrap ErrRequiresEnterprise here, but
+		// we can't currently propagate wrapped errors across the gRPC boundary,
+		// and we want tctl to display a clean user-facing message in this case
+		return nil, trace.AccessDenied("OIDC is only available in Teleport Enterprise")
+	}
+
+	// Support reused MFA for bulk tctl create requests.
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	creted, err := a.authServer.CreateOIDCConnector(ctx, connector)
+	return creted, trace.Wrap(err)
 }
 
 func (a *ServerWithRoles) GetOIDCConnector(ctx context.Context, id string, withSecrets bool) (types.OIDCConnector, error) {
-	if err := a.authConnectorAction(apidefaults.Namespace, types.KindOIDC, types.VerbReadNoSecrets); err != nil {
+	if err := a.authConnectorAction(types.KindOIDC, types.VerbReadNoSecrets); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	if withSecrets {
-		if err := a.authConnectorAction(apidefaults.Namespace, types.KindOIDC, types.VerbRead); err != nil {
+		if err := a.authConnectorAction(types.KindOIDC, types.VerbRead); err != nil {
 			return nil, trace.Wrap(err)
 		}
 	}
@@ -3515,14 +3761,14 @@ func (a *ServerWithRoles) GetOIDCConnector(ctx context.Context, id string, withS
 }
 
 func (a *ServerWithRoles) GetOIDCConnectors(ctx context.Context, withSecrets bool) ([]types.OIDCConnector, error) {
-	if err := a.authConnectorAction(apidefaults.Namespace, types.KindOIDC, types.VerbList); err != nil {
+	if err := a.authConnectorAction(types.KindOIDC, types.VerbList); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	if err := a.authConnectorAction(apidefaults.Namespace, types.KindOIDC, types.VerbReadNoSecrets); err != nil {
+	if err := a.authConnectorAction(types.KindOIDC, types.VerbReadNoSecrets); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	if withSecrets {
-		if err := a.authConnectorAction(apidefaults.Namespace, types.KindOIDC, types.VerbRead); err != nil {
+		if err := a.authConnectorAction(types.KindOIDC, types.VerbRead); err != nil {
 			return nil, trace.Wrap(err)
 		}
 	}
@@ -3530,15 +3776,31 @@ func (a *ServerWithRoles) GetOIDCConnectors(ctx context.Context, withSecrets boo
 }
 
 func (a *ServerWithRoles) CreateOIDCAuthRequest(ctx context.Context, req types.OIDCAuthRequest) (*types.OIDCAuthRequest, error) {
-	if err := a.action(apidefaults.Namespace, types.KindOIDCRequest, types.VerbCreate); err != nil {
+	if !modules.GetModules().Features().GetEntitlement(entitlements.OIDC).Enabled {
+		// TODO(zmb3): ideally we would wrap ErrRequiresEnterprise here, but
+		// we can't currently propagate wrapped errors across the gRPC boundary,
+		// and we want tctl to display a clean user-facing message in this case
+		return nil, trace.AccessDenied("OIDC is only available in Teleport Enterprise")
+	}
+
+	if err := a.action(types.KindOIDCRequest, types.VerbCreate); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	if err := a.context.AuthorizeAdminAction(); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	// require additional permissions for executing SSO test flow.
 	if req.SSOTestFlow {
-		if err := a.authConnectorAction(apidefaults.Namespace, types.KindOIDC, types.VerbCreate); err != nil {
+		if err := a.authConnectorAction(types.KindOIDC, types.VerbCreate); err != nil {
 			return nil, trace.Wrap(err)
 		}
+	}
+
+	// Only the Proxy service can create web sessions via OIDC connector.
+	if req.CreateWebSession && !a.hasBuiltinRole(types.RoleProxy) {
+		return nil, trace.AccessDenied("this request can be only executed by a proxy")
 	}
 
 	oidcReq, err := a.authServer.CreateOIDCAuthRequest(ctx, req)
@@ -3552,62 +3814,122 @@ func (a *ServerWithRoles) CreateOIDCAuthRequest(ctx context.Context, req types.O
 
 // GetOIDCAuthRequest returns OIDC auth request if found.
 func (a *ServerWithRoles) GetOIDCAuthRequest(ctx context.Context, id string) (*types.OIDCAuthRequest, error) {
-	if err := a.action(apidefaults.Namespace, types.KindOIDCRequest, types.VerbRead); err != nil {
+	if err := a.action(types.KindOIDCRequest, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	return a.authServer.GetOIDCAuthRequest(ctx, id)
 }
 
-func (a *ServerWithRoles) ValidateOIDCAuthCallback(ctx context.Context, q url.Values) (*OIDCAuthResponse, error) {
-	// auth callback is it's own authz, no need to check extra permissions
-	return a.authServer.ValidateOIDCAuthCallback(ctx, q)
+func (a *ServerWithRoles) ValidateOIDCAuthCallback(ctx context.Context, q url.Values) (*authclient.OIDCAuthResponse, error) {
+	// auth callback is its own authz, no need to check extra permissions
+	resp, err := a.authServer.ValidateOIDCAuthCallback(ctx, q)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	// Only the Proxy service can create web sessions via OIDC connector.
+	if resp.Session != nil && !a.hasBuiltinRole(types.RoleProxy) {
+		return nil, trace.AccessDenied("this request can be only executed by a proxy")
+	}
+
+	return resp, nil
 }
 
 func (a *ServerWithRoles) DeleteOIDCConnector(ctx context.Context, connectorID string) error {
-	if err := a.authConnectorAction(apidefaults.Namespace, types.KindOIDC, types.VerbDelete); err != nil {
+	if err := a.authConnectorAction(types.KindOIDC, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
+
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return trace.Wrap(err)
+	}
+
 	return a.authServer.DeleteOIDCConnector(ctx, connectorID)
 }
 
 // UpsertSAMLConnector creates or updates a SAML connector.
-func (a *ServerWithRoles) UpsertSAMLConnector(ctx context.Context, connector types.SAMLConnector) error {
-	if !modules.GetModules().Features().SAML {
-		return trace.Wrap(ErrSAMLRequiresEnterprise)
+func (a *ServerWithRoles) UpsertSAMLConnector(ctx context.Context, connector types.SAMLConnector) (types.SAMLConnector, error) {
+	if !modules.GetModules().Features().GetEntitlement(entitlements.SAML).Enabled {
+		return nil, trace.Wrap(ErrSAMLRequiresEnterprise)
 	}
 
-	if err := a.authConnectorAction(apidefaults.Namespace, types.KindSAML, types.VerbCreate); err != nil {
-		return trace.Wrap(err)
-	}
-	if err := a.authConnectorAction(apidefaults.Namespace, types.KindSAML, types.VerbUpdate); err != nil {
-		return trace.Wrap(err)
+	if err := a.authConnectorAction(types.KindSAML, types.VerbCreate); err != nil {
+		return nil, trace.Wrap(err)
 	}
 
-	return a.authServer.UpsertSAMLConnector(ctx, connector)
+	if err := a.authConnectorAction(types.KindSAML, types.VerbUpdate); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	// Support reused MFA for bulk tctl create requests.
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	upserted, err := a.authServer.UpsertSAMLConnector(ctx, connector)
+	return upserted, trace.Wrap(err)
+}
+
+// CreateSAMLConnector creates a new SAML connector.
+func (a *ServerWithRoles) CreateSAMLConnector(ctx context.Context, connector types.SAMLConnector) (types.SAMLConnector, error) {
+	if !modules.GetModules().Features().GetEntitlement(entitlements.SAML).Enabled {
+		return nil, trace.Wrap(ErrSAMLRequiresEnterprise)
+	}
+
+	if err := a.authConnectorAction(types.KindSAML, types.VerbCreate); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	created, err := a.authServer.CreateSAMLConnector(ctx, connector)
+	return created, trace.Wrap(err)
+}
+
+// UpdateSAMLConnector updates an existing SAML connector
+func (a *ServerWithRoles) UpdateSAMLConnector(ctx context.Context, connector types.SAMLConnector) (types.SAMLConnector, error) {
+	if !modules.GetModules().Features().GetEntitlement(entitlements.SAML).Enabled {
+		return nil, trace.Wrap(ErrSAMLRequiresEnterprise)
+	}
+
+	if err := a.authConnectorAction(types.KindSAML, types.VerbUpdate); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	updated, err := a.authServer.UpdateSAMLConnector(ctx, connector)
+	return updated, trace.Wrap(err)
 }
 
 func (a *ServerWithRoles) GetSAMLConnector(ctx context.Context, id string, withSecrets bool) (types.SAMLConnector, error) {
-	if err := a.authConnectorAction(apidefaults.Namespace, types.KindSAML, types.VerbReadNoSecrets); err != nil {
+	if err := a.authConnectorAction(types.KindSAML, types.VerbReadNoSecrets); err != nil {
 		return nil, trace.Wrap(err)
 	}
+
 	if withSecrets {
-		if err := a.authConnectorAction(apidefaults.Namespace, types.KindSAML, types.VerbRead); err != nil {
+		if err := a.authConnectorAction(types.KindSAML, types.VerbRead); err != nil {
 			return nil, trace.Wrap(err)
 		}
 	}
+
 	return a.authServer.GetSAMLConnector(ctx, id, withSecrets)
 }
 
 func (a *ServerWithRoles) GetSAMLConnectors(ctx context.Context, withSecrets bool) ([]types.SAMLConnector, error) {
-	if err := a.authConnectorAction(apidefaults.Namespace, types.KindSAML, types.VerbList); err != nil {
+	if err := a.authConnectorAction(types.KindSAML, types.VerbList); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	if err := a.authConnectorAction(apidefaults.Namespace, types.KindSAML, types.VerbReadNoSecrets); err != nil {
+	if err := a.authConnectorAction(types.KindSAML, types.VerbReadNoSecrets); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	if withSecrets {
-		if err := a.authConnectorAction(apidefaults.Namespace, types.KindSAML, types.VerbRead); err != nil {
+		if err := a.authConnectorAction(types.KindSAML, types.VerbRead); err != nil {
 			return nil, trace.Wrap(err)
 		}
 	}
@@ -3615,15 +3937,28 @@ func (a *ServerWithRoles) GetSAMLConnectors(ctx context.Context, withSecrets boo
 }
 
 func (a *ServerWithRoles) CreateSAMLAuthRequest(ctx context.Context, req types.SAMLAuthRequest) (*types.SAMLAuthRequest, error) {
-	if err := a.action(apidefaults.Namespace, types.KindSAMLRequest, types.VerbCreate); err != nil {
+	if !modules.GetModules().Features().GetEntitlement(entitlements.SAML).Enabled {
+		return nil, trace.Wrap(ErrSAMLRequiresEnterprise)
+	}
+
+	if err := a.action(types.KindSAMLRequest, types.VerbCreate); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	if err := a.context.AuthorizeAdminAction(); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	// require additional permissions for executing SSO test flow.
 	if req.SSOTestFlow {
-		if err := a.authConnectorAction(apidefaults.Namespace, types.KindSAML, types.VerbCreate); err != nil {
+		if err := a.authConnectorAction(types.KindSAML, types.VerbCreate); err != nil {
 			return nil, trace.Wrap(err)
 		}
+	}
+
+	// Only the Proxy service can create web sessions via SAML connector.
+	if req.CreateWebSession && !a.hasBuiltinRole(types.RoleProxy) {
+		return nil, trace.AccessDenied("this request can be only executed by a proxy")
 	}
 
 	samlReq, err := a.authServer.CreateSAMLAuthRequest(ctx, req)
@@ -3636,14 +3971,29 @@ func (a *ServerWithRoles) CreateSAMLAuthRequest(ctx context.Context, req types.S
 }
 
 // ValidateSAMLResponse validates SAML auth response.
-func (a *ServerWithRoles) ValidateSAMLResponse(ctx context.Context, re string, connectorID string) (*SAMLAuthResponse, error) {
-	// auth callback is it's own authz, no need to check extra permissions
-	return a.authServer.ValidateSAMLResponse(ctx, re, connectorID)
+func (a *ServerWithRoles) ValidateSAMLResponse(ctx context.Context, samlResponse, connectorID, clientIP string) (*authclient.SAMLAuthResponse, error) {
+	isProxy := a.hasBuiltinRole(types.RoleProxy)
+	if !isProxy {
+		clientIP = "" // We only trust IP information coming from the Proxy.
+	}
+
+	// auth callback is its own authz, no need to check extra permissions
+	resp, err := a.authServer.ValidateSAMLResponse(ctx, samlResponse, connectorID, clientIP)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	// Only the Proxy service can create web sessions via SAML connector.
+	if resp.Session != nil && !isProxy {
+		return nil, trace.AccessDenied("this request can be only executed by a proxy")
+	}
+
+	return resp, nil
 }
 
 // GetSAMLAuthRequest returns SAML auth request if found.
 func (a *ServerWithRoles) GetSAMLAuthRequest(ctx context.Context, id string) (*types.SAMLAuthRequest, error) {
-	if err := a.action(apidefaults.Namespace, types.KindSAMLRequest, types.VerbRead); err != nil {
+	if err := a.action(types.KindSAMLRequest, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
@@ -3665,7 +4015,7 @@ func (a *ServerWithRoles) GetSSODiagnosticInfo(ctx context.Context, authKind str
 		return nil, trace.BadParameter("unsupported authKind %q", authKind)
 	}
 
-	if err := a.action(apidefaults.Namespace, resource, types.VerbRead); err != nil {
+	if err := a.action(resource, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
@@ -3674,9 +4024,14 @@ func (a *ServerWithRoles) GetSSODiagnosticInfo(ctx context.Context, authKind str
 
 // DeleteSAMLConnector deletes a SAML connector by name.
 func (a *ServerWithRoles) DeleteSAMLConnector(ctx context.Context, connectorID string) error {
-	if err := a.authConnectorAction(apidefaults.Namespace, types.KindSAML, types.VerbDelete); err != nil {
+	if err := a.authConnectorAction(types.KindSAML, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
+
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return trace.Wrap(err)
+	}
+
 	return a.authServer.DeleteSAMLConnector(ctx, connectorID)
 }
 
@@ -3700,25 +4055,71 @@ func (a *ServerWithRoles) checkGithubConnector(connector types.GithubConnector) 
 }
 
 // UpsertGithubConnector creates or updates a Github connector.
-func (a *ServerWithRoles) UpsertGithubConnector(ctx context.Context, connector types.GithubConnector) error {
-	if err := a.authConnectorAction(apidefaults.Namespace, types.KindGithub, types.VerbCreate); err != nil {
-		return trace.Wrap(err)
+func (a *ServerWithRoles) UpsertGithubConnector(ctx context.Context, connector types.GithubConnector) (types.GithubConnector, error) {
+	if err := a.authConnectorAction(types.KindGithub, types.VerbCreate); err != nil {
+		return nil, trace.Wrap(err)
 	}
-	if err := a.authConnectorAction(apidefaults.Namespace, types.KindGithub, types.VerbUpdate); err != nil {
-		return trace.Wrap(err)
+
+	if err := a.authConnectorAction(types.KindGithub, types.VerbUpdate); err != nil {
+		return nil, trace.Wrap(err)
 	}
+
 	if err := a.checkGithubConnector(connector); err != nil {
-		return trace.Wrap(err)
+		return nil, trace.Wrap(err)
 	}
-	return a.authServer.upsertGithubConnector(ctx, connector)
+
+	// Support reused MFA for bulk tctl create requests.
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	upserted, err := a.authServer.upsertGithubConnector(ctx, connector)
+	return upserted, trace.Wrap(err)
+}
+
+// CreateGithubConnector creates a new Github connector.
+func (a *ServerWithRoles) CreateGithubConnector(ctx context.Context, connector types.GithubConnector) (types.GithubConnector, error) {
+	if err := a.authConnectorAction(types.KindGithub, types.VerbCreate); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	if err := a.checkGithubConnector(connector); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	// Support reused MFA for bulk tctl create requests.
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	created, err := a.authServer.createGithubConnector(ctx, connector)
+	return created, trace.Wrap(err)
+}
+
+// UpdateGithubConnector updates an existing Github connector.
+func (a *ServerWithRoles) UpdateGithubConnector(ctx context.Context, connector types.GithubConnector) (types.GithubConnector, error) {
+	if err := a.authConnectorAction(types.KindGithub, types.VerbUpdate); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	if err := a.checkGithubConnector(connector); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	updated, err := a.authServer.updateGithubConnector(ctx, connector)
+	return updated, trace.Wrap(err)
 }
 
 func (a *ServerWithRoles) GetGithubConnector(ctx context.Context, id string, withSecrets bool) (types.GithubConnector, error) {
-	if err := a.authConnectorAction(apidefaults.Namespace, types.KindGithub, types.VerbReadNoSecrets); err != nil {
+	if err := a.authConnectorAction(types.KindGithub, types.VerbReadNoSecrets); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	if withSecrets {
-		if err := a.authConnectorAction(apidefaults.Namespace, types.KindGithub, types.VerbRead); err != nil {
+		if err := a.authConnectorAction(types.KindGithub, types.VerbRead); err != nil {
 			return nil, trace.Wrap(err)
 		}
 	}
@@ -3726,14 +4127,14 @@ func (a *ServerWithRoles) GetGithubConnector(ctx context.Context, id string, wit
 }
 
 func (a *ServerWithRoles) GetGithubConnectors(ctx context.Context, withSecrets bool) ([]types.GithubConnector, error) {
-	if err := a.authConnectorAction(apidefaults.Namespace, types.KindGithub, types.VerbList); err != nil {
+	if err := a.authConnectorAction(types.KindGithub, types.VerbList); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	if err := a.authConnectorAction(apidefaults.Namespace, types.KindGithub, types.VerbReadNoSecrets); err != nil {
+	if err := a.authConnectorAction(types.KindGithub, types.VerbReadNoSecrets); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	if withSecrets {
-		if err := a.authConnectorAction(apidefaults.Namespace, types.KindGithub, types.VerbRead); err != nil {
+		if err := a.authConnectorAction(types.KindGithub, types.VerbRead); err != nil {
 			return nil, trace.Wrap(err)
 		}
 	}
@@ -3742,22 +4143,36 @@ func (a *ServerWithRoles) GetGithubConnectors(ctx context.Context, withSecrets b
 
 // DeleteGithubConnector deletes a Github connector by name.
 func (a *ServerWithRoles) DeleteGithubConnector(ctx context.Context, connectorID string) error {
-	if err := a.authConnectorAction(apidefaults.Namespace, types.KindGithub, types.VerbDelete); err != nil {
+	if err := a.authConnectorAction(types.KindGithub, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
+
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return trace.Wrap(err)
+	}
+
 	return a.authServer.deleteGithubConnector(ctx, connectorID)
 }
 
 func (a *ServerWithRoles) CreateGithubAuthRequest(ctx context.Context, req types.GithubAuthRequest) (*types.GithubAuthRequest, error) {
-	if err := a.action(apidefaults.Namespace, types.KindGithubRequest, types.VerbCreate); err != nil {
+	if err := a.action(types.KindGithubRequest, types.VerbCreate); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	if err := a.context.AuthorizeAdminAction(); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	// require additional permissions for executing SSO test flow.
 	if req.SSOTestFlow {
-		if err := a.authConnectorAction(apidefaults.Namespace, types.KindGithub, types.VerbCreate); err != nil {
+		if err := a.authConnectorAction(types.KindGithub, types.VerbCreate); err != nil {
 			return nil, trace.Wrap(err)
 		}
+	}
+
+	// Only the Proxy service can create web sessions via Github connector.
+	if req.CreateWebSession && !a.hasBuiltinRole(types.RoleProxy) {
+		return nil, trace.AccessDenied("this request can be only executed by a proxy")
 	}
 
 	githubReq, err := a.authServer.CreateGithubAuthRequest(ctx, req)
@@ -3771,20 +4186,32 @@ func (a *ServerWithRoles) CreateGithubAuthRequest(ctx context.Context, req types
 
 // GetGithubAuthRequest returns Github auth request if found.
 func (a *ServerWithRoles) GetGithubAuthRequest(ctx context.Context, stateToken string) (*types.GithubAuthRequest, error) {
-	if err := a.action(apidefaults.Namespace, types.KindGithubRequest, types.VerbRead); err != nil {
+	if err := a.action(types.KindGithubRequest, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	return a.authServer.GetGithubAuthRequest(ctx, stateToken)
 }
 
-func (a *ServerWithRoles) ValidateGithubAuthCallback(ctx context.Context, q url.Values) (*GithubAuthResponse, error) {
-	return a.authServer.ValidateGithubAuthCallback(ctx, q)
+func (a *ServerWithRoles) ValidateGithubAuthCallback(ctx context.Context, q url.Values) (*authclient.GithubAuthResponse, error) {
+	// auth callback is its own authz, no need to check extra permissions
+	resp, err := a.authServer.ValidateGithubAuthCallback(ctx, q)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	// Only the Proxy service can create web sessions via Github connector.
+	if resp.Session != nil && !a.hasBuiltinRole(types.RoleProxy) {
+		return nil, trace.AccessDenied("this request can be only executed by a proxy")
+	}
+
+	return resp, nil
 }
 
 // EmitAuditEvent emits a single audit event
 func (a *ServerWithRoles) EmitAuditEvent(ctx context.Context, event apievents.AuditEvent) error {
-	if err := a.action(apidefaults.Namespace, types.KindEvent, types.VerbCreate); err != nil {
+	ctx = context.WithoutCancel(ctx)
+	if err := a.action(types.KindEvent, types.VerbCreate); err != nil {
 		return trace.Wrap(err)
 	}
 	role, ok := a.context.Identity.(authz.BuiltinRole)
@@ -3795,9 +4222,13 @@ func (a *ServerWithRoles) EmitAuditEvent(ctx context.Context, event apievents.Au
 	if err != nil {
 		// TODO: this should be a proper audit event
 		// notifying about access violation
-		log.Warningf("Rejecting audit event %v(%q) from %q: %v. The client is attempting to "+
-			"submit events for an identity other than the one on its x509 certificate.",
-			event.GetType(), event.GetID(), role.GetServerID(), err)
+		const msg = "Rejecting audit event, the client is attempting to " +
+			"submit events for an identity other than the one on its x509 certificate."
+		a.authServer.logger.WarnContext(ctx, msg,
+			"event_type", event.GetType(),
+			"event_id", event.GetID(),
+			"server_id", role.GetServerID(),
+			"error", err)
 		// this message is sparse on purpose to avoid conveying extra data to an attacker
 		return trace.AccessDenied("failed to validate event metadata")
 	}
@@ -3806,7 +4237,7 @@ func (a *ServerWithRoles) EmitAuditEvent(ctx context.Context, event apievents.Au
 
 // CreateAuditStream creates audit event stream
 func (a *ServerWithRoles) CreateAuditStream(ctx context.Context, sid session.ID) (apievents.Stream, error) {
-	if err := a.action(apidefaults.Namespace, types.KindEvent, types.VerbCreate, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindEvent, types.VerbCreate, types.VerbUpdate); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	role, ok := a.context.Identity.(authz.BuiltinRole)
@@ -3826,7 +4257,7 @@ func (a *ServerWithRoles) CreateAuditStream(ctx context.Context, sid session.ID)
 
 // ResumeAuditStream resumes the stream that has been created
 func (a *ServerWithRoles) ResumeAuditStream(ctx context.Context, sid session.ID, uploadID string) (apievents.Stream, error) {
-	if err := a.action(apidefaults.Namespace, types.KindEvent, types.VerbCreate, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindEvent, types.VerbCreate, types.VerbUpdate); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	role, ok := a.context.Identity.(authz.BuiltinRole)
@@ -3879,45 +4310,22 @@ func (s *streamWithRoles) RecordEvent(ctx context.Context, pe apievents.Prepared
 	if err != nil {
 		// TODO: this should be a proper audit event
 		// notifying about access violation
-		log.Warningf("Rejecting audit event %v from %v: %v. A node is attempting to "+
-			"submit events for an identity other than the one on its x509 certificate.",
-			event.GetID(), s.serverID, err)
+		const msg = "Rejecting audit event, a node is attempting to " +
+			"submit events for an identity other than the one on its x509 certificate."
+		s.a.authServer.logger.WarnContext(ctx, msg,
+			"event_id", event.GetID(),
+			"event_type", event.GetType(),
+			"server_id", s.serverID,
+			"error", err,
+		)
 		// this message is sparse on purpose to avoid conveying extra data to an attacker
 		return trace.AccessDenied("failed to validate event metadata")
 	}
 	return s.stream.RecordEvent(ctx, pe)
 }
 
-func (a *ServerWithRoles) GetSessionChunk(namespace string, sid session.ID, offsetBytes, maxBytes int) ([]byte, error) {
-	if err := a.actionForKindSession(namespace, sid); err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	return a.alog.GetSessionChunk(namespace, sid, offsetBytes, maxBytes)
-}
-
-func (a *ServerWithRoles) GetSessionEvents(namespace string, sid session.ID, afterN int) ([]events.EventFields, error) {
-	if err := a.actionForKindSession(namespace, sid); err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	// emit a session recording view event for the audit log
-	if err := a.authServer.emitter.EmitAuditEvent(a.authServer.closeCtx, &apievents.SessionRecordingAccess{
-		Metadata: apievents.Metadata{
-			Type: events.SessionRecordingAccessEvent,
-			Code: events.SessionRecordingAccessCode,
-		},
-		SessionID:    sid.String(),
-		UserMetadata: a.context.Identity.GetIdentity().GetUserMetadata(),
-	}); err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	return a.alog.GetSessionEvents(namespace, sid, afterN)
-}
-
-func (a *ServerWithRoles) findSessionEndEvent(namespace string, sid session.ID) (apievents.AuditEvent, error) {
-	sessionEvents, _, err := a.alog.SearchSessionEvents(context.TODO(), events.SearchSessionEventsRequest{
+func (a *ServerWithRoles) findSessionEndEvent(ctx context.Context, sid session.ID) (apievents.AuditEvent, error) {
+	sessionEvents, _, err := a.alog.SearchSessionEvents(ctx, events.SearchSessionEventsRequest{
 		From:  time.Time{},
 		To:    a.authServer.clock.Now().UTC(),
 		Limit: defaults.EventsIterationLimit,
@@ -3940,7 +4348,7 @@ func (a *ServerWithRoles) findSessionEndEvent(namespace string, sid session.ID) 
 
 // GetNamespaces returns a list of namespaces
 func (a *ServerWithRoles) GetNamespaces() ([]types.Namespace, error) {
-	if err := a.action(apidefaults.Namespace, types.KindNamespace, types.VerbList, types.VerbRead); err != nil {
+	if err := a.action(types.KindNamespace, types.VerbList, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return a.authServer.GetNamespaces()
@@ -3948,7 +4356,7 @@ func (a *ServerWithRoles) GetNamespaces() ([]types.Namespace, error) {
 
 // GetNamespace returns namespace by name
 func (a *ServerWithRoles) GetNamespace(name string) (*types.Namespace, error) {
-	if err := a.action(apidefaults.Namespace, types.KindNamespace, types.VerbRead); err != nil {
+	if err := a.action(types.KindNamespace, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return a.authServer.GetNamespace(name)
@@ -3956,7 +4364,7 @@ func (a *ServerWithRoles) GetNamespace(name string) (*types.Namespace, error) {
 
 // UpsertNamespace upserts namespace
 func (a *ServerWithRoles) UpsertNamespace(ns types.Namespace) error {
-	if err := a.action(apidefaults.Namespace, types.KindNamespace, types.VerbCreate, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindNamespace, types.VerbCreate, types.VerbUpdate); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.UpsertNamespace(ns)
@@ -3964,7 +4372,7 @@ func (a *ServerWithRoles) UpsertNamespace(ns types.Namespace) error {
 
 // DeleteNamespace deletes namespace by name
 func (a *ServerWithRoles) DeleteNamespace(name string) error {
-	if err := a.action(apidefaults.Namespace, types.KindNamespace, types.VerbDelete); err != nil {
+	if err := a.action(types.KindNamespace, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.DeleteNamespace(name)
@@ -3972,23 +4380,58 @@ func (a *ServerWithRoles) DeleteNamespace(name string) error {
 
 // GetRoles returns a list of roles
 func (a *ServerWithRoles) GetRoles(ctx context.Context) ([]types.Role, error) {
-	if err := a.action(apidefaults.Namespace, types.KindRole, types.VerbList, types.VerbRead); err != nil {
+	// delegate all access-control logic to ListRoles, which will eventually
+	// supplant GetRoles everywhere.
+	var roles []types.Role
+	var req proto.ListRolesRequest
+	for {
+		rsp, err := a.ListRoles(ctx, &req)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+
+		for _, r := range rsp.Roles {
+			roles = append(roles, r)
+		}
+		req.StartKey = rsp.NextKey
+		if req.StartKey == "" {
+			break
+		}
+	}
+
+	return roles, nil
+}
+
+// ListRoles is a paginated role getter.
+func (a *ServerWithRoles) ListRoles(ctx context.Context, req *proto.ListRolesRequest) (*proto.ListRolesResponse, error) {
+	authErr := a.action(types.KindRole, types.VerbList, types.VerbRead)
+	if authErr == nil {
+		rsp, err := a.authServer.ListRoles(ctx, req)
+		return rsp, trace.Wrap(err)
+	}
+
+	firstPage := req.StartKey == ""
+
+	// most users are at least allowed to view *some* roles, so fallback to per-role access checks.
+	roles, nextKey, err := a.authServer.IterateRoles(ctx, req, func(role *types.RoleV6) (bool, error) {
+		return a.actionForResource(role, types.KindRole, types.VerbList, types.VerbRead) == nil, nil
+	})
+	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	return a.authServer.GetRoles(ctx)
-}
 
-// CreateRole not implemented: can only be called locally.
-func (a *ServerWithRoles) CreateRole(ctx context.Context, role types.Role) error {
-	return trace.NotImplemented(notImplementedMessage)
-}
-
-// UpsertRole creates or updates role.
-func (a *ServerWithRoles) UpsertRole(ctx context.Context, role types.Role) error {
-	if err := a.action(apidefaults.Namespace, types.KindRole, types.VerbCreate, types.VerbUpdate); err != nil {
-		return trace.Wrap(err)
+	// If we found no roles, let's return the previous auth error.
+	if firstPage && len(roles) == 0 {
+		return nil, trace.Wrap(authErr)
 	}
 
+	return &proto.ListRolesResponse{
+		Roles:   roles,
+		NextKey: nextKey,
+	}, nil
+}
+
+func (a *ServerWithRoles) validateRole(role types.Role) error {
 	if downgradeReason := role.GetMetadata().Labels[types.TeleportDowngradedLabel]; downgradeReason != "" {
 		return trace.BadParameter("refusing to upsert role because %s label is set with reason %q",
 			types.TeleportDowngradedLabel, downgradeReason)
@@ -4007,26 +4450,105 @@ func (a *ServerWithRoles) UpsertRole(ctx context.Context, role types.Role) error
 	}
 
 	// check that the given RequireMFAType is supported in this build.
-	switch role.GetOptions().RequireMFAType {
-	case types.RequireMFAType_SESSION_AND_HARDWARE_KEY, types.RequireMFAType_HARDWARE_KEY_TOUCH:
+	if role.GetPrivateKeyPolicy().IsHardwareKeyPolicy() {
 		if modules.GetModules().BuildType() != modules.BuildEnterprise {
 			return trace.AccessDenied("Hardware Key support is only available with an enterprise license")
 		}
 	}
 
-	// Note: passing a.authServer.GetInventoryStatus here intentionally bypasses
-	// the authz checks in a.GetInventoryStatus, for these reasons:
-	// - We don't actually return the inventory status result, we're only using
-	//   it internally to check for a misconfiguration and return a generic error.
-	// - We don't want to require users to have new permissions to call UpsertRole.
-	// - GetInventoryStatus currently only supports builtin roles.
-	// - This user already has UpsertRole permissions and could give themselves
-	//   arbitrary permissions if they wanted to.
-	if err := checkInventorySupportsRole(ctx, role, api.Version, a.authServer.GetInventoryStatus); err != nil {
-		return trace.Wrap(err)
+	if role.GetRequestReasonMode(types.Deny) != "" {
+		return trace.BadParameter("request reason mode can be provided only for allow rules")
+	}
+	if role.GetRequestReasonMode(types.Allow) != "" {
+		err := role.GetRequestReasonMode(types.Allow).Check()
+		if err != nil {
+			return trace.Wrap(err)
+		}
 	}
 
-	return a.authServer.UpsertRole(ctx, role)
+	return nil
+}
+
+// CreateRole creates a new role.
+func (a *ServerWithRoles) CreateRole(ctx context.Context, role types.Role) (types.Role, error) {
+	if err := a.actionForResource(role, types.KindRole, types.VerbCreate); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	if err := a.validateRole(role); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	created, err := a.authServer.CreateRole(ctx, role)
+	return created, trace.Wrap(err)
+}
+
+// UpdateRole updates an existing role.
+func (a *ServerWithRoles) UpdateRole(ctx context.Context, role types.Role) (types.Role, error) {
+	oldRole, getErr := a.authServer.GetRole(ctx, role.GetName())
+	oldRoleIsNotFound := trace.IsNotFound(getErr)
+	if getErr != nil && !oldRoleIsNotFound {
+		return nil, trace.Wrap(getErr)
+	}
+
+	// If oldRole is nil, this whole call will fail. However, we'll continue so that the rest of
+	// the call can return an appropriate error.
+	if oldRole != nil {
+		if err := a.actionForResource(oldRole, types.KindRole, types.VerbUpdate); err != nil {
+			return nil, trace.Wrap(err)
+		}
+	}
+
+	if err := a.actionForResource(role, types.KindRole, types.VerbUpdate); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	if err := a.validateRole(role); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	updated, err := a.authServer.UpdateRole(ctx, role)
+	return updated, trace.Wrap(err)
+}
+
+// UpsertRole creates or updates role.
+func (a *ServerWithRoles) UpsertRole(ctx context.Context, role types.Role) (types.Role, error) {
+	oldRole, err := a.authServer.GetRole(ctx, role.GetName())
+	if err != nil && !trace.IsNotFound(err) {
+		return nil, trace.Wrap(err)
+	}
+
+	verbs := []string{types.VerbCreate}
+	if oldRole != nil {
+		verbs = []string{types.VerbUpdate}
+		if err := a.actionForResource(oldRole, types.KindRole, verbs...); err != nil {
+			return nil, trace.Wrap(err)
+		}
+	}
+
+	if err := a.actionForResource(role, types.KindRole, verbs...); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	// Support reused MFA for bulk tctl create requests.
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	if err := a.validateRole(role); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	upserted, err := a.authServer.UpsertRole(ctx, role)
+	return upserted, trace.Wrap(err)
 }
 
 func checkRoleFeatureSupport(role types.Role) error {
@@ -4062,125 +4584,65 @@ func checkRoleFeatureSupport(role types.Role) error {
 	}
 }
 
-type inventoryGetter func(context.Context, proto.InventoryStatusRequest) (proto.InventoryStatusSummary, error)
-
-// checkInventorySupportsRole returns an error if any connected servers found in
-// the inventory do not support some features enabled in [role]. This is only a
-// best-effort check meant to prevent common user errors, since some unsupported
-// servers may not be connected to this auth, or they may connect later.
-func checkInventorySupportsRole(ctx context.Context, role types.Role, authVersion string, getInventory inventoryGetter) error {
-	minRequiredVersion, msg, err := minRequiredVersionForRole(role)
-	if err != nil {
-		return trace.Wrap(err)
-	}
-
-	if safeToSkipInventoryCheck(*semver.New(authVersion), minRequiredVersion) {
-		return nil
-	}
-
-	inventoryStatus, err := getInventory(ctx, proto.InventoryStatusRequest{Connected: true})
-	if err != nil {
-		return trace.Wrap(err)
-	}
-	for _, hello := range inventoryStatus.Connected {
-		version, err := semver.NewVersion(hello.Version)
-		if err != nil {
-			log.Warnf("Connected server %q has unparseable version %q", hello.ServerID, hello.Version)
-			continue
-		}
-		if version.LessThan(minRequiredVersion) {
-			return trace.BadParameter(msg)
-		}
-	}
-	return nil
-}
-
-func minRequiredVersionForRole(role types.Role) (semver.Version, string, error) {
-	// DELETE IN 15.0.0
-	// The label expression checks can be deleted in 15.0.0 since all servers
-	// that don't support label expressions are on 13.x or older. If no other
-	// feature checks have been added at that time, checkInventorySupportsRole
-	// can be deleted entirely.
-	for _, kind := range types.LabelMatcherKinds {
-		for _, rct := range []types.RoleConditionType{types.Allow, types.Deny} {
-			labelMatchers, err := role.GetLabelMatchers(rct, kind)
-			if err != nil {
-				return semver.Version{}, "", trace.Wrap(err)
-			}
-			if len(labelMatchers.Expression) != 0 {
-				return minSupportedLabelExpressionVersion, fmt.Sprintf(
-					"one or more connected servers is running a Teleport version "+
-						"older than %s which does not support the label expressions used "+
-						"in this role.", minSupportedLabelExpressionVersion), nil
-			}
-		}
-	}
-	// Return the zero version to indicate all server versions are supported.
-	return semver.Version{}, "", nil
-}
-
-// safeToSkipInventoryCheck returns true if all possible versions *less than*
-// [minRequiredVersion] are more than one major version behind [authVersion].
-//
-// In this case, any servers older than [minRequiredVersion] are already
-// unsupported and shouldn't be connected, so it's safe to skip the inventory
-// check as an optimization.
-//
-// This also covers the case where minRequiredVersionForRole returned
-// the zero version.
-//
-// Examples:
-// - (15.x.x, 13.1.1) -> true (anything older than 13.1.1 is >1 major behind v15)
-// - (14.x.x, 13.1.1) -> false (13.0.9 is within one major of v14)
-// - (14.x.x, 13.0.0) -> true (anything older than 13.0.0 is >1 major behind v14)
-func safeToSkipInventoryCheck(authVersion, minRequiredVersion semver.Version) bool {
-	return authVersion.Major > roundToNextMajor(minRequiredVersion)
-}
-
-// roundToNextMajor returns the next major version that is *not less than* [v].
-//
-// Examples:
-// - 13.1.1 -> 14.0.0
-// - 13.0.0 -> 13.0.0
-// - 13.0.0-alpha -> 13.0.0
-func roundToNextMajor(v semver.Version) int64 {
-	if (semver.Version{Major: v.Major}).LessThan(v) {
-		return v.Major + 1
-	}
-	return v.Major
-}
-
 // GetRole returns role by name
 func (a *ServerWithRoles) GetRole(ctx context.Context, name string) (types.Role, error) {
 	// Current-user exception: we always allow users to read roles
 	// that they hold.  This requirement is checked first to avoid
 	// misleading denial messages in the logs.
-	if !slices.Contains(a.context.User.GetRoles(), name) {
-		if err := a.action(apidefaults.Namespace, types.KindRole, types.VerbRead); err != nil {
-			return nil, trace.Wrap(err)
-		}
+	if slices.Contains(a.context.User.GetRoles(), name) {
+		return a.authServer.GetRole(ctx, name)
 	}
-	return a.authServer.GetRole(ctx, name)
+
+	authErr := a.action(types.KindRole, types.VerbRead)
+	if authErr == nil {
+		return a.authServer.GetRole(ctx, name)
+	}
+
+	// See if the user has access to this individual role.
+	role, err := a.authServer.GetRole(ctx, name)
+	if err != nil {
+		return nil, trace.Wrap(authErr)
+	}
+
+	if err := a.actionForResource(role, types.KindRole, types.VerbRead); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return role, nil
 }
 
 // DeleteRole deletes role by name
 func (a *ServerWithRoles) DeleteRole(ctx context.Context, name string) error {
-	if err := a.action(apidefaults.Namespace, types.KindRole, types.VerbDelete); err != nil {
+	// See if the user has access to this individual role. If this get fails,
+	// the delete will fail, but we'll leave it to the later call to send the appropriate
+	// error.
+	role, err := a.authServer.GetRole(ctx, name)
+	if err != nil && !trace.IsNotFound(err) {
 		return trace.Wrap(err)
 	}
+
+	if err := a.actionForResource(role, types.KindRole, types.VerbDelete); err != nil {
+		return trace.Wrap(err)
+	}
+
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return trace.Wrap(err)
+	}
+
 	// DELETE IN (7.0)
 	// It's OK to delete this code alongside migrateOSS code in auth.
 	// It prevents 6.0 from migrating resources multiple times
 	// and the role is used for `tctl users add` code too.
-	if modules.GetModules().BuildType() == modules.BuildOSS && name == teleport.AdminRoleName {
+	if modules.GetModules().IsOSSBuild() && name == teleport.AdminRoleName {
 		return trace.AccessDenied("can not delete system role %q", name)
 	}
+
 	return a.authServer.DeleteRole(ctx, name)
 }
 
 // DeleteClusterName deletes cluster name
 func (a *ServerWithRoles) DeleteClusterName() error {
-	if err := a.action(apidefaults.Namespace, types.KindClusterName, types.VerbDelete); err != nil {
+	if err := a.action(types.KindClusterName, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.DeleteClusterName()
@@ -4188,7 +4650,7 @@ func (a *ServerWithRoles) DeleteClusterName() error {
 
 // GetClusterName gets the name of the cluster.
 func (a *ServerWithRoles) GetClusterName(opts ...services.MarshalOption) (types.ClusterName, error) {
-	if err := a.action(apidefaults.Namespace, types.KindClusterName, types.VerbRead); err != nil {
+	if err := a.action(types.KindClusterName, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return a.authServer.GetClusterName()
@@ -4196,7 +4658,7 @@ func (a *ServerWithRoles) GetClusterName(opts ...services.MarshalOption) (types.
 
 // SetClusterName sets the name of the cluster. SetClusterName can only be called once.
 func (a *ServerWithRoles) SetClusterName(c types.ClusterName) error {
-	if err := a.action(apidefaults.Namespace, types.KindClusterName, types.VerbCreate, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindClusterName, types.VerbCreate, types.VerbUpdate); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.SetClusterName(c)
@@ -4204,47 +4666,26 @@ func (a *ServerWithRoles) SetClusterName(c types.ClusterName) error {
 
 // UpsertClusterName sets the name of the cluster.
 func (a *ServerWithRoles) UpsertClusterName(c types.ClusterName) error {
-	if err := a.action(apidefaults.Namespace, types.KindClusterName, types.VerbCreate, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindClusterName, types.VerbCreate, types.VerbUpdate); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.UpsertClusterName(c)
 }
 
-// DeleteStaticTokens deletes static tokens
-func (a *ServerWithRoles) DeleteStaticTokens() error {
-	if err := a.action(apidefaults.Namespace, types.KindStaticTokens, types.VerbDelete); err != nil {
-		return trace.Wrap(err)
-	}
-	return a.authServer.DeleteStaticTokens()
-}
-
-// GetStaticTokens gets the list of static tokens used to provision nodes.
-func (a *ServerWithRoles) GetStaticTokens() (types.StaticTokens, error) {
-	if err := a.action(apidefaults.Namespace, types.KindStaticTokens, types.VerbRead); err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return a.authServer.GetStaticTokens()
-}
-
-// SetStaticTokens sets the list of static tokens used to provision nodes.
-func (a *ServerWithRoles) SetStaticTokens(s types.StaticTokens) error {
-	if err := a.action(apidefaults.Namespace, types.KindStaticTokens, types.VerbCreate, types.VerbUpdate); err != nil {
-		return trace.Wrap(err)
-	}
-	return a.authServer.SetStaticTokens(s)
-}
-
 // GetAuthPreference gets cluster auth preference.
 func (a *ServerWithRoles) GetAuthPreference(ctx context.Context) (types.AuthPreference, error) {
-	if err := a.action(apidefaults.Namespace, types.KindClusterAuthPreference, types.VerbRead); err != nil {
+	if err := a.action(types.KindClusterAuthPreference, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
-
-	return a.authServer.GetAuthPreference(ctx)
+	cfg, err := a.authServer.GetReadOnlyAuthPreference(ctx)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return cfg.Clone(), nil
 }
 
 func (a *ServerWithRoles) GetUIConfig(ctx context.Context) (types.UIConfig, error) {
-	if err := a.action(apidefaults.Namespace, types.KindUIConfig, types.VerbRead); err != nil {
+	if err := a.action(types.KindUIConfig, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	cfg, err := a.authServer.GetUIConfig(ctx)
@@ -4252,14 +4693,14 @@ func (a *ServerWithRoles) GetUIConfig(ctx context.Context) (types.UIConfig, erro
 }
 
 func (a *ServerWithRoles) SetUIConfig(ctx context.Context, uic types.UIConfig) error {
-	if err := a.action(apidefaults.Namespace, types.KindUIConfig, types.VerbUpdate, types.VerbCreate); err != nil {
+	if err := a.action(types.KindUIConfig, types.VerbUpdate, types.VerbCreate); err != nil {
 		return trace.Wrap(err)
 	}
 	return trace.Wrap(a.authServer.SetUIConfig(ctx, uic))
 }
 
 func (a *ServerWithRoles) DeleteUIConfig(ctx context.Context) error {
-	if err := a.action(apidefaults.Namespace, types.KindUIConfig, types.VerbDelete); err != nil {
+	if err := a.action(types.KindUIConfig, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	return trace.Wrap(a.authServer.DeleteUIConfig(ctx))
@@ -4267,7 +4708,7 @@ func (a *ServerWithRoles) DeleteUIConfig(ctx context.Context) error {
 
 // GetInstaller retrieves an installer script resource
 func (a *ServerWithRoles) GetInstaller(ctx context.Context, name string) (types.Installer, error) {
-	if err := a.action(apidefaults.Namespace, types.KindInstaller, types.VerbRead); err != nil {
+	if err := a.action(types.KindInstaller, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return a.authServer.GetInstaller(ctx, name)
@@ -4275,7 +4716,7 @@ func (a *ServerWithRoles) GetInstaller(ctx context.Context, name string) (types.
 
 // GetInstallers gets all the installer resources.
 func (a *ServerWithRoles) GetInstallers(ctx context.Context) ([]types.Installer, error) {
-	if err := a.action(apidefaults.Namespace, types.KindInstaller, types.VerbRead, types.VerbList); err != nil {
+	if err := a.action(types.KindInstaller, types.VerbRead, types.VerbList); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return a.authServer.GetInstallers(ctx)
@@ -4283,7 +4724,7 @@ func (a *ServerWithRoles) GetInstallers(ctx context.Context) ([]types.Installer,
 
 // SetInstaller sets an Installer script resource
 func (a *ServerWithRoles) SetInstaller(ctx context.Context, inst types.Installer) error {
-	if err := a.action(apidefaults.Namespace, types.KindInstaller, types.VerbUpdate, types.VerbCreate); err != nil {
+	if err := a.action(types.KindInstaller, types.VerbUpdate, types.VerbCreate); err != nil {
 		return trace.Wrap(err)
 	}
 	return trace.Wrap(a.authServer.SetInstaller(ctx, inst))
@@ -4291,7 +4732,7 @@ func (a *ServerWithRoles) SetInstaller(ctx context.Context, inst types.Installer
 
 // DeleteInstaller removes an installer script resource
 func (a *ServerWithRoles) DeleteInstaller(ctx context.Context, name string) error {
-	if err := a.action(apidefaults.Namespace, types.KindInstaller, types.VerbDelete); err != nil {
+	if err := a.action(types.KindInstaller, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	return trace.Wrap(a.authServer.DeleteInstaller(ctx, name))
@@ -4299,36 +4740,73 @@ func (a *ServerWithRoles) DeleteInstaller(ctx context.Context, name string) erro
 
 // DeleteAllInstallers removes all installer script resources
 func (a *ServerWithRoles) DeleteAllInstallers(ctx context.Context) error {
-	if err := a.action(apidefaults.Namespace, types.KindInstaller, types.VerbDelete, types.VerbList); err != nil {
+	if err := a.action(types.KindInstaller, types.VerbDelete, types.VerbList); err != nil {
 		return trace.Wrap(err)
 	}
 	return trace.Wrap(a.authServer.DeleteAllInstallers(ctx))
 }
 
 // SetAuthPreference sets cluster auth preference.
+// Deprecated: Use Update/UpsertAuthPreference where appropriate.
 func (a *ServerWithRoles) SetAuthPreference(ctx context.Context, newAuthPref types.AuthPreference) error {
 	storedAuthPref, err := a.authServer.GetAuthPreference(ctx)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
-	if err := a.action(apidefaults.Namespace, types.KindClusterAuthPreference, verbsToReplaceResourceWithOrigin(storedAuthPref)...); err != nil {
+	if err := a.action(types.KindClusterAuthPreference, verbsToReplaceResourceWithOrigin(storedAuthPref)...); err != nil {
+		return trace.Wrap(err)
+	}
+
+	// Support reused MFA for bulk tctl create requests.
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
 		return trace.Wrap(err)
 	}
 
 	// check that the given RequireMFAType is supported in this build.
-	switch newAuthPref.GetRequireMFAType() {
-	case types.RequireMFAType_SESSION_AND_HARDWARE_KEY, types.RequireMFAType_HARDWARE_KEY_TOUCH:
+	if newAuthPref.GetPrivateKeyPolicy().IsHardwareKeyPolicy() {
 		if modules.GetModules().BuildType() != modules.BuildEnterprise {
 			return trace.AccessDenied("Hardware Key support is only available with an enterprise license")
 		}
+	}
+
+	if err := newAuthPref.CheckSignatureAlgorithmSuite(types.SignatureAlgorithmSuiteParams{
+		FIPS:          a.authServer.fips,
+		UsingHSMOrKMS: a.authServer.keyStore.UsingHSMOrKMS(),
+		Cloud:         modules.GetModules().Features().Cloud,
+	}); err != nil {
+		return trace.Wrap(err)
 	}
 
 	if err := dtconfig.ValidateConfigAgainstModules(newAuthPref.GetDeviceTrust()); err != nil {
 		return trace.Wrap(err)
 	}
 
-	return a.authServer.SetAuthPreference(ctx, newAuthPref)
+	_, err = a.authServer.UpsertAuthPreference(ctx, newAuthPref)
+
+	var msg string
+	if err != nil {
+		msg = err.Error()
+	}
+
+	if auditErr := a.authServer.emitter.EmitAuditEvent(ctx, &apievents.AuthPreferenceUpdate{
+		Metadata: apievents.Metadata{
+			Type: events.AuthPreferenceUpdateEvent,
+			Code: events.AuthPreferenceUpdateCode,
+		},
+		UserMetadata:       a.context.GetUserMetadata(),
+		ConnectionMetadata: authz.ConnectionMetadata(ctx),
+		Status: apievents.Status{
+			Success:     err == nil,
+			Error:       msg,
+			UserMessage: msg,
+		},
+		AdminActionsMFA: clusterconfigv1.GetAdminActionsMFAStatus(storedAuthPref, newAuthPref),
+	}); auditErr != nil {
+		a.authServer.logger.WarnContext(ctx, "Failed to emit auth preference update event event", "error", auditErr)
+	}
+
+	return trace.Wrap(err)
 }
 
 // ResetAuthPreference resets cluster auth preference to defaults.
@@ -4341,46 +4819,68 @@ func (a *ServerWithRoles) ResetAuthPreference(ctx context.Context) error {
 		return trace.BadParameter("config-file configuration cannot be reset")
 	}
 
-	if err := a.action(apidefaults.Namespace, types.KindClusterAuthPreference, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindClusterAuthPreference, types.VerbUpdate); err != nil {
 		return trace.Wrap(err)
 	}
 
-	return a.authServer.SetAuthPreference(ctx, types.DefaultAuthPreference())
-}
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return trace.Wrap(err)
+	}
 
-// DeleteAuthPreference not implemented: can only be called locally.
-func (a *ServerWithRoles) DeleteAuthPreference(context.Context) error {
-	return trace.NotImplemented(notImplementedMessage)
+	defaultAuthPref := types.DefaultAuthPreference()
+	defaultAuthPref.SetDefaultSignatureAlgorithmSuite(types.SignatureAlgorithmSuiteParams{
+		FIPS:          a.authServer.fips,
+		UsingHSMOrKMS: a.authServer.keyStore.UsingHSMOrKMS(),
+	})
+	_, err = a.authServer.UpsertAuthPreference(ctx, defaultAuthPref)
+
+	var msg string
+	if err != nil {
+		msg = err.Error()
+	}
+
+	if auditErr := a.authServer.emitter.EmitAuditEvent(ctx, &apievents.AuthPreferenceUpdate{
+		Metadata: apievents.Metadata{
+			Type: events.AuthPreferenceUpdateEvent,
+			Code: events.AuthPreferenceUpdateCode,
+		},
+		UserMetadata:       a.context.GetUserMetadata(),
+		ConnectionMetadata: authz.ConnectionMetadata(ctx),
+		Status: apievents.Status{
+			Success:     err == nil,
+			Error:       msg,
+			UserMessage: msg,
+		},
+		AdminActionsMFA: clusterconfigv1.GetAdminActionsMFAStatus(storedAuthPref, defaultAuthPref),
+	}); auditErr != nil {
+		a.authServer.logger.WarnContext(ctx, "Failed to emit auth preference update event event", "error", auditErr)
+	}
+
+	return trace.Wrap(err)
 }
 
 // GetClusterAuditConfig gets cluster audit configuration.
-func (a *ServerWithRoles) GetClusterAuditConfig(ctx context.Context, opts ...services.MarshalOption) (types.ClusterAuditConfig, error) {
-	if err := a.action(apidefaults.Namespace, types.KindClusterAuditConfig, types.VerbRead); err != nil {
-		if err2 := a.action(apidefaults.Namespace, types.KindClusterConfig, types.VerbRead); err2 != nil {
+func (a *ServerWithRoles) GetClusterAuditConfig(ctx context.Context) (types.ClusterAuditConfig, error) {
+	if err := a.action(types.KindClusterAuditConfig, types.VerbRead); err != nil {
+		if err2 := a.action(types.KindClusterConfig, types.VerbRead); err2 != nil {
 			return nil, trace.Wrap(err)
 		}
 	}
-	return a.authServer.GetClusterAuditConfig(ctx, opts...)
-}
-
-// SetClusterAuditConfig not implemented: can only be called locally.
-func (a *ServerWithRoles) SetClusterAuditConfig(ctx context.Context, auditConfig types.ClusterAuditConfig) error {
-	return trace.NotImplemented(notImplementedMessage)
-}
-
-// DeleteClusterAuditConfig not implemented: can only be called locally.
-func (a *ServerWithRoles) DeleteClusterAuditConfig(ctx context.Context) error {
-	return trace.NotImplemented(notImplementedMessage)
+	return a.authServer.GetClusterAuditConfig(ctx)
 }
 
 // GetClusterNetworkingConfig gets cluster networking configuration.
-func (a *ServerWithRoles) GetClusterNetworkingConfig(ctx context.Context, opts ...services.MarshalOption) (types.ClusterNetworkingConfig, error) {
-	if err := a.action(apidefaults.Namespace, types.KindClusterNetworkingConfig, types.VerbRead); err != nil {
-		if err2 := a.action(apidefaults.Namespace, types.KindClusterConfig, types.VerbRead); err2 != nil {
+func (a *ServerWithRoles) GetClusterNetworkingConfig(ctx context.Context) (types.ClusterNetworkingConfig, error) {
+	if err := a.action(types.KindClusterNetworkingConfig, types.VerbRead); err != nil {
+		if err2 := a.action(types.KindClusterConfig, types.VerbRead); err2 != nil {
 			return nil, trace.Wrap(err)
 		}
 	}
-	return a.authServer.GetClusterNetworkingConfig(ctx, opts...)
+	cfg, err := a.authServer.GetReadOnlyClusterNetworkingConfig(ctx)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return cfg.Clone(), nil
 }
 
 // SetClusterNetworkingConfig sets cluster networking configuration.
@@ -4390,10 +4890,15 @@ func (a *ServerWithRoles) SetClusterNetworkingConfig(ctx context.Context, newNet
 		return trace.Wrap(err)
 	}
 
-	if err := a.action(apidefaults.Namespace, types.KindClusterNetworkingConfig, verbsToReplaceResourceWithOrigin(storedNetConfig)...); err != nil {
-		if err2 := a.action(apidefaults.Namespace, types.KindClusterConfig, verbsToReplaceResourceWithOrigin(storedNetConfig)...); err2 != nil {
+	if err := a.action(types.KindClusterNetworkingConfig, verbsToReplaceResourceWithOrigin(storedNetConfig)...); err != nil {
+		if err2 := a.action(types.KindClusterConfig, verbsToReplaceResourceWithOrigin(storedNetConfig)...); err2 != nil {
 			return trace.Wrap(err)
 		}
+	}
+
+	// Support reused MFA for bulk tctl create requests.
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return trace.Wrap(err)
 	}
 
 	tst, err := newNetConfig.GetTunnelStrategyType()
@@ -4405,7 +4910,36 @@ func (a *ServerWithRoles) SetClusterNetworkingConfig(ctx context.Context, newNet
 		return trace.AccessDenied("proxy peering is an enterprise-only feature")
 	}
 
-	return a.authServer.SetClusterNetworkingConfig(ctx, newNetConfig)
+	oldNetConf, err := a.authServer.GetClusterNetworkingConfig(ctx)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	if err := clusterconfigv1.ValidateCloudNetworkConfigUpdate(a.context, newNetConfig, oldNetConf); err != nil {
+		return trace.Wrap(err)
+	}
+
+	_, err = a.authServer.UpsertClusterNetworkingConfig(ctx, newNetConfig)
+	var msg string
+	if err != nil {
+		msg = err.Error()
+	}
+	if auditErr := a.authServer.emitter.EmitAuditEvent(ctx, &apievents.ClusterNetworkingConfigUpdate{
+		Metadata: apievents.Metadata{
+			Type: events.ClusterNetworkingConfigUpdateEvent,
+			Code: events.ClusterNetworkingConfigUpdateCode,
+		},
+		UserMetadata:       a.context.GetUserMetadata(),
+		ConnectionMetadata: authz.ConnectionMetadata(ctx),
+		Status: apievents.Status{
+			Success:     err == nil,
+			Error:       msg,
+			UserMessage: msg,
+		},
+	}); auditErr != nil {
+		a.authServer.logger.WarnContext(ctx, "Failed to emit cluster networking config update event event", "error", auditErr)
+	}
+	return trace.Wrap(err)
 }
 
 // ResetClusterNetworkingConfig resets cluster networking configuration to defaults.
@@ -4418,28 +4952,57 @@ func (a *ServerWithRoles) ResetClusterNetworkingConfig(ctx context.Context) erro
 		return trace.BadParameter("config-file configuration cannot be reset")
 	}
 
-	if err := a.action(apidefaults.Namespace, types.KindClusterNetworkingConfig, types.VerbUpdate); err != nil {
-		if err2 := a.action(apidefaults.Namespace, types.KindClusterConfig, types.VerbUpdate); err2 != nil {
+	if err := a.action(types.KindClusterNetworkingConfig, types.VerbUpdate); err != nil {
+		if err2 := a.action(types.KindClusterConfig, types.VerbUpdate); err2 != nil {
 			return trace.Wrap(err)
 		}
 	}
+	oldNetConf, err := a.authServer.GetClusterNetworkingConfig(ctx)
+	if err != nil {
+		return trace.Wrap(err)
+	}
 
-	return a.authServer.SetClusterNetworkingConfig(ctx, types.DefaultClusterNetworkingConfig())
-}
+	if err := clusterconfigv1.ValidateCloudNetworkConfigUpdate(a.context, types.DefaultClusterNetworkingConfig(), oldNetConf); err != nil {
+		return trace.Wrap(err)
+	}
 
-// DeleteClusterNetworkingConfig not implemented: can only be called locally.
-func (a *ServerWithRoles) DeleteClusterNetworkingConfig(ctx context.Context) error {
-	return trace.NotImplemented(notImplementedMessage)
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return trace.Wrap(err)
+	}
+
+	_, err = a.authServer.UpsertClusterNetworkingConfig(ctx, types.DefaultClusterNetworkingConfig())
+
+	var msg string
+	if err != nil {
+		msg = err.Error()
+	}
+	if auditErr := a.authServer.emitter.EmitAuditEvent(ctx, &apievents.ClusterNetworkingConfigUpdate{
+		Metadata: apievents.Metadata{
+			Type: events.ClusterNetworkingConfigUpdateEvent,
+			Code: events.ClusterNetworkingConfigUpdateCode,
+		},
+		UserMetadata:       a.context.GetUserMetadata(),
+		ConnectionMetadata: authz.ConnectionMetadata(ctx),
+		Status: apievents.Status{
+			Success:     err == nil,
+			Error:       msg,
+			UserMessage: msg,
+		},
+	}); auditErr != nil {
+		a.authServer.logger.WarnContext(ctx, "Failed to emit cluster networking config update event event", "error", auditErr)
+	}
+
+	return trace.Wrap(err)
 }
 
 // GetSessionRecordingConfig gets session recording configuration.
-func (a *ServerWithRoles) GetSessionRecordingConfig(ctx context.Context, opts ...services.MarshalOption) (types.SessionRecordingConfig, error) {
-	if err := a.action(apidefaults.Namespace, types.KindSessionRecordingConfig, types.VerbRead); err != nil {
-		if err2 := a.action(apidefaults.Namespace, types.KindClusterConfig, types.VerbRead); err2 != nil {
+func (a *ServerWithRoles) GetSessionRecordingConfig(ctx context.Context) (types.SessionRecordingConfig, error) {
+	if err := a.action(types.KindSessionRecordingConfig, types.VerbRead); err != nil {
+		if err2 := a.action(types.KindClusterConfig, types.VerbRead); err2 != nil {
 			return nil, trace.Wrap(err)
 		}
 	}
-	return a.authServer.GetSessionRecordingConfig(ctx, opts...)
+	return a.authServer.GetSessionRecordingConfig(ctx)
 }
 
 // SetSessionRecordingConfig sets session recording configuration.
@@ -4449,13 +5012,40 @@ func (a *ServerWithRoles) SetSessionRecordingConfig(ctx context.Context, newRecC
 		return trace.Wrap(err)
 	}
 
-	if err := a.action(apidefaults.Namespace, types.KindSessionRecordingConfig, verbsToReplaceResourceWithOrigin(storedRecConfig)...); err != nil {
-		if err2 := a.action(apidefaults.Namespace, types.KindClusterConfig, verbsToReplaceResourceWithOrigin(storedRecConfig)...); err2 != nil {
+	if err := a.action(types.KindSessionRecordingConfig, verbsToReplaceResourceWithOrigin(storedRecConfig)...); err != nil {
+		if err2 := a.action(types.KindClusterConfig, verbsToReplaceResourceWithOrigin(storedRecConfig)...); err2 != nil {
 			return trace.Wrap(err)
 		}
 	}
 
-	return a.authServer.SetSessionRecordingConfig(ctx, newRecConfig)
+	// Support reused MFA for bulk tctl create requests.
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return trace.Wrap(err)
+	}
+
+	_, err = a.authServer.UpsertSessionRecordingConfig(ctx, newRecConfig)
+
+	var msg string
+	if err != nil {
+		msg = err.Error()
+	}
+	if auditErr := a.authServer.emitter.EmitAuditEvent(ctx, &apievents.SessionRecordingConfigUpdate{
+		Metadata: apievents.Metadata{
+			Type: events.SessionRecordingConfigUpdateEvent,
+			Code: events.SessionRecordingConfigUpdateCode,
+		},
+		UserMetadata:       a.context.GetUserMetadata(),
+		ConnectionMetadata: authz.ConnectionMetadata(ctx),
+		Status: apievents.Status{
+			Success:     err == nil,
+			Error:       msg,
+			UserMessage: msg,
+		},
+	}); auditErr != nil {
+		a.authServer.logger.WarnContext(ctx, "Failed to emit session recording config update event event", "error", auditErr)
+	}
+
+	return trace.Wrap(err)
 }
 
 // ResetSessionRecordingConfig resets session recording configuration to defaults.
@@ -4468,53 +5058,44 @@ func (a *ServerWithRoles) ResetSessionRecordingConfig(ctx context.Context) error
 		return trace.BadParameter("config-file configuration cannot be reset")
 	}
 
-	if err := a.action(apidefaults.Namespace, types.KindSessionRecordingConfig, types.VerbUpdate); err != nil {
-		if err2 := a.action(apidefaults.Namespace, types.KindClusterConfig, types.VerbUpdate); err2 != nil {
+	if err := a.action(types.KindSessionRecordingConfig, types.VerbUpdate); err != nil {
+		if err2 := a.action(types.KindClusterConfig, types.VerbUpdate); err2 != nil {
 			return trace.Wrap(err)
 		}
 	}
 
-	return a.authServer.SetSessionRecordingConfig(ctx, types.DefaultSessionRecordingConfig())
-}
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return trace.Wrap(err)
+	}
 
-// DeleteSessionRecordingConfig not implemented: can only be called locally.
-func (a *ServerWithRoles) DeleteSessionRecordingConfig(ctx context.Context) error {
-	return trace.NotImplemented(notImplementedMessage)
-}
+	_, err = a.authServer.UpsertSessionRecordingConfig(ctx, types.DefaultSessionRecordingConfig())
 
-// DeleteAllTokens not implemented: can only be called locally.
-func (a *ServerWithRoles) DeleteAllTokens() error {
-	return trace.NotImplemented(notImplementedMessage)
-}
+	var msg string
+	if err != nil {
+		msg = err.Error()
+	}
+	if auditErr := a.authServer.emitter.EmitAuditEvent(ctx, &apievents.SessionRecordingConfigUpdate{
+		Metadata: apievents.Metadata{
+			Type: events.SessionRecordingConfigUpdateEvent,
+			Code: events.SessionRecordingConfigUpdateCode,
+		},
+		UserMetadata:       a.context.GetUserMetadata(),
+		ConnectionMetadata: authz.ConnectionMetadata(ctx),
+		Status: apievents.Status{
+			Success:     err == nil,
+			Error:       msg,
+			UserMessage: msg,
+		},
+	}); auditErr != nil {
+		a.authServer.logger.WarnContext(ctx, "Failed to emit session recording config update event event", "error", auditErr)
+	}
 
-// DeleteAllCertAuthorities not implemented: can only be called locally.
-func (a *ServerWithRoles) DeleteAllCertAuthorities(caType types.CertAuthType) error {
-	return trace.NotImplemented(notImplementedMessage)
-}
-
-// DeleteAllCertNamespaces not implemented: can only be called locally.
-func (a *ServerWithRoles) DeleteAllNamespaces() error {
-	return trace.NotImplemented(notImplementedMessage)
-}
-
-// DeleteAllReverseTunnels not implemented: can only be called locally.
-func (a *ServerWithRoles) DeleteAllReverseTunnels() error {
-	return trace.NotImplemented(notImplementedMessage)
-}
-
-// DeleteAllRoles not implemented: can only be called locally.
-func (a *ServerWithRoles) DeleteAllRoles() error {
-	return trace.NotImplemented(notImplementedMessage)
-}
-
-// DeleteAllUsers not implemented: can only be called locally.
-func (a *ServerWithRoles) DeleteAllUsers() error {
-	return trace.NotImplemented(notImplementedMessage)
+	return trace.Wrap(err)
 }
 
 // GetServerInfos returns a stream of ServerInfos.
 func (a *ServerWithRoles) GetServerInfos(ctx context.Context) stream.Stream[types.ServerInfo] {
-	if err := a.action(apidefaults.Namespace, types.KindServerInfo, types.VerbList, types.VerbRead); err != nil {
+	if err := a.action(types.KindServerInfo, types.VerbList, types.VerbRead); err != nil {
 		return stream.Fail[types.ServerInfo](trace.Wrap(err))
 	}
 
@@ -4523,7 +5104,7 @@ func (a *ServerWithRoles) GetServerInfos(ctx context.Context) stream.Stream[type
 
 // GetServerInfo returns a ServerInfo by name.
 func (a *ServerWithRoles) GetServerInfo(ctx context.Context, name string) (types.ServerInfo, error) {
-	if err := a.action(apidefaults.Namespace, types.KindServerInfo, types.VerbRead); err != nil {
+	if err := a.action(types.KindServerInfo, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
@@ -4533,7 +5114,7 @@ func (a *ServerWithRoles) GetServerInfo(ctx context.Context, name string) (types
 
 // UpsertServerInfo upserts a ServerInfo.
 func (a *ServerWithRoles) UpsertServerInfo(ctx context.Context, si types.ServerInfo) error {
-	if err := a.action(apidefaults.Namespace, types.KindServerInfo, types.VerbCreate, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindServerInfo, types.VerbCreate, types.VerbUpdate); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -4542,7 +5123,7 @@ func (a *ServerWithRoles) UpsertServerInfo(ctx context.Context, si types.ServerI
 
 // DeleteServerInfo deletes a ServerInfo by name.
 func (a *ServerWithRoles) DeleteServerInfo(ctx context.Context, name string) error {
-	if err := a.action(apidefaults.Namespace, types.KindServerInfo, types.VerbDelete); err != nil {
+	if err := a.action(types.KindServerInfo, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -4551,7 +5132,7 @@ func (a *ServerWithRoles) DeleteServerInfo(ctx context.Context, name string) err
 
 // DeleteAllServerInfos deletes all ServerInfos.
 func (a *ServerWithRoles) DeleteAllServerInfos(ctx context.Context) error {
-	if err := a.action(apidefaults.Namespace, types.KindServerInfo, types.VerbDelete); err != nil {
+	if err := a.action(types.KindServerInfo, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -4559,7 +5140,7 @@ func (a *ServerWithRoles) DeleteAllServerInfos(ctx context.Context) error {
 }
 
 func (a *ServerWithRoles) GetTrustedClusters(ctx context.Context) ([]types.TrustedCluster, error) {
-	if err := a.action(apidefaults.Namespace, types.KindTrustedCluster, types.VerbList, types.VerbRead); err != nil {
+	if err := a.action(types.KindTrustedCluster, types.VerbList, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
@@ -4567,7 +5148,7 @@ func (a *ServerWithRoles) GetTrustedClusters(ctx context.Context) ([]types.Trust
 }
 
 func (a *ServerWithRoles) GetTrustedCluster(ctx context.Context, name string) (types.TrustedCluster, error) {
-	if err := a.action(apidefaults.Namespace, types.KindTrustedCluster, types.VerbRead); err != nil {
+	if err := a.action(types.KindTrustedCluster, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
@@ -4576,26 +5157,39 @@ func (a *ServerWithRoles) GetTrustedCluster(ctx context.Context, name string) (t
 
 // UpsertTrustedCluster creates or updates a trusted cluster.
 func (a *ServerWithRoles) UpsertTrustedCluster(ctx context.Context, tc types.TrustedCluster) (types.TrustedCluster, error) {
-	if err := a.action(apidefaults.Namespace, types.KindTrustedCluster, types.VerbCreate, types.VerbUpdate); err != nil {
+	// Don't allow a Cloud tenant to be a leaf cluster.
+	if modules.GetModules().Features().Cloud {
+		return nil, trace.NotImplemented("cloud tenants cannot be leaf clusters")
+	}
+
+	if err := a.action(types.KindTrustedCluster, types.VerbCreate, types.VerbUpdate); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	return a.authServer.UpsertTrustedCluster(ctx, tc)
 }
 
-func (a *ServerWithRoles) ValidateTrustedCluster(ctx context.Context, validateRequest *ValidateTrustedClusterRequest) (*ValidateTrustedClusterResponse, error) {
-	// Don't allow leaf clusters if running in Cloud.
+func (a *ServerWithRoles) ValidateTrustedCluster(ctx context.Context, validateRequest *authclient.ValidateTrustedClusterRequest) (*authclient.ValidateTrustedClusterResponse, error) {
+	// Don't allow a leaf cluster to be added to a Cloud tenant.
 	if modules.GetModules().Features().Cloud {
-		return nil, trace.NotImplemented("cloud clusters do not support trusted cluster resources")
+		return nil, trace.NotImplemented("leaf clusters cannot be added to cloud tenants")
 	}
 
-	// the token provides it's own authorization and authentication
+	// the token provides its own authorization and authentication
 	return a.authServer.validateTrustedCluster(ctx, validateRequest)
 }
 
 // DeleteTrustedCluster deletes a trusted cluster by name.
 func (a *ServerWithRoles) DeleteTrustedCluster(ctx context.Context, name string) error {
-	if err := a.action(apidefaults.Namespace, types.KindTrustedCluster, types.VerbDelete); err != nil {
+	if err := a.action(types.KindTrustedCluster, types.VerbDelete); err != nil {
+		return trace.Wrap(err)
+	}
+
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -4603,118 +5197,50 @@ func (a *ServerWithRoles) DeleteTrustedCluster(ctx context.Context, name string)
 }
 
 func (a *ServerWithRoles) UpsertTunnelConnection(conn types.TunnelConnection) error {
-	if err := a.action(apidefaults.Namespace, types.KindTunnelConnection, types.VerbCreate, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindTunnelConnection, types.VerbCreate, types.VerbUpdate); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.UpsertTunnelConnection(conn)
 }
 
 func (a *ServerWithRoles) GetTunnelConnections(clusterName string, opts ...services.MarshalOption) ([]types.TunnelConnection, error) {
-	if err := a.action(apidefaults.Namespace, types.KindTunnelConnection, types.VerbList); err != nil {
+	if err := a.action(types.KindTunnelConnection, types.VerbList); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return a.authServer.GetTunnelConnections(clusterName, opts...)
 }
 
 func (a *ServerWithRoles) GetAllTunnelConnections(opts ...services.MarshalOption) ([]types.TunnelConnection, error) {
-	if err := a.action(apidefaults.Namespace, types.KindTunnelConnection, types.VerbList); err != nil {
+	if err := a.action(types.KindTunnelConnection, types.VerbList); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return a.authServer.GetAllTunnelConnections(opts...)
 }
 
 func (a *ServerWithRoles) DeleteTunnelConnection(clusterName string, connName string) error {
-	if err := a.action(apidefaults.Namespace, types.KindTunnelConnection, types.VerbDelete); err != nil {
+	if err := a.action(types.KindTunnelConnection, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.DeleteTunnelConnection(clusterName, connName)
 }
 
 func (a *ServerWithRoles) DeleteTunnelConnections(clusterName string) error {
-	if err := a.action(apidefaults.Namespace, types.KindTunnelConnection, types.VerbList, types.VerbDelete); err != nil {
+	if err := a.action(types.KindTunnelConnection, types.VerbList, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.DeleteTunnelConnections(clusterName)
 }
 
 func (a *ServerWithRoles) DeleteAllTunnelConnections() error {
-	if err := a.action(apidefaults.Namespace, types.KindTunnelConnection, types.VerbList, types.VerbDelete); err != nil {
+	if err := a.action(types.KindTunnelConnection, types.VerbList, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.DeleteAllTunnelConnections()
 }
 
-func (a *ServerWithRoles) CreateRemoteCluster(conn types.RemoteCluster) error {
-	if err := a.action(apidefaults.Namespace, types.KindRemoteCluster, types.VerbCreate); err != nil {
-		return trace.Wrap(err)
-	}
-	return a.authServer.CreateRemoteCluster(conn)
-}
-
-func (a *ServerWithRoles) UpdateRemoteCluster(ctx context.Context, rc types.RemoteCluster) error {
-	if err := a.action(apidefaults.Namespace, types.KindRemoteCluster, types.VerbUpdate); err != nil {
-		return trace.Wrap(err)
-	}
-	return a.authServer.UpdateRemoteCluster(ctx, rc)
-}
-
-func (a *ServerWithRoles) GetRemoteCluster(clusterName string) (types.RemoteCluster, error) {
-	if err := a.action(apidefaults.Namespace, types.KindRemoteCluster, types.VerbRead); err != nil {
-		return nil, trace.Wrap(err)
-	}
-	cluster, err := a.authServer.GetRemoteCluster(clusterName)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	if err := a.context.Checker.CheckAccessToRemoteCluster(cluster); err != nil {
-		return nil, utils.OpaqueAccessDenied(err)
-	}
-	return cluster, nil
-}
-
-func (a *ServerWithRoles) GetRemoteClusters(opts ...services.MarshalOption) ([]types.RemoteCluster, error) {
-	if err := a.action(apidefaults.Namespace, types.KindRemoteCluster, types.VerbList); err != nil {
-		return nil, trace.Wrap(err)
-	}
-	remoteClusters, err := a.authServer.GetRemoteClusters(opts...)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return a.filterRemoteClustersForUser(remoteClusters)
-}
-
-// filterRemoteClustersForUser filters remote clusters based on what the current user is authorized to access
-func (a *ServerWithRoles) filterRemoteClustersForUser(remoteClusters []types.RemoteCluster) ([]types.RemoteCluster, error) {
-	filteredClusters := make([]types.RemoteCluster, 0, len(remoteClusters))
-	for _, rc := range remoteClusters {
-		if err := a.context.Checker.CheckAccessToRemoteCluster(rc); err != nil {
-			if trace.IsAccessDenied(err) {
-				continue
-			}
-			return nil, trace.Wrap(err)
-		}
-		filteredClusters = append(filteredClusters, rc)
-	}
-	return filteredClusters, nil
-}
-
-func (a *ServerWithRoles) DeleteRemoteCluster(ctx context.Context, clusterName string) error {
-	if err := a.action(apidefaults.Namespace, types.KindRemoteCluster, types.VerbDelete); err != nil {
-		return trace.Wrap(err)
-	}
-	return a.authServer.DeleteRemoteCluster(ctx, clusterName)
-}
-
-func (a *ServerWithRoles) DeleteAllRemoteClusters() error {
-	if err := a.action(apidefaults.Namespace, types.KindRemoteCluster, types.VerbList, types.VerbDelete); err != nil {
-		return trace.Wrap(err)
-	}
-	return a.authServer.DeleteAllRemoteClusters()
-}
-
 // AcquireSemaphore acquires lease with requested resources from semaphore.
 func (a *ServerWithRoles) AcquireSemaphore(ctx context.Context, params types.AcquireSemaphoreRequest) (*types.SemaphoreLease, error) {
-	if err := a.action(apidefaults.Namespace, types.KindSemaphore, types.VerbCreate, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindSemaphore, types.VerbCreate, types.VerbUpdate); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return a.authServer.AcquireSemaphore(ctx, params)
@@ -4722,7 +5248,7 @@ func (a *ServerWithRoles) AcquireSemaphore(ctx context.Context, params types.Acq
 
 // KeepAliveSemaphoreLease updates semaphore lease.
 func (a *ServerWithRoles) KeepAliveSemaphoreLease(ctx context.Context, lease types.SemaphoreLease) error {
-	if err := a.action(apidefaults.Namespace, types.KindSemaphore, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindSemaphore, types.VerbUpdate); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.KeepAliveSemaphoreLease(ctx, lease)
@@ -4730,7 +5256,7 @@ func (a *ServerWithRoles) KeepAliveSemaphoreLease(ctx context.Context, lease typ
 
 // CancelSemaphoreLease cancels semaphore lease early.
 func (a *ServerWithRoles) CancelSemaphoreLease(ctx context.Context, lease types.SemaphoreLease) error {
-	if err := a.action(apidefaults.Namespace, types.KindSemaphore, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindSemaphore, types.VerbUpdate); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.CancelSemaphoreLease(ctx, lease)
@@ -4738,7 +5264,7 @@ func (a *ServerWithRoles) CancelSemaphoreLease(ctx context.Context, lease types.
 
 // GetSemaphores returns a list of all semaphores matching the supplied filter.
 func (a *ServerWithRoles) GetSemaphores(ctx context.Context, filter types.SemaphoreFilter) ([]types.Semaphore, error) {
-	if err := a.action(apidefaults.Namespace, types.KindSemaphore, types.VerbReadNoSecrets, types.VerbList); err != nil {
+	if err := a.action(types.KindSemaphore, types.VerbReadNoSecrets, types.VerbList); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return a.authServer.GetSemaphores(ctx, filter)
@@ -4746,7 +5272,7 @@ func (a *ServerWithRoles) GetSemaphores(ctx context.Context, filter types.Semaph
 
 // DeleteSemaphore deletes a semaphore matching the supplied filter.
 func (a *ServerWithRoles) DeleteSemaphore(ctx context.Context, filter types.SemaphoreFilter) error {
-	if err := a.action(apidefaults.Namespace, types.KindSemaphore, types.VerbDelete); err != nil {
+	if err := a.action(types.KindSemaphore, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.DeleteSemaphore(ctx, filter)
@@ -4754,17 +5280,52 @@ func (a *ServerWithRoles) DeleteSemaphore(ctx context.Context, filter types.Sema
 
 // ProcessKubeCSR processes CSR request against Kubernetes CA, returns
 // signed certificate if successful.
-func (a *ServerWithRoles) ProcessKubeCSR(req KubeCSR) (*KubeCSRResponse, error) {
+// DEPRECATED
+// TODO(tigrato): DELETE IN 18.0
+func (a *ServerWithRoles) ProcessKubeCSR(req authclient.KubeCSR) (*authclient.KubeCSRResponse, error) {
 	// limits the requests types to proxies to make it harder to break
 	if !a.hasBuiltinRole(types.RoleProxy) {
 		return nil, trace.AccessDenied("this request can be only executed by a proxy")
 	}
+	clusterName, err := a.GetClusterName()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	proxyClusterName := a.context.Identity.GetIdentity().TeleportCluster
+	identityClusterName, err := extractOriginalClusterNameFromCSR(req)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	if proxyClusterName != "" &&
+		proxyClusterName != clusterName.GetClusterName() &&
+		proxyClusterName != identityClusterName {
+		a.authServer.logger.WarnContext(a.CloseContext(), "KubeCSR request denied because the proxy and identity clusters didn't match",
+			"proxy_cluster_name", proxyClusterName,
+			"identity_cluster_name", identityClusterName,
+		)
+		return nil, trace.AccessDenied("can not sign certs for users via a different cluster proxy")
+	}
 	return a.authServer.ProcessKubeCSR(req)
+}
+
+func extractOriginalClusterNameFromCSR(req authclient.KubeCSR) (string, error) {
+	csr, err := tlsca.ParseCertificateRequestPEM(req.CSR)
+	if err != nil {
+		return "", trace.Wrap(err)
+	}
+
+	// Extract identity from the CSR. Pass zero time for id.Expiry, it won't be
+	// used here.
+	id, err := tlsca.FromSubject(csr.Subject, time.Time{})
+	if err != nil {
+		return "", trace.Wrap(err)
+	}
+	return id.TeleportCluster, nil
 }
 
 // GetDatabaseServers returns all registered database servers.
 func (a *ServerWithRoles) GetDatabaseServers(ctx context.Context, namespace string, opts ...services.MarshalOption) ([]types.DatabaseServer, error) {
-	if err := a.action(namespace, types.KindDatabaseServer, types.VerbList, types.VerbRead); err != nil {
+	if err := a.actionNamespace(namespace, types.KindDatabaseServer, types.VerbList, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	servers, err := a.authServer.GetDatabaseServers(ctx, namespace, opts...)
@@ -4786,7 +5347,7 @@ func (a *ServerWithRoles) GetDatabaseServers(ctx context.Context, namespace stri
 
 // UpsertDatabaseServer creates or updates a new database proxy server.
 func (a *ServerWithRoles) UpsertDatabaseServer(ctx context.Context, server types.DatabaseServer) (*types.KeepAlive, error) {
-	if err := a.action(server.GetNamespace(), types.KindDatabaseServer, types.VerbCreate, types.VerbUpdate); err != nil {
+	if err := a.actionNamespace(server.GetNamespace(), types.KindDatabaseServer, types.VerbCreate, types.VerbUpdate); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return a.authServer.UpsertDatabaseServer(ctx, server)
@@ -4794,7 +5355,7 @@ func (a *ServerWithRoles) UpsertDatabaseServer(ctx context.Context, server types
 
 // DeleteDatabaseServer removes the specified database proxy server.
 func (a *ServerWithRoles) DeleteDatabaseServer(ctx context.Context, namespace, hostID, name string) error {
-	if err := a.action(namespace, types.KindDatabaseServer, types.VerbDelete); err != nil {
+	if err := a.actionNamespace(namespace, types.KindDatabaseServer, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.DeleteDatabaseServer(ctx, namespace, hostID, name)
@@ -4802,7 +5363,7 @@ func (a *ServerWithRoles) DeleteDatabaseServer(ctx context.Context, namespace, h
 
 // DeleteAllDatabaseServers removes all registered database proxy servers.
 func (a *ServerWithRoles) DeleteAllDatabaseServers(ctx context.Context, namespace string) error {
-	if err := a.action(namespace, types.KindDatabaseServer, types.VerbList, types.VerbDelete); err != nil {
+	if err := a.actionNamespace(namespace, types.KindDatabaseServer, types.VerbList, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.DeleteAllDatabaseServers(ctx, namespace)
@@ -4810,7 +5371,7 @@ func (a *ServerWithRoles) DeleteAllDatabaseServers(ctx context.Context, namespac
 
 // UpsertDatabaseService creates or updates a new DatabaseService resource.
 func (a *ServerWithRoles) UpsertDatabaseService(ctx context.Context, service types.DatabaseService) (*types.KeepAlive, error) {
-	if err := a.action(service.GetNamespace(), types.KindDatabaseService, types.VerbCreate, types.VerbUpdate); err != nil {
+	if err := a.actionNamespace(service.GetNamespace(), types.KindDatabaseService, types.VerbCreate, types.VerbUpdate); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return a.authServer.UpsertDatabaseService(ctx, service)
@@ -4818,7 +5379,7 @@ func (a *ServerWithRoles) UpsertDatabaseService(ctx context.Context, service typ
 
 // DeleteAllDatabaseServices removes all DatabaseService resources.
 func (a *ServerWithRoles) DeleteAllDatabaseServices(ctx context.Context) error {
-	if err := a.action(apidefaults.Namespace, types.KindDatabaseService, types.VerbList, types.VerbDelete); err != nil {
+	if err := a.action(types.KindDatabaseService, types.VerbList, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.DeleteAllDatabaseServices(ctx)
@@ -4826,7 +5387,7 @@ func (a *ServerWithRoles) DeleteAllDatabaseServices(ctx context.Context) error {
 
 // DeleteDatabaseService removes a specific DatabaseService resource.
 func (a *ServerWithRoles) DeleteDatabaseService(ctx context.Context, name string) error {
-	if err := a.action(apidefaults.Namespace, types.KindDatabaseService, types.VerbDelete); err != nil {
+	if err := a.action(types.KindDatabaseService, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.DeleteDatabaseService(ctx, name)
@@ -4843,26 +5404,40 @@ func (a *ServerWithRoles) SignDatabaseCSR(ctx context.Context, req *proto.Databa
 	return a.authServer.SignDatabaseCSR(ctx, req)
 }
 
-// GenerateDatabaseCert generates a certificate used by a database service
-// to authenticate with the database instance.
+// GenerateDatabaseCert generates a client certificate used by a database
+// service to authenticate with the database instance, or a server certificate
+// for configuring a self-hosted database, depending on the requester_name.
 //
 // This certificate can be requested by:
 //
 //   - Cluster administrator using "tctl auth sign --format=db" command locally
 //     on the auth server to produce a certificate for configuring a self-hosted
 //     database.
-//   - Remote user using "tctl auth sign --format=db" command with a remote
-//     proxy (e.g. Teleport Cloud), as long as they can impersonate system
-//     role Db.
+//   - Remote user using "tctl auth sign --format=db" command or
+//     /webapi/sites/:site/sign/db with a remote proxy (e.g. Teleport Cloud),
+//     as long as they can impersonate system role Db.
 //   - Database service when initiating connection to a database instance to
 //     produce a client certificate.
-//   - Proxy service when generating mTLS files to a database
 func (a *ServerWithRoles) GenerateDatabaseCert(ctx context.Context, req *proto.DatabaseCertRequest) (*proto.DatabaseCertResponse, error) {
-	// Check if the User can `create` DatabaseCertificates
-	err := a.action(apidefaults.Namespace, types.KindDatabaseCertificate, types.VerbCreate)
+	err := a.checkAccessToGenerateDatabaseCert(types.KindDatabaseCertificate)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return a.authServer.GenerateDatabaseCert(ctx, req)
+}
+
+// checkAccessToGenerateDatabaseCert is a helper for checking db cert gen authz.
+// Requester must have at least one of:
+// - create: database_certificate or database_client_certificate.
+// - built-in Admin or DB role.
+// - allowed to impersonate the built-in DB role.
+func (a *ServerWithRoles) checkAccessToGenerateDatabaseCert(resourceKind string) error {
+	const verb = types.VerbCreate
+	// Check if the User can `create` Database Certificates
+	err := a.action(resourceKind, verb)
 	if err != nil {
 		if !trace.IsAccessDenied(err) {
-			return nil, trace.Wrap(err)
+			return trace.Wrap(err)
 		}
 
 		// Err is access denied, trying the old way
@@ -4871,13 +5446,18 @@ func (a *ServerWithRoles) GenerateDatabaseCert(ctx context.Context, req *proto.D
 		// user that is allowed to impersonate database service.
 		if !a.hasBuiltinRole(types.RoleDatabase, types.RoleAdmin) {
 			if err := a.canImpersonateBuiltinRole(types.RoleDatabase); err != nil {
-				log.WithError(err).Warnf("User %v tried to generate database certificate but does not have '%s' permission for '%s' kind, nor is allowed to impersonate %q system role",
-					a.context.User.GetName(), types.VerbCreate, types.KindDatabaseCertificate, types.RoleDatabase)
-				return nil, trace.AccessDenied(fmt.Sprintf("access denied. User must have '%s' permission for '%s' kind to generate the certificate ", types.VerbCreate, types.KindDatabaseCertificate))
+				a.authServer.logger.WarnContext(a.CloseContext(), "User tried to generate database certificate but does not have permissions, nor is allowed to impersonate database system role",
+					"user", a.context.User.GetName(),
+					"verb", verb,
+					"resource_kind", resourceKind,
+					"error", err,
+				)
+				return trace.AccessDenied("access denied. User must have '%s' permission for '%s' kind to generate the certificate ",
+					verb, resourceKind)
 			}
 		}
 	}
-	return a.authServer.GenerateDatabaseCert(ctx, req)
+	return nil
 }
 
 // GenerateSnowflakeJWT generates JWT in the Snowflake required format.
@@ -4886,8 +5466,10 @@ func (a *ServerWithRoles) GenerateSnowflakeJWT(ctx context.Context, req *proto.S
 	// user that is allowed to impersonate database service.
 	if !a.hasBuiltinRole(types.RoleDatabase, types.RoleAdmin) {
 		if err := a.canImpersonateBuiltinRole(types.RoleDatabase); err != nil {
-			log.WithError(err).Warnf("User %v tried to generate database certificate but is not allowed to impersonate %q system role.",
-				a.context.User.GetName(), types.RoleDatabase)
+			a.authServer.logger.WarnContext(ctx, "User tried to generate database certificate but is not allowed to impersonate Database system role.",
+				"user", a.context.User.GetName(),
+				"error", err,
+			)
 			return nil, trace.AccessDenied(`access denied. The user must be able to impersonate the builtin role and user "Db" in order to generate database certificates, for more info see https://goteleport.com/docs/database-access/reference/cli/#tctl-auth-sign.`)
 		}
 	}
@@ -4919,7 +5501,7 @@ func (a *ServerWithRoles) checkAccessToApp(app types.Application) error {
 
 // GetApplicationServers returns all registered application servers.
 func (a *ServerWithRoles) GetApplicationServers(ctx context.Context, namespace string) ([]types.AppServer, error) {
-	if err := a.action(namespace, types.KindAppServer, types.VerbList, types.VerbRead); err != nil {
+	if err := a.actionNamespace(namespace, types.KindAppServer, types.VerbList, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	servers, err := a.authServer.GetApplicationServers(ctx, namespace)
@@ -4940,6 +5522,8 @@ func (a *ServerWithRoles) GetApplicationServers(ctx context.Context, namespace s
 }
 
 // GetAppServersAndSAMLIdPServiceProviders returns a list containing all registered AppServers and SAMLIdPServiceProviders.
+//
+//nolint:staticcheck // SA1019. TODO(sshah) DELETE IN 17.0
 func (a *ServerWithRoles) GetAppServersAndSAMLIdPServiceProviders(ctx context.Context, namespace string) ([]types.AppServerOrSAMLIdPServiceProvider, error) {
 	appservers, err := a.GetApplicationServers(ctx, namespace)
 	if err != nil {
@@ -4961,7 +5545,7 @@ func (a *ServerWithRoles) GetAppServersAndSAMLIdPServiceProviders(ctx context.Co
 	// Only add SAMLIdPServiceProviders to the list if the caller has an enterprise license since this is an enteprise-only feature.
 	if modules.GetModules().BuildType() == modules.BuildEnterprise {
 		// Only attempt to list SAMLIdPServiceProviders if the caller has the permission to.
-		if err := a.action(namespace, types.KindSAMLIdPServiceProvider, types.VerbList); err == nil {
+		if err := a.action(types.KindSAMLIdPServiceProvider, types.VerbList); err == nil {
 			serviceProviders, _, err := a.authServer.ListSAMLIdPServiceProviders(ctx, 0, "")
 			if err != nil {
 				return nil, trace.Wrap(err)
@@ -4983,7 +5567,7 @@ func (a *ServerWithRoles) GetAppServersAndSAMLIdPServiceProviders(ctx context.Co
 
 // UpsertApplicationServer registers an application server.
 func (a *ServerWithRoles) UpsertApplicationServer(ctx context.Context, server types.AppServer) (*types.KeepAlive, error) {
-	if err := a.action(server.GetNamespace(), types.KindAppServer, types.VerbCreate, types.VerbUpdate); err != nil {
+	if err := a.actionNamespace(server.GetNamespace(), types.KindAppServer, types.VerbCreate, types.VerbUpdate); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return a.authServer.UpsertApplicationServer(ctx, server)
@@ -4991,7 +5575,7 @@ func (a *ServerWithRoles) UpsertApplicationServer(ctx context.Context, server ty
 
 // DeleteApplicationServer deletes specified application server.
 func (a *ServerWithRoles) DeleteApplicationServer(ctx context.Context, namespace, hostID, name string) error {
-	if err := a.action(namespace, types.KindAppServer, types.VerbDelete); err != nil {
+	if err := a.actionNamespace(namespace, types.KindAppServer, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.DeleteApplicationServer(ctx, namespace, hostID, name)
@@ -4999,7 +5583,7 @@ func (a *ServerWithRoles) DeleteApplicationServer(ctx context.Context, namespace
 
 // DeleteAllApplicationServers deletes all registered application servers.
 func (a *ServerWithRoles) DeleteAllApplicationServers(ctx context.Context, namespace string) error {
-	if err := a.action(namespace, types.KindAppServer, types.VerbList, types.VerbDelete); err != nil {
+	if err := a.actionNamespace(namespace, types.KindAppServer, types.VerbList, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.DeleteAllApplicationServers(ctx, namespace)
@@ -5011,13 +5595,18 @@ func (a *ServerWithRoles) GetAppSession(ctx context.Context, req types.GetAppSes
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	// Users can only fetch their own app sessions.
-	if err := a.currentUserAction(session.GetUser()); err != nil {
-		if err := a.action(apidefaults.Namespace, types.KindWebSession, types.VerbRead); err != nil {
-			return nil, trace.Wrap(err)
-		}
+
+	authErr := a.action(types.KindWebSession, types.VerbRead)
+	if authErr == nil {
+		return session, nil
 	}
-	return session, nil
+
+	// Users can fetch their own app sessions without secrets.
+	if err := a.currentUserAction(session.GetUser()); err == nil {
+		return session.WithoutSecrets(), nil
+	}
+
+	return nil, trace.Wrap(authErr)
 }
 
 // GetSnowflakeSession gets a Snowflake web session.
@@ -5033,7 +5622,7 @@ func (a *ServerWithRoles) GetSnowflakeSession(ctx context.Context, req types.Get
 	if !a.hasBuiltinRole(types.RoleDatabase) {
 		// Users can only fetch their own web sessions.
 		if err := a.currentUserAction(session.GetUser()); err != nil {
-			if err := a.action(apidefaults.Namespace, types.KindWebSession, types.VerbRead); err != nil {
+			if err := a.action(types.KindWebSession, types.VerbRead); err != nil {
 				return nil, trace.Wrap(err)
 			}
 		}
@@ -5042,7 +5631,12 @@ func (a *ServerWithRoles) GetSnowflakeSession(ctx context.Context, req types.Get
 }
 
 // GetSAMLIdPSession gets a SAML IdP session.
+// TODO(Joerger): DELETE IN v18.0.0
 func (a *ServerWithRoles) GetSAMLIdPSession(ctx context.Context, req types.GetSAMLIdPSessionRequest) (types.WebSession, error) {
+	if err := a.action(types.KindWebSession, types.VerbRead); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
 	session, err := a.authServer.GetSAMLIdPSession(ctx, req)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -5050,18 +5644,12 @@ func (a *ServerWithRoles) GetSAMLIdPSession(ctx context.Context, req types.GetSA
 	if session.GetSubKind() != types.KindSAMLIdPSession {
 		return nil, trace.AccessDenied("GetSAMLIdPSession only allows reading sessions with SubKind SAMLIdpSession")
 	}
-	// Users can only fetch their own web sessions or the proxy can fetch all web sessions.
-	if err := a.currentUserAction(session.GetUser()); err != nil {
-		if err := a.action(apidefaults.Namespace, types.KindWebSession, types.VerbRead); err != nil {
-			return nil, trace.Wrap(err)
-		}
-	}
 	return session, nil
 }
 
 // ListAppSessions gets a paginated list of application web sessions.
 func (a *ServerWithRoles) ListAppSessions(ctx context.Context, pageSize int, pageToken, user string) ([]types.WebSession, string, error) {
-	if err := a.action(apidefaults.Namespace, types.KindWebSession, types.VerbList, types.VerbRead); err != nil {
+	if err := a.action(types.KindWebSession, types.VerbList, types.VerbRead); err != nil {
 		return nil, "", trace.Wrap(err)
 	}
 
@@ -5073,7 +5661,7 @@ func (a *ServerWithRoles) ListAppSessions(ctx context.Context, pageSize int, pag
 func (a *ServerWithRoles) GetSnowflakeSessions(ctx context.Context) ([]types.WebSession, error) {
 	// Check if this a database service.
 	if !a.hasBuiltinRole(types.RoleDatabase) {
-		if err := a.action(apidefaults.Namespace, types.KindWebSession, types.VerbList, types.VerbRead); err != nil {
+		if err := a.action(types.KindWebSession, types.VerbList, types.VerbRead); err != nil {
 			return nil, trace.Wrap(err)
 		}
 	}
@@ -5086,8 +5674,9 @@ func (a *ServerWithRoles) GetSnowflakeSessions(ctx context.Context) ([]types.Web
 }
 
 // ListSAMLIdPSessions gets a paginated list of SAML IdP sessions.
+// TODO(Joerger): DELETE IN v18.0.0
 func (a *ServerWithRoles) ListSAMLIdPSessions(ctx context.Context, pageSize int, pageToken, user string) ([]types.WebSession, string, error) {
-	if err := a.action(apidefaults.Namespace, types.KindWebSession, types.VerbList, types.VerbRead); err != nil {
+	if err := a.action(types.KindWebSession, types.VerbList, types.VerbRead); err != nil {
 		return nil, "", trace.Wrap(err)
 	}
 
@@ -5097,21 +5686,17 @@ func (a *ServerWithRoles) ListSAMLIdPSessions(ctx context.Context, pageSize int,
 
 // CreateAppSession creates an application web session. Application web
 // sessions represent a browser session the client holds.
-func (a *ServerWithRoles) CreateAppSession(ctx context.Context, req types.CreateAppSessionRequest) (types.WebSession, error) {
+func (a *ServerWithRoles) CreateAppSession(ctx context.Context, req *proto.CreateAppSessionRequest) (types.WebSession, error) {
 	if err := a.currentUserAction(req.Username); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	uls, err := a.authServer.GetUserOrLoginState(ctx, a.context.User.GetName())
+	session, err := a.authServer.CreateAppSession(ctx, req, a.context.Identity.GetIdentity(), a.context.Checker)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	session, err := a.authServer.CreateAppSession(ctx, req, uls, a.context.Identity.GetIdentity(), a.context.Checker)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return session, nil
+	return session.WithoutSecrets(), nil
 }
 
 // CreateSnowflakeSession creates a Snowflake web session.
@@ -5131,34 +5716,18 @@ func (a *ServerWithRoles) CreateSnowflakeSession(ctx context.Context, req types.
 }
 
 // CreateSAMLIdPSession creates a SAML IdP session.
+// TODO(Joerger): DELETE IN v18.0.0
 func (a *ServerWithRoles) CreateSAMLIdPSession(ctx context.Context, req types.CreateSAMLIdPSessionRequest) (types.WebSession, error) {
 	// Check if this a proxy service.
 	if !a.hasBuiltinRole(types.RoleProxy) {
-		if err := a.currentUserAction(req.Username); err != nil {
-			return nil, trace.Wrap(err)
-		}
+		return nil, trace.AccessDenied("this request can be only executed by a proxy")
 	}
 
-	samlSession, err := a.authServer.CreateSAMLIdPSession(ctx, req, a.context.Identity.GetIdentity(), a.context.Checker)
+	samlSession, err := a.authServer.CreateSAMLIdPSession(ctx, req)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return samlSession, nil
-}
-
-// UpsertAppSession not implemented: can only be called locally.
-func (a *ServerWithRoles) UpsertAppSession(ctx context.Context, session types.WebSession) error {
-	return trace.NotImplemented(notImplementedMessage)
-}
-
-// UpsertSnowflakeSession not implemented: can only be called locally.
-func (a *ServerWithRoles) UpsertSnowflakeSession(_ context.Context, _ types.WebSession) error {
-	return trace.NotImplemented(notImplementedMessage)
-}
-
-// UpsertSAMLIdPSession not implemented: can only be called locally.
-func (a *ServerWithRoles) UpsertSAMLIdPSession(_ context.Context, _ types.WebSession) error {
-	return trace.NotImplemented(notImplementedMessage)
 }
 
 // DeleteAppSession removes an application web session.
@@ -5196,6 +5765,7 @@ func (a *ServerWithRoles) DeleteSnowflakeSession(ctx context.Context, req types.
 }
 
 // DeleteSAMLIdPSession removes a SAML IdP session.
+// TODO(Joerger): DELETE IN v18.0.0
 func (a *ServerWithRoles) DeleteSAMLIdPSession(ctx context.Context, req types.DeleteSAMLIdPSessionRequest) error {
 	samlSession, err := a.authServer.GetSAMLIdPSession(ctx, types.GetSAMLIdPSessionRequest(req))
 	if err != nil {
@@ -5214,7 +5784,7 @@ func (a *ServerWithRoles) DeleteSAMLIdPSession(ctx context.Context, req types.De
 // DeleteAllSnowflakeSessions removes all Snowflake web sessions.
 func (a *ServerWithRoles) DeleteAllSnowflakeSessions(ctx context.Context) error {
 	if !a.hasBuiltinRole(types.RoleDatabase) {
-		if err := a.action(apidefaults.Namespace, types.KindWebSession, types.VerbList, types.VerbDelete); err != nil {
+		if err := a.action(types.KindWebSession, types.VerbList, types.VerbDelete); err != nil {
 			return trace.Wrap(err)
 		}
 	}
@@ -5227,7 +5797,7 @@ func (a *ServerWithRoles) DeleteAllSnowflakeSessions(ctx context.Context) error 
 
 // DeleteAllAppSessions removes all application web sessions.
 func (a *ServerWithRoles) DeleteAllAppSessions(ctx context.Context) error {
-	if err := a.action(apidefaults.Namespace, types.KindWebSession, types.VerbList, types.VerbDelete); err != nil {
+	if err := a.action(types.KindWebSession, types.VerbList, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -5252,8 +5822,9 @@ func (a *ServerWithRoles) DeleteUserAppSessions(ctx context.Context, req *proto.
 }
 
 // DeleteAllSAMLIdPSessions removes all SAML IdP sessions.
+// TODO(Joerger): DELETE IN v18.0.0
 func (a *ServerWithRoles) DeleteAllSAMLIdPSessions(ctx context.Context) error {
-	if err := a.action(apidefaults.Namespace, types.KindWebSession, types.VerbList, types.VerbDelete); err != nil {
+	if err := a.action(types.KindWebSession, types.VerbList, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -5264,6 +5835,7 @@ func (a *ServerWithRoles) DeleteAllSAMLIdPSessions(ctx context.Context) error {
 }
 
 // DeleteUserSAMLIdPSessions deletes all of a user's SAML IdP sessions.
+// TODO(Joerger): DELETE IN v18.0.0
 func (a *ServerWithRoles) DeleteUserSAMLIdPSessions(ctx context.Context, username string) error {
 	// First, check if the current user can delete the request user sessions.
 	if err := a.canDeleteWebSession(username); err != nil {
@@ -5281,7 +5853,7 @@ func (a *ServerWithRoles) DeleteUserSAMLIdPSessions(ctx context.Context, usernam
 // WebSessions from the provided `username`.
 func (a *ServerWithRoles) canDeleteWebSession(username string) error {
 	if err := a.currentUserAction(username); err != nil {
-		if err := a.action(apidefaults.Namespace, types.KindWebSession, types.VerbList, types.VerbDelete); err != nil {
+		if err := a.action(types.KindWebSession, types.VerbList, types.VerbDelete); err != nil {
 			return trace.Wrap(err)
 		}
 	}
@@ -5291,7 +5863,7 @@ func (a *ServerWithRoles) canDeleteWebSession(username string) error {
 
 // GenerateAppToken creates a JWT token with application access.
 func (a *ServerWithRoles) GenerateAppToken(ctx context.Context, req types.GenerateAppTokenRequest) (string, error) {
-	if err := a.action(apidefaults.Namespace, types.KindJWT, types.VerbCreate); err != nil {
+	if err := a.action(types.KindJWT, types.VerbCreate); err != nil {
 		return "", trace.Wrap(err)
 	}
 
@@ -5316,7 +5888,7 @@ func (a *ServerWithRoles) checkAccessToKubeCluster(cluster types.KubeCluster) er
 
 // GetKubernetesServers returns all registered kubernetes servers.
 func (a *ServerWithRoles) GetKubernetesServers(ctx context.Context) ([]types.KubeServer, error) {
-	if err := a.action(apidefaults.Namespace, types.KindKubeServer, types.VerbList, types.VerbRead); err != nil {
+	if err := a.action(types.KindKubeServer, types.VerbList, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
@@ -5341,7 +5913,7 @@ func (a *ServerWithRoles) GetKubernetesServers(ctx context.Context) ([]types.Kub
 // UpsertKubernetesServer creates or updates a Server representing a teleport
 // kubernetes server.
 func (a *ServerWithRoles) UpsertKubernetesServer(ctx context.Context, s types.KubeServer) (*types.KeepAlive, error) {
-	if err := a.action(apidefaults.Namespace, types.KindKubeServer, types.VerbCreate, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindKubeServer, types.VerbCreate, types.VerbUpdate); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return a.authServer.UpsertKubernetesServer(ctx, s)
@@ -5349,7 +5921,7 @@ func (a *ServerWithRoles) UpsertKubernetesServer(ctx context.Context, s types.Ku
 
 // DeleteKubernetesServer deletes specified kubernetes server.
 func (a *ServerWithRoles) DeleteKubernetesServer(ctx context.Context, hostID, name string) error {
-	if err := a.action(apidefaults.Namespace, types.KindKubeServer, types.VerbDelete); err != nil {
+	if err := a.action(types.KindKubeServer, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.DeleteKubernetesServer(ctx, hostID, name)
@@ -5357,7 +5929,7 @@ func (a *ServerWithRoles) DeleteKubernetesServer(ctx context.Context, hostID, na
 
 // DeleteAllKubernetesServers deletes all registered kubernetes servers.
 func (a *ServerWithRoles) DeleteAllKubernetesServers(ctx context.Context) error {
-	if err := a.action(apidefaults.Namespace, types.KindKubeServer, types.VerbList, types.VerbDelete); err != nil {
+	if err := a.action(types.KindKubeServer, types.VerbList, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.DeleteAllKubernetesServers(ctx)
@@ -5365,7 +5937,7 @@ func (a *ServerWithRoles) DeleteAllKubernetesServers(ctx context.Context) error 
 
 // GetNetworkRestrictions retrieves all the network restrictions (allow/deny lists).
 func (a *ServerWithRoles) GetNetworkRestrictions(ctx context.Context) (types.NetworkRestrictions, error) {
-	if err := a.action(apidefaults.Namespace, types.KindNetworkRestrictions, types.VerbRead); err != nil {
+	if err := a.action(types.KindNetworkRestrictions, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return a.authServer.GetNetworkRestrictions(ctx)
@@ -5373,38 +5945,34 @@ func (a *ServerWithRoles) GetNetworkRestrictions(ctx context.Context) (types.Net
 
 // SetNetworkRestrictions updates the network restrictions.
 func (a *ServerWithRoles) SetNetworkRestrictions(ctx context.Context, nr types.NetworkRestrictions) error {
-	if err := a.action(apidefaults.Namespace, types.KindNetworkRestrictions, types.VerbCreate, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindNetworkRestrictions, types.VerbCreate, types.VerbUpdate); err != nil {
 		return trace.Wrap(err)
 	}
+
+	// Support reused MFA for bulk tctl create requests.
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return trace.Wrap(err)
+	}
+
 	return a.authServer.SetNetworkRestrictions(ctx, nr)
 }
 
 // DeleteNetworkRestrictions deletes the network restrictions.
 func (a *ServerWithRoles) DeleteNetworkRestrictions(ctx context.Context) error {
-	if err := a.action(apidefaults.Namespace, types.KindNetworkRestrictions, types.VerbDelete); err != nil {
+	if err := a.action(types.KindNetworkRestrictions, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
+
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return trace.Wrap(err)
+	}
+
 	return a.authServer.DeleteNetworkRestrictions(ctx)
 }
 
 // GetMFADevices returns a list of MFA devices.
 func (a *ServerWithRoles) GetMFADevices(ctx context.Context, req *proto.GetMFADevicesRequest) (*proto.GetMFADevicesResponse, error) {
 	return a.authServer.GetMFADevices(ctx, req)
-}
-
-// TODO(awly): decouple auth.ClientI from auth.ServerWithRoles, they exist on
-// opposite sides of the connection.
-
-// AddMFADevice exists to satisfy auth.ClientI but is not implemented here.
-// Use auth.GRPCServer.AddMFADevice or client.Client.AddMFADevice instead.
-func (a *ServerWithRoles) AddMFADevice(ctx context.Context) (proto.AuthService_AddMFADeviceClient, error) {
-	return nil, trace.NotImplemented("bug: AddMFADevice must not be called on auth.ServerWithRoles")
-}
-
-// DeleteMFADevice exists to satisfy auth.ClientI but is not implemented here.
-// Use auth.GRPCServer.DeleteMFADevice or client.Client.DeleteMFADevice instead.
-func (a *ServerWithRoles) DeleteMFADevice(ctx context.Context) (proto.AuthService_DeleteMFADeviceClient, error) {
-	return nil, trace.NotImplemented("bug: DeleteMFADevice must not be called on auth.ServerWithRoles")
 }
 
 // AddMFADeviceSync is implemented by AuthService.AddMFADeviceSync.
@@ -5426,42 +5994,61 @@ func (a *ServerWithRoles) AddMFADeviceSync(ctx context.Context, req *proto.AddMF
 
 // DeleteMFADeviceSync is implemented by AuthService.DeleteMFADeviceSync.
 func (a *ServerWithRoles) DeleteMFADeviceSync(ctx context.Context, req *proto.DeleteMFADeviceSyncRequest) error {
-	// The token provides its own authorization and authentication.
+	switch {
+	case req.TokenID != "":
+		// OK. Token holds the user.
+	case req.ExistingMFAResponse != nil:
+		// Sanity check: caller must be an end user.
+		if !authz.IsLocalOrRemoteUser(a.context) {
+			return trace.BadParameter("only end users are allowed to delete devices using an MFA authentication challenge")
+		}
+	default:
+		// Let Server.DeleteMFADeviceSync handle the failure.
+	}
+
 	return a.authServer.DeleteMFADeviceSync(ctx, req)
 }
 
-// GenerateUserSingleUseCerts exists to satisfy auth.ClientI but is not
-// implemented here.
-//
-// Use auth.GRPCServer.GenerateUserSingleUseCerts or
-// client.Client.GenerateUserSingleUseCerts instead.
-func (a *ServerWithRoles) GenerateUserSingleUseCerts(ctx context.Context) (proto.AuthService_GenerateUserSingleUseCertsClient, error) {
-	return nil, trace.NotImplemented("bug: GenerateUserSingleUseCerts must not be called on auth.ServerWithRoles")
-}
-
-// GetResources exists to satisfy auth.ClientI but is not
-// implemented here. It is a client only interface to make
-// interacting with ListResources friendlier.
-func (a *ServerWithRoles) GetResources(ctx context.Context, req *proto.ListResourcesRequest) (*proto.ListResourcesResponse, error) {
-	return nil, trace.NotImplemented("bug: GetResources must not be called on auth.ServerWithRoles")
-}
-
+// IsMFARequired queries whether MFA is required for the specified target.
 func (a *ServerWithRoles) IsMFARequired(ctx context.Context, req *proto.IsMFARequiredRequest) (*proto.IsMFARequiredResponse, error) {
-	if !hasLocalUserRole(a.context) && !hasRemoteUserRole(a.context) {
+	// Check if MFA is required for admin actions. We don't currently have
+	// a reason to check the name of the admin action in question.
+	if _, ok := req.Target.(*proto.IsMFARequiredRequest_AdminAction); ok {
+		if a.context.AdminActionAuthState == authz.AdminActionAuthUnauthorized {
+			return &proto.IsMFARequiredResponse{
+				Required:    true,
+				MFARequired: proto.MFARequired_MFA_REQUIRED_YES,
+			}, nil
+		} else {
+			return &proto.IsMFARequiredResponse{
+				Required:    false,
+				MFARequired: proto.MFARequired_MFA_REQUIRED_NO,
+			}, nil
+		}
+	}
+
+	// Other than for admin action targets, IsMFARequired should only be called by users.
+	if !authz.IsLocalOrRemoteUser(a.context) {
 		return nil, trace.AccessDenied("only a user role can call IsMFARequired, got %T", a.context.Checker)
 	}
-	// Certain hardware-key based private key policies are treated as MFA verification.
+
+	// Certain hardware-key based private key policies are treated as MFA verification,
+	// except for app sessions which can only be attested with the key policy "web_session".
 	if a.context.Identity.GetIdentity().PrivateKeyPolicy.MFAVerified() {
-		return &proto.IsMFARequiredResponse{
-			Required: false,
-		}, nil
+		if _, isAppReq := req.Target.(*proto.IsMFARequiredRequest_App); !isAppReq {
+			return &proto.IsMFARequiredResponse{
+				Required:    false,
+				MFARequired: proto.MFARequired_MFA_REQUIRED_NO,
+			}, nil
+		}
 	}
+
 	return a.authServer.isMFARequired(ctx, a.context.Checker, req)
 }
 
 // SearchEvents allows searching audit events with pagination support.
 func (a *ServerWithRoles) SearchEvents(ctx context.Context, req events.SearchEventsRequest) (outEvents []apievents.AuditEvent, lastKey string, err error) {
-	if err := a.action(apidefaults.Namespace, types.KindEvent, types.VerbList); err != nil {
+	if err := a.action(types.KindEvent, types.VerbList); err != nil {
 		return nil, "", trace.Wrap(err)
 	}
 
@@ -5473,13 +6060,33 @@ func (a *ServerWithRoles) SearchEvents(ctx context.Context, req events.SearchEve
 	return outEvents, lastKey, nil
 }
 
+// ExportUnstructuredEvents exports events from a given event chunk returned by GetEventExportChunks. This API prioritizes
+// performance over ordering and filtering, and is intended for bulk export of events.
+func (a *ServerWithRoles) ExportUnstructuredEvents(ctx context.Context, req *auditlogpb.ExportUnstructuredEventsRequest) stream.Stream[*auditlogpb.ExportEventUnstructured] {
+	if err := a.action(types.KindEvent, types.VerbList); err != nil {
+		return stream.Fail[*auditlogpb.ExportEventUnstructured](trace.Wrap(err))
+	}
+
+	return a.alog.ExportUnstructuredEvents(ctx, req)
+}
+
+// GetEventExportChunks returns a stream of event chunks that can be exported via ExportUnstructuredEvents. The returned
+// list isn't ordered and polling for new chunks requires re-consuming the entire stream from the beginning.
+func (a *ServerWithRoles) GetEventExportChunks(ctx context.Context, req *auditlogpb.GetEventExportChunksRequest) stream.Stream[*auditlogpb.EventExportChunk] {
+	if err := a.action(types.KindEvent, types.VerbList); err != nil {
+		return stream.Fail[*auditlogpb.EventExportChunk](trace.Wrap(err))
+	}
+
+	return a.alog.GetEventExportChunks(ctx, req)
+}
+
 // SearchSessionEvents allows searching session audit events with pagination support.
 func (a *ServerWithRoles) SearchSessionEvents(ctx context.Context, req events.SearchSessionEventsRequest) (outEvents []apievents.AuditEvent, lastKey string, err error) {
 	if req.Cond != nil {
 		return nil, "", trace.BadParameter("cond is an internal parameter, should not be set by client")
 	}
 
-	cond, err := a.actionForListWithCondition(apidefaults.Namespace, types.KindSession, services.SessionIdentifier)
+	cond, err := a.actionForListWithCondition(ctx, types.KindSession, services.SessionIdentifier)
 	if err != nil {
 		return nil, "", trace.Wrap(err)
 	}
@@ -5496,7 +6103,7 @@ func (a *ServerWithRoles) SearchSessionEvents(ctx context.Context, req events.Se
 
 // GetLock gets a lock by name.
 func (a *ServerWithRoles) GetLock(ctx context.Context, name string) (types.Lock, error) {
-	if err := a.action(apidefaults.Namespace, types.KindLock, types.VerbRead); err != nil {
+	if err := a.action(types.KindLock, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return a.authServer.GetLock(ctx, name)
@@ -5504,7 +6111,7 @@ func (a *ServerWithRoles) GetLock(ctx context.Context, name string) (types.Lock,
 
 // GetLocks gets all/in-force locks that match at least one of the targets when specified.
 func (a *ServerWithRoles) GetLocks(ctx context.Context, inForceOnly bool, targets ...types.LockTarget) ([]types.Lock, error) {
-	if err := a.action(apidefaults.Namespace, types.KindLock, types.VerbList, types.VerbRead); err != nil {
+	if err := a.action(types.KindLock, types.VerbList, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return a.authServer.GetLocks(ctx, inForceOnly, targets...)
@@ -5512,7 +6119,19 @@ func (a *ServerWithRoles) GetLocks(ctx context.Context, inForceOnly bool, target
 
 // UpsertLock upserts a lock.
 func (a *ServerWithRoles) UpsertLock(ctx context.Context, lock types.Lock) error {
-	if err := a.action(apidefaults.Namespace, types.KindLock, types.VerbCreate, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindLock, types.VerbCreate, types.VerbUpdate); err != nil {
+		return trace.Wrap(err)
+	}
+
+	if err := okta.CheckOrigin(&a.context, lock); err != nil {
+		return trace.Wrap(err)
+	}
+
+	if err := checkOktaLockTarget(ctx, &a.context, a.authServer, lock); err != nil {
+		return trace.Wrap(err)
+	}
+
+	if err := checkOktaLockAccess(ctx, &a.context, a.authServer, lock.GetName(), types.VerbUpdate); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -5534,15 +6153,15 @@ func (a *ServerWithRoles) UpsertLock(ctx context.Context, lock types.Lock) error
 
 // DeleteLock deletes a lock.
 func (a *ServerWithRoles) DeleteLock(ctx context.Context, name string) error {
-	if err := a.action(apidefaults.Namespace, types.KindLock, types.VerbDelete); err != nil {
+	if err := a.action(types.KindLock, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
-	return a.authServer.DeleteLock(ctx, name)
-}
 
-// DeleteAllLocks not implemented: can only be called locally.
-func (a *ServerWithRoles) DeleteAllLocks(context.Context) error {
-	return trace.NotImplemented(notImplementedMessage)
+	if err := checkOktaLockAccess(ctx, &a.context, a.authServer, name, types.VerbDelete); err != nil {
+		return trace.Wrap(err)
+	}
+
+	return a.authServer.DeleteLock(ctx, name)
 }
 
 // ReplaceRemoteLocks replaces the set of locks associated with a remote cluster.
@@ -5558,26 +6177,25 @@ func (a *ServerWithRoles) ReplaceRemoteLocks(ctx context.Context, clusterName st
 // channel if one is encountered. Otherwise the event channel is closed when the stream ends.
 // The event channel is not closed on error to prevent race conditions in downstream select statements.
 func (a *ServerWithRoles) StreamSessionEvents(ctx context.Context, sessionID session.ID, startIndex int64) (chan apievents.AuditEvent, chan error) {
-	createErrorChannel := func(err error) (chan apievents.AuditEvent, chan error) {
-		e := make(chan error, 1)
-		e <- trace.Wrap(err)
-		return nil, e
-	}
-
 	err := a.localServerAction()
 	isTeleportServer := err == nil
 
-	if !isTeleportServer {
-		if err := a.actionForKindSession(apidefaults.Namespace, sessionID); err != nil {
-			c, e := make(chan apievents.AuditEvent), make(chan error, 1)
-			e <- trace.Wrap(err)
-			return c, e
-		}
+	// StreamSessionEvents can be called internally, and when that
+	// happens we don't want to emit an event or check for permissions.
+	if isTeleportServer {
+		return a.alog.StreamSessionEvents(ctx, sessionID, startIndex)
 	}
 
-	// StreamSessionEvents can be called internally, and when that happens we don't want to emit an event.
-	shouldEmitAuditEvent := !isTeleportServer
-	if shouldEmitAuditEvent {
+	if err := a.actionForKindSession(ctx, sessionID); err != nil {
+		c, e := make(chan apievents.AuditEvent), make(chan error, 1)
+		e <- trace.Wrap(err)
+		return c, e
+	}
+
+	// We can only determine the session type after the streaming started. For
+	// this reason, we delay the emit audit event until the first event or if
+	// the streaming returns an error.
+	cb := func(evt apievents.AuditEvent, _ error) {
 		if err := a.authServer.emitter.EmitAuditEvent(a.authServer.closeCtx, &apievents.SessionRecordingAccess{
 			Metadata: apievents.Metadata{
 				Type: events.SessionRecordingAccessEvent,
@@ -5585,17 +6203,39 @@ func (a *ServerWithRoles) StreamSessionEvents(ctx context.Context, sessionID ses
 			},
 			SessionID:    sessionID.String(),
 			UserMetadata: a.context.Identity.GetIdentity().GetUserMetadata(),
+			SessionType:  string(sessionTypeFromStartEvent(evt)),
+			Format:       metadata.SessionRecordingFormatFromContext(ctx),
 		}); err != nil {
-			return createErrorChannel(err)
+			a.authServer.logger.ErrorContext(ctx, "Failed to emit stream session event audit event", "error", err)
 		}
 	}
 
-	return a.alog.StreamSessionEvents(ctx, sessionID, startIndex)
+	return a.alog.StreamSessionEvents(events.ContextWithSessionStartCallback(ctx, cb), sessionID, startIndex)
+}
+
+// sessionTypeFromStartEvent determines the session type given the session start
+// event.
+func sessionTypeFromStartEvent(sessionStart apievents.AuditEvent) types.SessionKind {
+	switch e := sessionStart.(type) {
+	case *apievents.SessionStart:
+		if e.KubernetesCluster != "" {
+			return types.KubernetesSessionKind
+		}
+		return types.SSHSessionKind
+	case *apievents.DatabaseSessionStart:
+		return types.DatabaseSessionKind
+	case *apievents.AppSessionStart:
+		return types.AppSessionKind
+	case *apievents.WindowsDesktopSessionStart:
+		return types.WindowsDesktopSessionKind
+	default:
+		return types.UnknownSessionKind
+	}
 }
 
 // CreateApp creates a new application resource.
 func (a *ServerWithRoles) CreateApp(ctx context.Context, app types.Application) error {
-	if err := a.action(apidefaults.Namespace, types.KindApp, types.VerbCreate); err != nil {
+	if err := a.action(types.KindApp, types.VerbCreate); err != nil {
 		return trace.Wrap(err)
 	}
 	// Don't allow users create apps they wouldn't have access to (e.g.
@@ -5608,7 +6248,7 @@ func (a *ServerWithRoles) CreateApp(ctx context.Context, app types.Application) 
 
 // UpdateApp updates existing application resource.
 func (a *ServerWithRoles) UpdateApp(ctx context.Context, app types.Application) error {
-	if err := a.action(apidefaults.Namespace, types.KindApp, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindApp, types.VerbUpdate); err != nil {
 		return trace.Wrap(err)
 	}
 	// Don't allow users update apps they don't have access to (e.g.
@@ -5628,7 +6268,7 @@ func (a *ServerWithRoles) UpdateApp(ctx context.Context, app types.Application) 
 
 // GetApp returns specified application resource.
 func (a *ServerWithRoles) GetApp(ctx context.Context, name string) (types.Application, error) {
-	if err := a.action(apidefaults.Namespace, types.KindApp, types.VerbRead); err != nil {
+	if err := a.action(types.KindApp, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	app, err := a.authServer.GetApp(ctx, name)
@@ -5643,7 +6283,7 @@ func (a *ServerWithRoles) GetApp(ctx context.Context, name string) (types.Applic
 
 // GetApps returns all application resources.
 func (a *ServerWithRoles) GetApps(ctx context.Context) (result []types.Application, err error) {
-	if err := a.action(apidefaults.Namespace, types.KindApp, types.VerbList, types.VerbRead); err != nil {
+	if err := a.action(types.KindApp, types.VerbList, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	// Filter out apps user doesn't have access to.
@@ -5661,7 +6301,7 @@ func (a *ServerWithRoles) GetApps(ctx context.Context) (result []types.Applicati
 
 // DeleteApp removes the specified application resource.
 func (a *ServerWithRoles) DeleteApp(ctx context.Context, name string) error {
-	if err := a.action(apidefaults.Namespace, types.KindApp, types.VerbDelete); err != nil {
+	if err := a.action(types.KindApp, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	// Make sure user has access to the application before deleting.
@@ -5677,7 +6317,7 @@ func (a *ServerWithRoles) DeleteApp(ctx context.Context, name string) error {
 
 // DeleteAllApps removes all application resources.
 func (a *ServerWithRoles) DeleteAllApps(ctx context.Context) error {
-	if err := a.action(apidefaults.Namespace, types.KindApp, types.VerbList, types.VerbDelete); err != nil {
+	if err := a.action(types.KindApp, types.VerbList, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	// Make sure to only delete apps user has access to.
@@ -5697,7 +6337,7 @@ func (a *ServerWithRoles) DeleteAllApps(ctx context.Context) error {
 
 // CreateKubernetesCluster creates a new kubernetes cluster resource.
 func (a *ServerWithRoles) CreateKubernetesCluster(ctx context.Context, cluster types.KubeCluster) error {
-	if err := a.action(apidefaults.Namespace, types.KindKubernetesCluster, types.VerbCreate); err != nil {
+	if err := a.action(types.KindKubernetesCluster, types.VerbCreate); err != nil {
 		return trace.Wrap(err)
 	}
 	// Don't allow users create clusters they wouldn't have access to (e.g.
@@ -5714,7 +6354,7 @@ func (a *ServerWithRoles) CreateKubernetesCluster(ctx context.Context, cluster t
 
 // UpdateKubernetesCluster updates existing kubernetes cluster resource.
 func (a *ServerWithRoles) UpdateKubernetesCluster(ctx context.Context, cluster types.KubeCluster) error {
-	if err := a.action(apidefaults.Namespace, types.KindKubernetesCluster, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindKubernetesCluster, types.VerbUpdate); err != nil {
 		return trace.Wrap(err)
 	}
 	// Don't allow users update clusters they don't have access to (e.g.
@@ -5738,7 +6378,7 @@ func (a *ServerWithRoles) UpdateKubernetesCluster(ctx context.Context, cluster t
 
 // GetKubernetesCluster returns specified kubernetes cluster resource.
 func (a *ServerWithRoles) GetKubernetesCluster(ctx context.Context, name string) (types.KubeCluster, error) {
-	if err := a.action(apidefaults.Namespace, types.KindKubernetesCluster, types.VerbRead); err != nil {
+	if err := a.action(types.KindKubernetesCluster, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	kubeCluster, err := a.authServer.GetKubernetesCluster(ctx, name)
@@ -5753,7 +6393,7 @@ func (a *ServerWithRoles) GetKubernetesCluster(ctx context.Context, name string)
 
 // GetKubernetesClusters returns all kubernetes cluster resources.
 func (a *ServerWithRoles) GetKubernetesClusters(ctx context.Context) (result []types.KubeCluster, err error) {
-	if err := a.action(apidefaults.Namespace, types.KindKubernetesCluster, types.VerbList, types.VerbRead); err != nil {
+	if err := a.action(types.KindKubernetesCluster, types.VerbList, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	// Filter out kube clusters user doesn't have access to.
@@ -5771,7 +6411,7 @@ func (a *ServerWithRoles) GetKubernetesClusters(ctx context.Context) (result []t
 
 // DeleteKubernetesCluster removes the specified kubernetes cluster resource.
 func (a *ServerWithRoles) DeleteKubernetesCluster(ctx context.Context, name string) error {
-	if err := a.action(apidefaults.Namespace, types.KindKubernetesCluster, types.VerbDelete); err != nil {
+	if err := a.action(types.KindKubernetesCluster, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	// Make sure user has access to the kubernetes cluster before deleting.
@@ -5787,7 +6427,7 @@ func (a *ServerWithRoles) DeleteKubernetesCluster(ctx context.Context, name stri
 
 // DeleteAllKubernetesClusters removes all kubernetes cluster resources.
 func (a *ServerWithRoles) DeleteAllKubernetesClusters(ctx context.Context) error {
-	if err := a.action(apidefaults.Namespace, types.KindKubernetesCluster, types.VerbList, types.VerbDelete); err != nil {
+	if err := a.action(types.KindKubernetesCluster, types.VerbList, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	// Make sure to only delete kubernetes cluster user has access to.
@@ -5835,7 +6475,7 @@ func (a *ServerWithRoles) checkAccessToDatabase(database types.Database) error {
 
 // CreateDatabase creates a new database resource.
 func (a *ServerWithRoles) CreateDatabase(ctx context.Context, database types.Database) error {
-	if err := a.action(apidefaults.Namespace, types.KindDatabase, types.VerbCreate); err != nil {
+	if err := a.action(types.KindDatabase, types.VerbCreate); err != nil {
 		return trace.Wrap(err)
 	}
 	// Don't allow users create databases they wouldn't have access to (e.g.
@@ -5852,7 +6492,7 @@ func (a *ServerWithRoles) CreateDatabase(ctx context.Context, database types.Dat
 
 // UpdateDatabase updates existing database resource.
 func (a *ServerWithRoles) UpdateDatabase(ctx context.Context, database types.Database) error {
-	if err := a.action(apidefaults.Namespace, types.KindDatabase, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindDatabase, types.VerbUpdate); err != nil {
 		return trace.Wrap(err)
 	}
 	// Don't allow users update databases they don't have access to (e.g.
@@ -5876,7 +6516,7 @@ func (a *ServerWithRoles) UpdateDatabase(ctx context.Context, database types.Dat
 
 // GetDatabase returns specified database resource.
 func (a *ServerWithRoles) GetDatabase(ctx context.Context, name string) (types.Database, error) {
-	if err := a.action(apidefaults.Namespace, types.KindDatabase, types.VerbRead); err != nil {
+	if err := a.action(types.KindDatabase, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	database, err := a.authServer.GetDatabase(ctx, name)
@@ -5891,7 +6531,7 @@ func (a *ServerWithRoles) GetDatabase(ctx context.Context, name string) (types.D
 
 // GetDatabases returns all database resources.
 func (a *ServerWithRoles) GetDatabases(ctx context.Context) (result []types.Database, err error) {
-	if err := a.action(apidefaults.Namespace, types.KindDatabase, types.VerbList, types.VerbRead); err != nil {
+	if err := a.action(types.KindDatabase, types.VerbList, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	// Filter out databases user doesn't have access to.
@@ -5909,7 +6549,7 @@ func (a *ServerWithRoles) GetDatabases(ctx context.Context) (result []types.Data
 
 // DeleteDatabase removes the specified database resource.
 func (a *ServerWithRoles) DeleteDatabase(ctx context.Context, name string) error {
-	if err := a.action(apidefaults.Namespace, types.KindDatabase, types.VerbDelete); err != nil {
+	if err := a.action(types.KindDatabase, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	// Make sure user has access to the database before deleting.
@@ -5925,7 +6565,7 @@ func (a *ServerWithRoles) DeleteDatabase(ctx context.Context, name string) error
 
 // DeleteAllDatabases removes all database resources.
 func (a *ServerWithRoles) DeleteAllDatabases(ctx context.Context) error {
-	if err := a.action(apidefaults.Namespace, types.KindDatabase, types.VerbList, types.VerbDelete); err != nil {
+	if err := a.action(types.KindDatabase, types.VerbList, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	// Make sure to only delete databases user has access to.
@@ -5945,7 +6585,7 @@ func (a *ServerWithRoles) DeleteAllDatabases(ctx context.Context) error {
 
 // GetWindowsDesktopServices returns all registered windows desktop services.
 func (a *ServerWithRoles) GetWindowsDesktopServices(ctx context.Context) ([]types.WindowsDesktopService, error) {
-	if err := a.action(apidefaults.Namespace, types.KindWindowsDesktopService, types.VerbList, types.VerbRead); err != nil {
+	if err := a.action(types.KindWindowsDesktopService, types.VerbList, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	services, err := a.authServer.GetWindowsDesktopServices(ctx)
@@ -5957,7 +6597,7 @@ func (a *ServerWithRoles) GetWindowsDesktopServices(ctx context.Context) ([]type
 
 // GetWindowsDesktopService returns a registered windows desktop service by name.
 func (a *ServerWithRoles) GetWindowsDesktopService(ctx context.Context, name string) (types.WindowsDesktopService, error) {
-	if err := a.action(apidefaults.Namespace, types.KindWindowsDesktopService, types.VerbList, types.VerbRead); err != nil {
+	if err := a.action(types.KindWindowsDesktopService, types.VerbList, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	service, err := a.authServer.GetWindowsDesktopService(ctx, name)
@@ -5969,7 +6609,7 @@ func (a *ServerWithRoles) GetWindowsDesktopService(ctx context.Context, name str
 
 // UpsertWindowsDesktopService creates or updates a new windows desktop service.
 func (a *ServerWithRoles) UpsertWindowsDesktopService(ctx context.Context, s types.WindowsDesktopService) (*types.KeepAlive, error) {
-	if err := a.action(apidefaults.Namespace, types.KindWindowsDesktopService, types.VerbCreate, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindWindowsDesktopService, types.VerbCreate, types.VerbUpdate); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return a.authServer.UpsertWindowsDesktopService(ctx, s)
@@ -5977,7 +6617,7 @@ func (a *ServerWithRoles) UpsertWindowsDesktopService(ctx context.Context, s typ
 
 // DeleteWindowsDesktopService removes the specified windows desktop service.
 func (a *ServerWithRoles) DeleteWindowsDesktopService(ctx context.Context, name string) error {
-	if err := a.action(apidefaults.Namespace, types.KindWindowsDesktopService, types.VerbDelete); err != nil {
+	if err := a.action(types.KindWindowsDesktopService, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.DeleteWindowsDesktopService(ctx, name)
@@ -5985,7 +6625,7 @@ func (a *ServerWithRoles) DeleteWindowsDesktopService(ctx context.Context, name 
 
 // DeleteAllWindowsDesktopServices removes all registered windows desktop services.
 func (a *ServerWithRoles) DeleteAllWindowsDesktopServices(ctx context.Context) error {
-	if err := a.action(apidefaults.Namespace, types.KindWindowsDesktopService, types.VerbList, types.VerbDelete); err != nil {
+	if err := a.action(types.KindWindowsDesktopService, types.VerbList, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.DeleteAllWindowsDesktopServices(ctx)
@@ -5993,7 +6633,7 @@ func (a *ServerWithRoles) DeleteAllWindowsDesktopServices(ctx context.Context) e
 
 // GetWindowsDesktops returns all registered windows desktop hosts.
 func (a *ServerWithRoles) GetWindowsDesktops(ctx context.Context, filter types.WindowsDesktopFilter) ([]types.WindowsDesktop, error) {
-	if err := a.action(apidefaults.Namespace, types.KindWindowsDesktop, types.VerbList, types.VerbRead); err != nil {
+	if err := a.action(types.KindWindowsDesktop, types.VerbList, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	hosts, err := a.authServer.GetWindowsDesktops(ctx, filter)
@@ -6009,7 +6649,7 @@ func (a *ServerWithRoles) GetWindowsDesktops(ctx context.Context, filter types.W
 
 // CreateWindowsDesktop creates a new windows desktop host.
 func (a *ServerWithRoles) CreateWindowsDesktop(ctx context.Context, s types.WindowsDesktop) error {
-	if err := a.action(apidefaults.Namespace, types.KindWindowsDesktop, types.VerbCreate); err != nil {
+	if err := a.action(types.KindWindowsDesktop, types.VerbCreate); err != nil {
 		return trace.Wrap(err)
 	}
 	return a.authServer.CreateWindowsDesktop(ctx, s)
@@ -6017,7 +6657,7 @@ func (a *ServerWithRoles) CreateWindowsDesktop(ctx context.Context, s types.Wind
 
 // UpdateWindowsDesktop updates an existing windows desktop host.
 func (a *ServerWithRoles) UpdateWindowsDesktop(ctx context.Context, s types.WindowsDesktop) error {
-	if err := a.action(apidefaults.Namespace, types.KindWindowsDesktop, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindWindowsDesktop, types.VerbUpdate); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -6043,7 +6683,7 @@ func (a *ServerWithRoles) UpdateWindowsDesktop(ctx context.Context, s types.Wind
 // UpsertWindowsDesktop updates a windows desktop resource, creating it if it doesn't exist.
 func (a *ServerWithRoles) UpsertWindowsDesktop(ctx context.Context, s types.WindowsDesktop) error {
 	// Ensure caller has both Create and Update permissions.
-	if err := a.action(apidefaults.Namespace, types.KindWindowsDesktop, types.VerbCreate, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindWindowsDesktop, types.VerbCreate, types.VerbUpdate); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -6075,7 +6715,7 @@ func (a *ServerWithRoles) UpsertWindowsDesktop(ctx context.Context, s types.Wind
 // Passing an empty host ID will not trigger "delete all" behavior. To delete
 // all desktops, use DeleteAllWindowsDesktops.
 func (a *ServerWithRoles) DeleteWindowsDesktop(ctx context.Context, hostID, name string) error {
-	if err := a.action(apidefaults.Namespace, types.KindWindowsDesktop, types.VerbDelete); err != nil {
+	if err := a.action(types.KindWindowsDesktop, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	desktop, err := a.authServer.GetWindowsDesktops(ctx,
@@ -6095,7 +6735,7 @@ func (a *ServerWithRoles) DeleteWindowsDesktop(ctx context.Context, hostID, name
 
 // DeleteAllWindowsDesktops removes all registered windows desktop hosts.
 func (a *ServerWithRoles) DeleteAllWindowsDesktops(ctx context.Context) error {
-	if err := a.action(apidefaults.Namespace, types.KindWindowsDesktop, types.VerbList, types.VerbDelete); err != nil {
+	if err := a.action(types.KindWindowsDesktop, types.VerbList, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	// Only delete the desktops the user has access to.
@@ -6149,9 +6789,14 @@ func (a *ServerWithRoles) GenerateWindowsDesktopCert(ctx context.Context, req *p
 	return a.authServer.GenerateWindowsDesktopCert(ctx, req)
 }
 
+func (a *ServerWithRoles) GetDesktopBootstrapScript(ctx context.Context) (*proto.DesktopBootstrapScriptResponse, error) {
+	// No sensitive information is returned in the bootstrap script.
+	return a.authServer.GetDesktopBootstrapScript(ctx)
+}
+
 // GetConnectionDiagnostic returns the connection diagnostic with the matching name
 func (a *ServerWithRoles) GetConnectionDiagnostic(ctx context.Context, name string) (types.ConnectionDiagnostic, error) {
-	if err := a.action(apidefaults.Namespace, types.KindConnectionDiagnostic, types.VerbRead); err != nil {
+	if err := a.action(types.KindConnectionDiagnostic, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
@@ -6165,7 +6810,7 @@ func (a *ServerWithRoles) GetConnectionDiagnostic(ctx context.Context, name stri
 
 // CreateConnectionDiagnostic creates a new connection diagnostic.
 func (a *ServerWithRoles) CreateConnectionDiagnostic(ctx context.Context, connectionDiagnostic types.ConnectionDiagnostic) error {
-	if err := a.action(apidefaults.Namespace, types.KindConnectionDiagnostic, types.VerbCreate); err != nil {
+	if err := a.action(types.KindConnectionDiagnostic, types.VerbCreate); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -6178,7 +6823,7 @@ func (a *ServerWithRoles) CreateConnectionDiagnostic(ctx context.Context, connec
 
 // UpdateConnectionDiagnostic updates a connection diagnostic.
 func (a *ServerWithRoles) UpdateConnectionDiagnostic(ctx context.Context, connectionDiagnostic types.ConnectionDiagnostic) error {
-	if err := a.action(apidefaults.Namespace, types.KindConnectionDiagnostic, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindConnectionDiagnostic, types.VerbUpdate); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -6191,7 +6836,7 @@ func (a *ServerWithRoles) UpdateConnectionDiagnostic(ctx context.Context, connec
 
 // AppendDiagnosticTrace adds a new trace for the given ConnectionDiagnostic.
 func (a *ServerWithRoles) AppendDiagnosticTrace(ctx context.Context, name string, t *types.ConnectionDiagnosticTrace) (types.ConnectionDiagnostic, error) {
-	if err := a.action(apidefaults.Namespace, types.KindConnectionDiagnostic, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindConnectionDiagnostic, types.VerbUpdate); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
@@ -6227,35 +6872,89 @@ func (a *ServerWithRoles) GetAccountRecoveryToken(ctx context.Context, req *prot
 
 // CreateAuthenticateChallenge is implemented by AuthService.CreateAuthenticateChallenge.
 func (a *ServerWithRoles) CreateAuthenticateChallenge(ctx context.Context, req *proto.CreateAuthenticateChallengeRequest) (*proto.MFAAuthenticateChallenge, error) {
+	isLocalOrRemoteUser := authz.IsLocalOrRemoteUser(a.context)
+
+	// Run preliminary user checks first.
 	switch req.GetRequest().(type) {
 	case *proto.CreateAuthenticateChallengeRequest_UserCredentials:
 	case *proto.CreateAuthenticateChallengeRequest_RecoveryStartTokenID:
 	case *proto.CreateAuthenticateChallengeRequest_Passwordless:
 	default: // nil or *proto.CreateAuthenticateChallengeRequest_ContextUser:
-		if !authz.IsLocalOrRemoteUser(a.context) {
+		if !isLocalOrRemoteUser {
 			return nil, trace.BadParameter("only end users are allowed to issue authentication challenges using ContextUser")
 		}
 	}
 
-	// No permission check is required b/c this request verifies request by one of the following:
+	// Have we been asked to check if MFA is necessary? Resolve that first.
+	//
+	// We run the check in this layer, instead of under Server.IsMFARequired,
+	// because the ServerWithRoles.IsMFARequired variant adds logic of its own.
+	var mfaRequired proto.MFARequired
+	if req.MFARequiredCheck != nil {
+		// Return a nicer error message.
+		if !isLocalOrRemoteUser {
+			return nil, trace.BadParameter("only end users are allowed to supply MFARequiredCheck")
+		}
+
+		mfaRequiredResp, err := a.IsMFARequired(ctx, req.MFARequiredCheck)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+
+		// Exit early if we are certain that MFA is not necessary.
+		if !mfaRequiredResp.Required {
+			return &proto.MFAAuthenticateChallenge{
+				// No challenges provided.
+				MFARequired: mfaRequiredResp.MFARequired,
+			}, nil
+		}
+		mfaRequired = mfaRequiredResp.MFARequired
+	}
+
+	// The following serve as means of authentication for this RPC:
 	//   - username + password, anyone who has user's password can generate a sign request
 	//   - token provide its own auth
 	//   - the user extracted from context can create their own challenges
-	return a.authServer.CreateAuthenticateChallenge(ctx, req)
+	authnChal, err := a.authServer.CreateAuthenticateChallenge(ctx, req)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	// Set MFA requirement queried above, if any.
+	authnChal.MFARequired = mfaRequired
+	return authnChal, nil
 }
 
 // CreatePrivilegeToken is implemented by AuthService.CreatePrivilegeToken.
 func (a *ServerWithRoles) CreatePrivilegeToken(ctx context.Context, req *proto.CreatePrivilegeTokenRequest) (*types.UserTokenV3, error) {
+	// Device trust: authorize device before issuing a privileged token without an MFA response.
+	//
+	// This is an exceptional case for that that results in a "privilege_exception" token, which can
+	// used to register a user's first MFA device thorugh the WebUI. Since a register challenge can
+	// be created on behalf of the user using this token (e.g. by the Proxy Service), we must enforce
+	// the device trust requirement seen in [CreatePrivilegeToken] here instead.
+	if mfaResp := req.GetExistingMFAResponse(); mfaResp.GetTOTP() == nil && mfaResp.GetWebauthn() == nil {
+		if err := a.enforceGlobalModeTrustedDevice(ctx); err != nil {
+			return nil, trace.Wrap(err, "device trust is required for users to create a privileged token without an MFA check")
+		}
+	}
+
 	return a.authServer.CreatePrivilegeToken(ctx, req)
 }
 
 // CreateRegisterChallenge is implemented by AuthService.CreateRegisterChallenge.
 func (a *ServerWithRoles) CreateRegisterChallenge(ctx context.Context, req *proto.CreateRegisterChallengeRequest) (*proto.MFARegisterChallenge, error) {
-	switch {
-	case req.TokenID != "":
-	case req.ExistingMFAResponse != nil:
+	if req.TokenID == "" {
 		if !authz.IsLocalOrRemoteUser(a.context) {
 			return nil, trace.BadParameter("only end users are allowed issue registration challenges without a privilege token")
+		}
+
+		// Device trust: authorize device before issuing a register challenge without an MFA response or privilege token.
+		// This is an exceptional case for users registering their first MFA challenge through `tsh`.
+		if mfaResp := req.GetExistingMFAResponse(); mfaResp.GetTOTP() == nil && mfaResp.GetWebauthn() == nil {
+			if err := a.enforceGlobalModeTrustedDevice(ctx); err != nil {
+				return nil, trace.Wrap(err, "device trust is required for users to register their first MFA device")
+			}
 		}
 	}
 
@@ -6263,6 +6962,18 @@ func (a *ServerWithRoles) CreateRegisterChallenge(ctx context.Context, req *prot
 	//   - privilege token (or equivalent)
 	//   - authenticated user using non-Proxy identity
 	return a.authServer.CreateRegisterChallenge(ctx, req)
+}
+
+// enforceGlobalModeTrustedDevice is used to enforce global device trust requirements
+// for key endpoints.
+func (a *ServerWithRoles) enforceGlobalModeTrustedDevice(ctx context.Context) error {
+	readOnlyAuthPref, err := a.authServer.GetReadOnlyAuthPreference(ctx)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	err = dtauthz.VerifyTLSUser(ctx, readOnlyAuthPref.GetDeviceTrust(), a.context.Identity.GetIdentity())
+	return trace.Wrap(err)
 }
 
 // GetAccountRecoveryCodes is implemented by AuthService.GetAccountRecoveryCodes.
@@ -6277,15 +6988,15 @@ func (a *ServerWithRoles) GetAccountRecoveryCodes(ctx context.Context, req *prot
 //
 //   - Windows desktop service when updating the certificate authority contents
 //     on LDAP.
-//   - Cluster administrator using "tctl auth crl --type=db" command locally
+//   - Cluster administrator using "tctl auth crl --type=db_client" command locally
 //     on the auth server to produce revocation list used to be configured on
 //     external services such as Windows certificate store.
-//   - Remote user using "tctl auth crl --type=db" command with a remote
+//   - Remote user using "tctl auth crl --type=db_client" command with a remote
 //     proxy (e.g. Teleport Cloud), as long as they have permission to read
 //     certificate authorities.
 func (a *ServerWithRoles) GenerateCertAuthorityCRL(ctx context.Context, caType types.CertAuthType) ([]byte, error) {
 	// Assume this is a user request, check if the user has permission to read CAs.
-	err := a.action(apidefaults.Namespace, types.KindCertAuthority, types.VerbReadNoSecrets)
+	err := a.action(types.KindCertAuthority, types.VerbReadNoSecrets)
 	if err != nil {
 		// An error means the user doesn't have permission to read CAs, or this
 		// is an admin on the auth server or the windows desktop service. We
@@ -6309,21 +7020,9 @@ func (a *ServerWithRoles) GenerateCertAuthorityCRL(ctx context.Context, caType t
 	return crl, nil
 }
 
-// UpdatePresence is coupled to the service layer and must exist here but is never actually called
-// since it's handled by the session presence task. This is never valid to call.
-func (a *ServerWithRoles) UpdatePresence(ctx context.Context, sessionID, user string) error {
-	return trace.NotImplemented(notImplementedMessage)
-}
-
-// UpdatePresence is coupled to the service layer and must exist here but is never actually called
-// since it's handled by the session presence task. This is never valid to call.
-func (a *ServerWithRoles) MaintainSessionPresence(ctx context.Context) (proto.AuthService_MaintainSessionPresenceClient, error) {
-	return nil, trace.NotImplemented(notImplementedMessage)
-}
-
 // SubmitUsageEvent submits an external usage event.
 func (a *ServerWithRoles) SubmitUsageEvent(ctx context.Context, req *proto.SubmitUsageEventRequest) error {
-	if err := a.action(apidefaults.Namespace, types.KindUsageEvent, types.VerbCreate); err != nil {
+	if err := a.action(types.KindUsageEvent, types.VerbCreate); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -6336,7 +7035,7 @@ func (a *ServerWithRoles) SubmitUsageEvent(ctx context.Context, req *proto.Submi
 
 // GetLicense returns the license used to start the auth server
 func (a *ServerWithRoles) GetLicense(ctx context.Context) (string, error) {
-	if err := a.action(apidefaults.Namespace, types.KindLicense, types.VerbRead); err != nil {
+	if err := a.action(types.KindLicense, types.VerbRead); err != nil {
 		return "", trace.Wrap(err)
 	}
 	return a.authServer.GetLicense(ctx)
@@ -6344,154 +7043,287 @@ func (a *ServerWithRoles) GetLicense(ctx context.Context) (string, error) {
 
 // ListReleases return Teleport Enterprise releases
 func (a *ServerWithRoles) ListReleases(ctx context.Context) ([]*types.Release, error) {
-	if err := a.action(apidefaults.Namespace, types.KindDownload, types.VerbList); err != nil {
-		return nil, trace.Wrap(err)
+	// on Cloud, any user is allowed to list releases
+	if !modules.GetModules().Features().Cloud {
+		if err := a.action(types.KindDownload, types.VerbList); err != nil {
+			return nil, trace.Wrap(err)
+		}
 	}
 
 	return a.authServer.releaseService.ListReleases(ctx)
 }
 
+// TODO(sshah): set MFARequired for SAML IdP admin actions?
+func (a *ServerWithRoles) checkAccessToSAMLIdPServiceProvider(sp types.SAMLIdPServiceProvider) error {
+	return a.context.Checker.CheckAccess(
+		sp,
+		// MFA is not required for operations on SAML resources but
+		// will be enforced at the connection time.
+		services.AccessState{})
+}
+
 // ListSAMLIdPServiceProviders returns a paginated list of SAML IdP service provider resources.
 func (a *ServerWithRoles) ListSAMLIdPServiceProviders(ctx context.Context, pageSize int, nextToken string) ([]types.SAMLIdPServiceProvider, string, error) {
-	if err := a.action(apidefaults.Namespace, types.KindSAMLIdPServiceProvider, types.VerbList); err != nil {
+	if err := a.action(types.KindSAMLIdPServiceProvider, types.VerbList); err != nil {
 		return nil, "", trace.Wrap(err)
 	}
 
-	return a.authServer.ListSAMLIdPServiceProviders(ctx, pageSize, nextToken)
+	sps, nextKey, err := a.authServer.ListSAMLIdPServiceProviders(ctx, pageSize, nextToken)
+	if err != nil {
+		return nil, "", trace.Wrap(err)
+	}
+
+	// Filter out service providers the caller doesn't have access to.
+	var filtered []types.SAMLIdPServiceProvider
+	for _, sp := range sps {
+		err := a.checkAccessToSAMLIdPServiceProvider(sp)
+		if err != nil && !trace.IsAccessDenied(err) {
+			return nil, "", trace.Wrap(err)
+		} else if err == nil {
+			filtered = append(filtered, sp)
+		}
+
+	}
+	return filtered, nextKey, nil
 }
 
 // GetSAMLIdPServiceProvider returns the specified SAML IdP service provider resources.
 func (a *ServerWithRoles) GetSAMLIdPServiceProvider(ctx context.Context, name string) (types.SAMLIdPServiceProvider, error) {
-	if err := a.action(apidefaults.Namespace, types.KindSAMLIdPServiceProvider, types.VerbRead); err != nil {
+	if err := a.action(types.KindSAMLIdPServiceProvider, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	return a.authServer.GetSAMLIdPServiceProvider(ctx, name)
+	sp, err := a.authServer.GetSAMLIdPServiceProvider(ctx, name)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	if err = a.checkAccessToSAMLIdPServiceProvider(sp); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return sp, nil
 }
 
 // CreateSAMLIdPServiceProvider creates a new SAML IdP service provider resource.
-func (a *ServerWithRoles) CreateSAMLIdPServiceProvider(ctx context.Context, sp types.SAMLIdPServiceProvider) error {
-	code := events.SAMLIdPServiceProviderCreateFailureCode
-	var err error
-	if err = a.action(apidefaults.Namespace, types.KindSAMLIdPServiceProvider, types.VerbCreate); err == nil {
-		err = a.authServer.CreateSAMLIdPServiceProvider(ctx, sp)
-		if err == nil {
-			code = events.SAMLIdPServiceProviderCreateCode
+func (a *ServerWithRoles) CreateSAMLIdPServiceProvider(ctx context.Context, sp types.SAMLIdPServiceProvider) (err error) {
+	defer func() {
+		code := events.SAMLIdPServiceProviderCreateCode
+		if err != nil {
+			code = events.SAMLIdPServiceProviderCreateFailureCode
+		}
+
+		if emitErr := a.authServer.emitter.EmitAuditEvent(a.authServer.closeCtx, &apievents.SAMLIdPServiceProviderCreate{
+			Metadata: apievents.Metadata{
+				Type: events.SAMLIdPServiceProviderCreateEvent,
+				Code: code,
+			},
+			ResourceMetadata: apievents.ResourceMetadata{
+				Name:      sp.GetName(),
+				UpdatedBy: authz.ClientUsername(ctx),
+			},
+			SAMLIdPServiceProviderMetadata: apievents.SAMLIdPServiceProviderMetadata{
+				ServiceProviderEntityID: sp.GetEntityID(),
+				AttributeMapping:        typesAttrMapToEventAttrMap(sp.GetAttributeMapping()),
+			},
+		}); emitErr != nil {
+			a.authServer.logger.WarnContext(ctx, "Failed to emit SAML IdP service provider created event", "error", emitErr)
+		}
+	}()
+
+	if err = a.action(types.KindSAMLIdPServiceProvider, types.VerbCreate); err != nil {
+		return trace.Wrap(err)
+	}
+
+	// Support reused MFA for bulk tctl create requests.
+	if err = a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return trace.Wrap(err)
+	}
+
+	if err = a.checkAccessToSAMLIdPServiceProvider(sp); err != nil {
+		return trace.Wrap(err)
+	}
+
+	if err := services.ValidateSAMLIdPACSURLAndRelayStateInputs(sp); err != nil {
+		return trace.Wrap(err)
+	}
+
+	if sp.GetEntityDescriptor() != "" {
+		if err := services.ValidateAndFilterEntityDescriptor(sp, services.SAMLACSInputStrictFilter); err != nil {
+			return trace.Wrap(err)
 		}
 	}
 
-	if emitErr := a.authServer.emitter.EmitAuditEvent(a.authServer.closeCtx, &apievents.SAMLIdPServiceProviderCreate{
-		Metadata: apievents.Metadata{
-			Type: events.SAMLIdPServiceProviderCreateEvent,
-			Code: code,
-		},
-		ResourceMetadata: apievents.ResourceMetadata{
-			Name:      sp.GetName(),
-			UpdatedBy: authz.ClientUsername(ctx),
-		},
-		SAMLIdPServiceProviderMetadata: apievents.SAMLIdPServiceProviderMetadata{
-			ServiceProviderEntityID: sp.GetEntityID(),
-		},
-	}); emitErr != nil {
-		log.WithError(trace.NewAggregate(emitErr, err)).Warn("Failed to emit SAML IdP service provider created event.")
-	}
-
+	err = a.authServer.CreateSAMLIdPServiceProvider(ctx, sp)
 	return trace.Wrap(err)
 }
 
 // UpdateSAMLIdPServiceProvider updates an existing SAML IdP service provider resource.
-func (a *ServerWithRoles) UpdateSAMLIdPServiceProvider(ctx context.Context, sp types.SAMLIdPServiceProvider) error {
-	code := events.SAMLIdPServiceProviderUpdateFailureCode
-	var err error
-	if err = a.action(apidefaults.Namespace, types.KindSAMLIdPServiceProvider, types.VerbUpdate); err == nil {
-		err = a.authServer.UpdateSAMLIdPServiceProvider(ctx, sp)
-		if err == nil {
-			code = events.SAMLIdPServiceProviderUpdateCode
+func (a *ServerWithRoles) UpdateSAMLIdPServiceProvider(ctx context.Context, sp types.SAMLIdPServiceProvider) (err error) {
+	defer func() {
+		code := events.SAMLIdPServiceProviderUpdateCode
+		if err != nil {
+			code = events.SAMLIdPServiceProviderUpdateFailureCode
 		}
+
+		if emitErr := a.authServer.emitter.EmitAuditEvent(a.authServer.closeCtx, &apievents.SAMLIdPServiceProviderUpdate{
+			Metadata: apievents.Metadata{
+				Type: events.SAMLIdPServiceProviderUpdateEvent,
+				Code: code,
+			},
+			ResourceMetadata: apievents.ResourceMetadata{
+				Name:      sp.GetName(),
+				UpdatedBy: authz.ClientUsername(ctx),
+			},
+			SAMLIdPServiceProviderMetadata: apievents.SAMLIdPServiceProviderMetadata{
+				ServiceProviderEntityID: sp.GetEntityID(),
+				AttributeMapping:        typesAttrMapToEventAttrMap(sp.GetAttributeMapping()),
+			},
+		}); emitErr != nil {
+			a.authServer.logger.WarnContext(ctx, "Failed to emit SAML IdP service provider updated event", "error", emitErr)
+		}
+	}()
+
+	if err := a.action(types.KindSAMLIdPServiceProvider, types.VerbUpdate); err != nil {
+		return trace.Wrap(err)
 	}
 
-	if emitErr := a.authServer.emitter.EmitAuditEvent(a.authServer.closeCtx, &apievents.SAMLIdPServiceProviderUpdate{
-		Metadata: apievents.Metadata{
-			Type: events.SAMLIdPServiceProviderUpdateEvent,
-			Code: code,
-		},
-		ResourceMetadata: apievents.ResourceMetadata{
-			Name:      sp.GetName(),
-			UpdatedBy: authz.ClientUsername(ctx),
-		},
-		SAMLIdPServiceProviderMetadata: apievents.SAMLIdPServiceProviderMetadata{
-			ServiceProviderEntityID: sp.GetEntityID(),
-		},
-	}); emitErr != nil {
-		log.WithError(trace.NewAggregate(emitErr, err)).Warn("Failed to emit SAML IdP service provider updated event.")
+	// Support reused MFA for bulk tctl create requests.
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return trace.Wrap(err)
 	}
 
+	existingSP, err := a.authServer.GetSAMLIdPServiceProvider(ctx, sp.GetName())
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	if err = a.checkAccessToSAMLIdPServiceProvider(existingSP); err != nil {
+		return trace.Wrap(err)
+	}
+	if err = a.checkAccessToSAMLIdPServiceProvider(sp); err != nil {
+		return trace.Wrap(err)
+	}
+
+	if err := services.ValidateSAMLIdPACSURLAndRelayStateInputs(sp); err != nil {
+		return trace.Wrap(err)
+	}
+
+	if err := services.ValidateAndFilterEntityDescriptor(sp, services.SAMLACSInputStrictFilter); err != nil {
+		return trace.Wrap(err)
+	}
+
+	err = a.authServer.UpdateSAMLIdPServiceProvider(ctx, sp)
 	return trace.Wrap(err)
 }
 
+func typesAttrMapToEventAttrMap(attributeMapping []*types.SAMLAttributeMapping) map[string]string {
+	amap := make(map[string]string, len(attributeMapping))
+	for _, attribute := range attributeMapping {
+		amap[attribute.Name] = attribute.Value
+	}
+	return amap
+}
+
 // DeleteSAMLIdPServiceProvider removes the specified SAML IdP service provider resource.
-func (a *ServerWithRoles) DeleteSAMLIdPServiceProvider(ctx context.Context, name string) error {
+func (a *ServerWithRoles) DeleteSAMLIdPServiceProvider(ctx context.Context, name string) (err error) {
 	var entityID string
-	code := events.SAMLIdPServiceProviderDeleteFailureCode
-	var err error
-	if err = a.action(apidefaults.Namespace, types.KindSAMLIdPServiceProvider, types.VerbDelete); err == nil {
-		var sp types.SAMLIdPServiceProvider
-		// Get the service provider so we can emit its entity ID later.
-		sp, err = a.authServer.GetSAMLIdPServiceProvider(ctx, name)
-		if err == nil {
-			name = sp.GetName()
-			entityID = sp.GetEntityID()
-
-			// Delete the actual service provider.
-			err = a.authServer.DeleteSAMLIdPServiceProvider(ctx, name)
-			if err == nil {
-				code = events.SAMLIdPServiceProviderDeleteCode
-			}
+	defer func() {
+		code := events.SAMLIdPServiceProviderDeleteCode
+		if err != nil {
+			code = events.SAMLIdPServiceProviderDeleteFailureCode
 		}
+
+		if emitErr := a.authServer.emitter.EmitAuditEvent(a.authServer.closeCtx, &apievents.SAMLIdPServiceProviderDelete{
+			Metadata: apievents.Metadata{
+				Type: events.SAMLIdPServiceProviderDeleteEvent,
+				Code: code,
+			},
+			ResourceMetadata: apievents.ResourceMetadata{
+				Name:      name,
+				UpdatedBy: authz.ClientUsername(ctx),
+			},
+			SAMLIdPServiceProviderMetadata: apievents.SAMLIdPServiceProviderMetadata{
+				ServiceProviderEntityID: entityID,
+			},
+		}); emitErr != nil {
+			a.authServer.logger.WarnContext(ctx, "Failed to emit SAML IdP service provider deleted event", "error", emitErr)
+		}
+	}()
+
+	if err := a.action(types.KindSAMLIdPServiceProvider, types.VerbDelete); err != nil {
+		return trace.Wrap(err)
 	}
 
-	if emitErr := a.authServer.emitter.EmitAuditEvent(a.authServer.closeCtx, &apievents.SAMLIdPServiceProviderDelete{
-		Metadata: apievents.Metadata{
-			Type: events.SAMLIdPServiceProviderDeleteEvent,
-			Code: code,
-		},
-		ResourceMetadata: apievents.ResourceMetadata{
-			Name:      name,
-			UpdatedBy: authz.ClientUsername(ctx),
-		},
-		SAMLIdPServiceProviderMetadata: apievents.SAMLIdPServiceProviderMetadata{
-			ServiceProviderEntityID: entityID,
-		},
-	}); emitErr != nil {
-		log.WithError(trace.NewAggregate(emitErr, err)).Warn("Failed to emit SAML IdP service provider deleted event.")
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
+		return trace.Wrap(err)
 	}
 
+	// Get the service provider so we can emit its entity ID later.
+	sp, err := a.authServer.GetSAMLIdPServiceProvider(ctx, name)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	if err = a.checkAccessToSAMLIdPServiceProvider(sp); err != nil {
+		return trace.Wrap(err)
+	}
+
+	name = sp.GetName()
+	entityID = sp.GetEntityID()
+
+	// Delete the actual service provider.
+	err = a.authServer.DeleteSAMLIdPServiceProvider(ctx, name)
 	return trace.Wrap(err)
 }
 
 // DeleteAllSAMLIdPServiceProviders removes all SAML IdP service providers.
-func (a *ServerWithRoles) DeleteAllSAMLIdPServiceProviders(ctx context.Context) error {
-	code := events.SAMLIdPServiceProviderDeleteAllFailureCode
-	var err error
-	if err = a.action(apidefaults.Namespace, types.KindSAMLIdPServiceProvider, types.VerbDelete); err == nil {
-		err = a.authServer.DeleteAllSAMLIdPServiceProviders(ctx)
-		if err == nil {
-			code = events.SAMLIdPServiceProviderDeleteAllCode
+// Returns without deleting any resource if user role denies access to any one of the listed resource.
+func (a *ServerWithRoles) DeleteAllSAMLIdPServiceProviders(ctx context.Context) (err error) {
+	defer func() {
+		code := events.SAMLIdPServiceProviderDeleteAllCode
+		if err != nil {
+			code = events.SAMLIdPServiceProviderDeleteAllFailureCode
 		}
+
+		if emitErr := a.authServer.emitter.EmitAuditEvent(a.authServer.closeCtx, &apievents.SAMLIdPServiceProviderDeleteAll{
+			Metadata: apievents.Metadata{
+				Type: events.SAMLIdPServiceProviderDeleteAllEvent,
+				Code: code,
+			},
+			ResourceMetadata: apievents.ResourceMetadata{
+				UpdatedBy: authz.ClientUsername(ctx),
+			},
+		}); emitErr != nil {
+			a.authServer.logger.WarnContext(ctx, "Failed to emit SAML IdP service provider deleted all event", "error", emitErr)
+		}
+	}()
+
+	if err := a.action(types.KindSAMLIdPServiceProvider, types.VerbDelete); err != nil {
+		return trace.Wrap(err)
 	}
 
-	if emitErr := a.authServer.emitter.EmitAuditEvent(a.authServer.closeCtx, &apievents.SAMLIdPServiceProviderDeleteAll{
-		Metadata: apievents.Metadata{
-			Type: events.SAMLIdPServiceProviderDeleteAllEvent,
-			Code: code,
-		},
-		ResourceMetadata: apievents.ResourceMetadata{
-			UpdatedBy: authz.ClientUsername(ctx),
-		},
-	}); emitErr != nil {
-		log.WithError(trace.NewAggregate(emitErr, err)).Warn("Failed to emit SAML IdP service provider deleted all event.")
+	if err := a.context.AuthorizeAdminAction(); err != nil {
+		return trace.Wrap(err)
 	}
 
+	var startKey string
+	for {
+		sps, nextKey, err := a.authServer.ListSAMLIdPServiceProviders(ctx, apidefaults.DefaultChunkSize, startKey)
+		if err != nil {
+			return trace.Wrap(err)
+		}
+		for _, sp := range sps {
+			if err := a.checkAccessToSAMLIdPServiceProvider(sp); err != nil {
+				return trace.Wrap(err)
+			}
+		}
+		if nextKey == "" {
+			break
+		}
+		startKey = nextKey
+	}
+
+	err = a.authServer.DeleteAllSAMLIdPServiceProviders(ctx)
 	return trace.Wrap(err)
 }
 
@@ -6504,7 +7336,7 @@ func (a *ServerWithRoles) checkAccessToUserGroup(userGroup types.UserGroup) erro
 
 // ListUserGroups returns a paginated list of user group resources.
 func (a *ServerWithRoles) ListUserGroups(ctx context.Context, pageSize int, nextToken string) ([]types.UserGroup, string, error) {
-	if err := a.action(apidefaults.Namespace, types.KindUserGroup, types.VerbList); err != nil {
+	if err := a.action(types.KindUserGroup, types.VerbList); err != nil {
 		return nil, "", trace.Wrap(err)
 	}
 
@@ -6550,7 +7382,7 @@ func (a *ServerWithRoles) ListUserGroups(ctx context.Context, pageSize int, next
 
 // GetUserGroup returns the specified user group resources.
 func (a *ServerWithRoles) GetUserGroup(ctx context.Context, name string) (types.UserGroup, error) {
-	if err := a.action(apidefaults.Namespace, types.KindUserGroup, types.VerbRead); err != nil {
+	if err := a.action(types.KindUserGroup, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
@@ -6568,7 +7400,11 @@ func (a *ServerWithRoles) GetUserGroup(ctx context.Context, name string) (types.
 
 // CreateUserGroup creates a new user group resource.
 func (a *ServerWithRoles) CreateUserGroup(ctx context.Context, userGroup types.UserGroup) error {
-	if err := a.action(apidefaults.Namespace, types.KindUserGroup, types.VerbCreate); err != nil {
+	if err := a.action(types.KindUserGroup, types.VerbCreate); err != nil {
+		return trace.Wrap(err)
+	}
+
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -6581,7 +7417,11 @@ func (a *ServerWithRoles) CreateUserGroup(ctx context.Context, userGroup types.U
 
 // UpdateUserGroup updates an existing user group resource.
 func (a *ServerWithRoles) UpdateUserGroup(ctx context.Context, userGroup types.UserGroup) error {
-	if err := a.action(apidefaults.Namespace, types.KindUserGroup, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindUserGroup, types.VerbUpdate); err != nil {
+		return trace.Wrap(err)
+	}
+
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -6599,7 +7439,11 @@ func (a *ServerWithRoles) UpdateUserGroup(ctx context.Context, userGroup types.U
 
 // DeleteUserGroup removes the specified user group resource.
 func (a *ServerWithRoles) DeleteUserGroup(ctx context.Context, name string) error {
-	if err := a.action(apidefaults.Namespace, types.KindUserGroup, types.VerbDelete); err != nil {
+	if err := a.action(types.KindUserGroup, types.VerbDelete); err != nil {
+		return trace.Wrap(err)
+	}
+
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -6617,7 +7461,11 @@ func (a *ServerWithRoles) DeleteUserGroup(ctx context.Context, name string) erro
 
 // DeleteAllUserGroups removes all user groups.
 func (a *ServerWithRoles) DeleteAllUserGroups(ctx context.Context) error {
-	if err := a.action(apidefaults.Namespace, types.KindUserGroup, types.VerbDelete); err != nil {
+	if err := a.action(types.KindUserGroup, types.VerbDelete); err != nil {
+		return trace.Wrap(err)
+	}
+
+	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -6626,7 +7474,7 @@ func (a *ServerWithRoles) DeleteAllUserGroups(ctx context.Context) error {
 
 // GetHeadlessAuthentication gets a headless authentication from the backend.
 func (a *ServerWithRoles) GetHeadlessAuthentication(ctx context.Context, name string) (*types.HeadlessAuthentication, error) {
-	if !hasLocalUserRole(a.context) {
+	if !authz.IsLocalUser(a.context) {
 		return nil, trace.AccessDenied("non-local user roles cannot get headless authentication resources")
 	}
 	username := a.context.User.GetName()
@@ -6641,7 +7489,7 @@ func (a *ServerWithRoles) GetHeadlessAuthentication(ctx context.Context, name st
 // GetHeadlessAuthenticationFromWatcher gets a headless authentication from the headless
 // authentication watcher.
 func (a *ServerWithRoles) GetHeadlessAuthenticationFromWatcher(ctx context.Context, name string) (*types.HeadlessAuthentication, error) {
-	if !hasLocalUserRole(a.context) {
+	if !authz.IsLocalUser(a.context) {
 		return nil, trace.AccessDenied("non-local user roles cannot get headless authentication resources")
 	}
 	username := a.context.User.GetName()
@@ -6659,7 +7507,7 @@ func (a *ServerWithRoles) GetHeadlessAuthenticationFromWatcher(ctx context.Conte
 // look for this stub before inserting the headless authentication resource into the
 // backend as a form of indirect authorization.
 func (a *ServerWithRoles) UpsertHeadlessAuthenticationStub(ctx context.Context) error {
-	if !hasLocalUserRole(a.context) {
+	if !authz.IsLocalUser(a.context) {
 		return trace.AccessDenied("non-local user roles cannot create headless authentication stubs")
 	}
 	username := a.context.User.GetName()
@@ -6670,7 +7518,7 @@ func (a *ServerWithRoles) UpsertHeadlessAuthenticationStub(ctx context.Context) 
 
 // UpdateHeadlessAuthenticationState updates a headless authentication state.
 func (a *ServerWithRoles) UpdateHeadlessAuthenticationState(ctx context.Context, name string, state types.HeadlessAuthenticationState, mfaResp *proto.MFAAuthenticateResponse) error {
-	if !hasLocalUserRole(a.context) {
+	if !authz.IsLocalUser(a.context) {
 		return trace.AccessDenied("non-local user roles cannot approve or deny headless authentication resources")
 	}
 	username := a.context.User.GetName()
@@ -6688,31 +7536,44 @@ func (a *ServerWithRoles) UpdateHeadlessAuthenticationState(ctx context.Context,
 	replaceHeadlessAuthn := *headlessAuthn
 	replaceHeadlessAuthn.State = state
 
+	eventCode := ""
 	switch state {
 	case types.HeadlessAuthenticationState_HEADLESS_AUTHENTICATION_STATE_APPROVED:
 		// The user must authenticate with MFA to change the state to approved.
 		if mfaResp == nil {
-			return trace.BadParameter("expected MFA auth challenge response")
+			err = trace.BadParameter("expected MFA auth challenge response")
+			emitHeadlessLoginEvent(ctx, events.UserHeadlessLoginApprovedFailureCode, a.authServer.emitter, headlessAuthn, err)
+			return err
 		}
 
 		// Only WebAuthn is supported in headless login flow for superior phishing prevention.
 		if _, ok := mfaResp.Response.(*proto.MFAAuthenticateResponse_Webauthn); !ok {
-			return trace.BadParameter("expected WebAuthn challenge response, but got %T", mfaResp.Response)
+			err = trace.BadParameter("expected WebAuthn challenge response, but got %T", mfaResp.Response)
+			emitHeadlessLoginEvent(ctx, events.UserHeadlessLoginApprovedFailureCode, a.authServer.emitter, headlessAuthn, err)
+			return err
 		}
 
-		mfaDevice, _, err := a.authServer.validateMFAAuthResponse(ctx, mfaResp, headlessAuthn.User, false /* passwordless */)
+		requiredExt := &mfav1.ChallengeExtensions{Scope: mfav1.ChallengeScope_CHALLENGE_SCOPE_HEADLESS_LOGIN}
+		mfaData, err := a.authServer.ValidateMFAAuthResponse(ctx, mfaResp, headlessAuthn.User, requiredExt)
 		if err != nil {
+			emitHeadlessLoginEvent(ctx, events.UserHeadlessLoginApprovedFailureCode, a.authServer.emitter, headlessAuthn, err)
 			return trace.Wrap(err)
 		}
 
-		replaceHeadlessAuthn.MfaDevice = mfaDevice
+		replaceHeadlessAuthn.MfaDevice = mfaData.Device
+		eventCode = events.UserHeadlessLoginApprovedCode
 	case types.HeadlessAuthenticationState_HEADLESS_AUTHENTICATION_STATE_DENIED:
+		eventCode = events.UserHeadlessLoginRejectedCode
 		// continue to compare and swap without MFA.
 	default:
 		return trace.AccessDenied("cannot update a headless authentication state to %v", state.String())
 	}
 
 	_, err = a.authServer.CompareAndSwapHeadlessAuthentication(ctx, headlessAuthn, &replaceHeadlessAuthn)
+	if err != nil && eventCode == events.UserHeadlessLoginApprovedCode {
+		eventCode = events.UserHeadlessLoginApprovedFailureCode
+	}
+	emitHeadlessLoginEvent(ctx, eventCode, a.authServer.emitter, headlessAuthn, err)
 	return trace.Wrap(err)
 }
 
@@ -6720,7 +7581,7 @@ func (a *ServerWithRoles) UpdateHeadlessAuthenticationState(ctx context.Context,
 // Headless login processes will look for this stub before inserting the headless authentication
 // resource into the backend as a form of indirect authorization.
 func (a *ServerWithRoles) MaintainHeadlessAuthenticationStub(ctx context.Context) error {
-	if !hasLocalUserRole(a.context) {
+	if !authz.IsLocalUser(a.context) {
 		return trace.AccessDenied("non-local user roles cannot create headless authentication stubs")
 	}
 	username := a.context.User.GetName()
@@ -6731,7 +7592,7 @@ func (a *ServerWithRoles) MaintainHeadlessAuthenticationStub(ctx context.Context
 		return trace.Wrap(err)
 	}
 
-	ticker := time.NewTicker(defaults.CallbackTimeout)
+	ticker := time.NewTicker(defaults.HeadlessLoginTimeout)
 	defer ticker.Stop()
 
 	for {
@@ -6748,7 +7609,7 @@ func (a *ServerWithRoles) MaintainHeadlessAuthenticationStub(ctx context.Context
 
 // WatchPendingHeadlessAuthentications creates a watcher for pending headless authentication for the current user.
 func (a *ServerWithRoles) WatchPendingHeadlessAuthentications(ctx context.Context) (types.Watcher, error) {
-	if !hasLocalUserRole(a.context) {
+	if !authz.IsLocalUser(a.context) {
 		return nil, trace.AccessDenied("non-local user roles cannot watch headless authentications")
 	}
 	username := a.context.User.GetName()
@@ -6768,56 +7629,6 @@ func (a *ServerWithRoles) WatchPendingHeadlessAuthentications(ctx context.Contex
 	})
 }
 
-// CreateAssistantConversation creates a new conversation entry in the backend.
-func (a *ServerWithRoles) CreateAssistantConversation(ctx context.Context, req *assist.CreateAssistantConversationRequest) (*assist.CreateAssistantConversationResponse, error) {
-	return nil, trace.NotImplemented("CreateAssistantConversation must not be called on auth.ServerWithRoles")
-}
-
-// GetAssistantConversations returns all conversations started by a user.
-func (a *ServerWithRoles) GetAssistantConversations(ctx context.Context, request *assist.GetAssistantConversationsRequest) (*assist.GetAssistantConversationsResponse, error) {
-	return nil, trace.NotImplemented("GetAssistantConversations must not be called on auth.ServerWithRoles")
-}
-
-// GetAssistantMessages returns all messages with given conversation ID.
-func (a *ServerWithRoles) GetAssistantMessages(ctx context.Context, req *assist.GetAssistantMessagesRequest) (*assist.GetAssistantMessagesResponse, error) {
-	return nil, trace.NotImplemented("GetAssistantMessages must not be called on auth.ServerWithRoles")
-}
-
-// DeleteAssistantConversation deletes a conversation by ID.
-func (a *ServerWithRoles) DeleteAssistantConversation(ctx context.Context, req *assist.DeleteAssistantConversationRequest) error {
-	return trace.NotImplemented("DeleteAssistantConversation must not be called on auth.ServerWithRoles")
-}
-
-// IsAssistEnabled returns true if the assist is enabled or not on the auth level.
-func (a *ServerWithRoles) IsAssistEnabled(ctx context.Context) (*assist.IsAssistEnabledResponse, error) {
-	return nil, trace.NotImplemented("IsAssistEnabled must not be called on auth.ServerWithRoles")
-}
-
-// CreateAssistantMessage adds the message to the backend.
-func (a *ServerWithRoles) CreateAssistantMessage(ctx context.Context, msg *assist.CreateAssistantMessageRequest) error {
-	return trace.NotImplemented("CreateAssistantMessage must not be called on auth.ServerWithRoles")
-}
-
-// UpdateAssistantConversationInfo updates the conversation info.
-func (a *ServerWithRoles) UpdateAssistantConversationInfo(ctx context.Context, msg *assist.UpdateAssistantConversationInfoRequest) error {
-	return trace.NotImplemented("UpdateAssistantConversationInfo must not be called on auth.ServerWithRoles")
-}
-
-// GetUserPreferences returns the user preferences for a given user.
-func (a *ServerWithRoles) GetUserPreferences(ctx context.Context, req *userpreferencespb.GetUserPreferencesRequest) (*userpreferencespb.GetUserPreferencesResponse, error) {
-	return nil, trace.NotImplemented("GetUserPreferences must not be called on auth.ServerWithRoles")
-}
-
-// UpsertUserPreferences creates or updates user preferences for a given username.
-func (a *ServerWithRoles) UpsertUserPreferences(ctx context.Context, req *userpreferencespb.UpsertUserPreferencesRequest) error {
-	return trace.NotImplemented("UpsertUserPreferences must not be called on auth.ServerWithRoles")
-}
-
-// CloneHTTPClient creates a new HTTP client with the same configuration.
-func (a *ServerWithRoles) CloneHTTPClient(params ...roundtrip.ClientParam) (*HTTPClient, error) {
-	return nil, trace.NotImplemented("not implemented")
-}
-
 // ExportUpgradeWindows is used to load derived upgrade window values for agents that
 // need to export schedules to external upgraders.
 func (a *ServerWithRoles) ExportUpgradeWindows(ctx context.Context, req proto.ExportUpgradeWindowsRequest) (proto.ExportUpgradeWindowsResponse, error) {
@@ -6832,7 +7643,7 @@ func (a *ServerWithRoles) ExportUpgradeWindows(ctx context.Context, req proto.Ex
 
 // GetClusterMaintenanceConfig gets the current maintenance config singleton.
 func (a *ServerWithRoles) GetClusterMaintenanceConfig(ctx context.Context) (types.ClusterMaintenanceConfig, error) {
-	if err := a.action(apidefaults.Namespace, types.KindClusterMaintenanceConfig, types.VerbRead); err != nil {
+	if err := a.action(types.KindClusterMaintenanceConfig, types.VerbRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
@@ -6841,7 +7652,7 @@ func (a *ServerWithRoles) GetClusterMaintenanceConfig(ctx context.Context) (type
 
 // UpdateClusterMaintenanceConfig updates the current maintenance config singleton.
 func (a *ServerWithRoles) UpdateClusterMaintenanceConfig(ctx context.Context, cmc types.ClusterMaintenanceConfig) error {
-	if err := a.action(apidefaults.Namespace, types.KindClusterMaintenanceConfig, types.VerbCreate, types.VerbUpdate); err != nil {
+	if err := a.action(types.KindClusterMaintenanceConfig, types.VerbCreate, types.VerbUpdate); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -6855,7 +7666,7 @@ func (a *ServerWithRoles) UpdateClusterMaintenanceConfig(ctx context.Context, cm
 }
 
 func (a *ServerWithRoles) DeleteClusterMaintenanceConfig(ctx context.Context) error {
-	if err := a.action(apidefaults.Namespace, types.KindClusterMaintenanceConfig, types.VerbDelete); err != nil {
+	if err := a.action(types.KindClusterMaintenanceConfig, types.VerbDelete); err != nil {
 		return trace.Wrap(err)
 	}
 	if modules.GetModules().Features().Cloud {
@@ -6867,18 +7678,47 @@ func (a *ServerWithRoles) DeleteClusterMaintenanceConfig(ctx context.Context) er
 	return a.authServer.DeleteClusterMaintenanceConfig(ctx)
 }
 
-// NewAdminAuthServer returns auth server authorized as admin,
-// used for auth server cached access
-func NewAdminAuthServer(authServer *Server, alog events.AuditLogSessionStreamer) (ClientI, error) {
-	ctx, err := authz.NewAdminContext()
-	if err != nil {
-		return nil, trace.Wrap(err)
+func emitHeadlessLoginEvent(ctx context.Context, code string, emitter apievents.Emitter, headlessAuthn *types.HeadlessAuthentication, err error) {
+	clientAddr := ""
+	if code == events.UserHeadlessLoginRequestedCode {
+		clientAddr = headlessAuthn.ClientIpAddress
+	} else if c, err := authz.ClientSrcAddrFromContext(ctx); err == nil {
+		clientAddr = c.String()
 	}
-	return &ServerWithRoles{
-		authServer: authServer,
-		context:    *ctx,
-		alog:       alog,
-	}, nil
+
+	message := ""
+	if code != events.UserHeadlessLoginRequestedCode {
+		// For events.UserHeadlessLoginRequestedCode remote.addr will be the IP of requester.
+		// For other events that IP will be different because user will be approving the request from another machine,
+		// so we mentioned requester IP in the message.
+		message = fmt.Sprintf("Headless login was requested from the address %s", headlessAuthn.ClientIpAddress)
+	}
+	errorMessage := ""
+	if err != nil {
+		errorMessage = trace.Unwrap(err).Error()
+	}
+	event := apievents.UserLogin{
+		Metadata: apievents.Metadata{
+			Type: events.UserLoginEvent,
+			Code: code,
+		},
+		Method: events.LoginMethodHeadless,
+		UserMetadata: apievents.UserMetadata{
+			User: headlessAuthn.User,
+		},
+		ConnectionMetadata: apievents.ConnectionMetadata{
+			RemoteAddr: clientAddr,
+		},
+		Status: apievents.Status{
+			Success:     code == events.UserHeadlessLoginApprovedCode,
+			UserMessage: message,
+			Error:       errorMessage,
+		},
+	}
+
+	if emitErr := emitter.EmitAuditEvent(ctx, &event); emitErr != nil {
+		logger.WarnContext(ctx, "Failed to emit headless login event", "event_code", code, "error", emitErr)
+	}
 }
 
 func emitSSOLoginFailureEvent(ctx context.Context, emitter apievents.Emitter, method string, err error, testFlow bool) {
@@ -6901,7 +7741,11 @@ func emitSSOLoginFailureEvent(ctx context.Context, emitter apievents.Emitter, me
 	})
 
 	if emitErr != nil {
-		log.WithError(err).Warnf("Failed to emit %v login failure event.", method)
+		logger.WarnContext(ctx, "Failed to emit sso login event",
+			"sso_method", method,
+			"event_code", code,
+			"error", emitErr,
+		)
 	}
 }
 
@@ -6913,4 +7757,48 @@ func verbsToReplaceResourceWithOrigin(stored types.ResourceWithOrigin) []string 
 		verbs = append(verbs, types.VerbCreate)
 	}
 	return verbs
+}
+
+// checkOktaLockTarget prevents the okta service from locking users that are not
+// controlled by the Okta service.
+func checkOktaLockTarget(ctx context.Context, authzCtx *authz.Context, users services.UserGetter, lock types.Lock) error {
+	const errorMsg = "Okta service may only lock okta user"
+
+	if !authz.HasBuiltinRole(*authzCtx, string(types.RoleOkta)) {
+		return nil
+	}
+
+	target := lock.Target()
+	switch {
+	case !target.Equals(types.LockTarget{User: target.User}):
+		return trace.BadParameter(errorMsg)
+
+	case target.User == "":
+		return trace.BadParameter(errorMsg)
+	}
+
+	targetUser, err := users.GetUser(ctx, target.User, false /* withSecrets */)
+	if err != nil {
+		if trace.IsNotFound(err) {
+			return trace.AccessDenied(errorMsg)
+		}
+		return trace.Wrap(err)
+	}
+
+	if targetUser.Origin() != types.OriginOkta {
+		return trace.AccessDenied(errorMsg)
+	}
+
+	return nil
+}
+
+// checkOktaLockAccess gates access to update operations on lock records based
+// on the origin label on the supplied user record.
+func checkOktaLockAccess(ctx context.Context, authzCtx *authz.Context, locks services.LockGetter, existingLockName string, verb string) error {
+	existingLock, err := locks.GetLock(ctx, existingLockName)
+	if err != nil && !trace.IsNotFound(err) {
+		return trace.Wrap(err)
+	}
+
+	return okta.CheckAccess(authzCtx, existingLock, verb)
 }

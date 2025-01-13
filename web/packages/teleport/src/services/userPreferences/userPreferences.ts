@@ -1,49 +1,87 @@
 /**
- * Copyright 2023 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
+
+import { ClusterUserPreferences } from 'gen-proto-ts/teleport/userpreferences/v1/cluster_preferences_pb';
+import { OnboardUserPreferences } from 'gen-proto-ts/teleport/userpreferences/v1/onboard_pb';
+import { SideNavDrawerMode } from 'gen-proto-ts/teleport/userpreferences/v1/sidenav_preferences_pb';
+import { Theme } from 'gen-proto-ts/teleport/userpreferences/v1/theme_pb';
+import {
+  AvailableResourceMode,
+  DefaultTab,
+  LabelsViewMode,
+  UnifiedResourcePreferences,
+  ViewMode,
+} from 'gen-proto-ts/teleport/userpreferences/v1/unified_resource_preferences_pb';
+import { UserPreferences } from 'gen-proto-ts/teleport/userpreferences/v1/userpreferences_pb';
 
 import cfg from 'teleport/config';
 import api from 'teleport/services/api';
+import { getPrefersDark } from 'teleport/ThemeProvider';
 
-import { ViewMode } from 'teleport/Assist/types';
-import { ThemePreference } from 'teleport/services/userPreferences/types';
+interface BackendClusterUserPreferences {
+  pinnedResources?: string[];
+}
 
-import type {
-  GetUserPreferencesResponse,
-  UserPreferences,
-} from 'teleport/services/userPreferences/types';
+export interface BackendUserPreferences {
+  theme: Theme;
+  sideNavDrawerMode: SideNavDrawerMode;
+  onboard?: OnboardUserPreferences;
+  clusterPreferences?: BackendClusterUserPreferences;
+  unifiedResourcePreferences?: UnifiedResourcePreferences;
+}
 
-export async function getUserPreferences() {
-  const res: GetUserPreferencesResponse = await api.get(
+export async function getUserPreferences(): Promise<UserPreferences> {
+  const res: BackendUserPreferences = await api.get(
     cfg.api.userPreferencesPath
   );
 
-  return res;
+  return convertBackendUserPreferences(res);
+}
+
+export async function getUserClusterPreferences(
+  clusterId: string
+): Promise<ClusterUserPreferences> {
+  return await api
+    .get(cfg.getUserClusterPreferencesUrl(clusterId))
+    .then(convertBackendClusterUserPreferences);
+}
+
+export function updateUserClusterPreferences(
+  clusterId: string,
+  preferences: UserPreferences
+) {
+  return api.put(
+    cfg.getUserClusterPreferencesUrl(clusterId),
+    convertUserPreferences(preferences)
+  );
 }
 
 export function updateUserPreferences(preferences: Partial<UserPreferences>) {
-  return api.put(cfg.api.userPreferencesPath, preferences);
+  return api.put(
+    cfg.api.userPreferencesPath,
+    convertUserPreferences(preferences as UserPreferences)
+  );
 }
 
 export function makeDefaultUserPreferences(): UserPreferences {
+  const prefersDark = getPrefersDark();
   return {
-    theme: ThemePreference.Light,
-    assist: {
-      viewMode: ViewMode.Docked,
-      preferredLogins: [],
-    },
+    theme: prefersDark ? Theme.DARK : Theme.LIGHT,
     onboard: {
       preferredResources: [],
       marketingParams: {
@@ -53,5 +91,68 @@ export function makeDefaultUserPreferences(): UserPreferences {
         intent: '',
       },
     },
+    unifiedResourcePreferences: {
+      defaultTab: DefaultTab.ALL,
+      viewMode: ViewMode.CARD,
+      labelsViewMode: LabelsViewMode.COLLAPSED,
+      availableResourceMode: AvailableResourceMode.ALL,
+    },
+    clusterPreferences: makeDefaultUserClusterPreferences(),
+    sideNavDrawerMode: SideNavDrawerMode.COLLAPSED,
   };
+}
+
+export function makeDefaultUserClusterPreferences(): ClusterUserPreferences {
+  return {
+    pinnedResources: {
+      resourceIds: [],
+    },
+  };
+}
+
+export function convertUserPreferences(
+  preferences: UserPreferences
+): BackendUserPreferences {
+  return {
+    ...preferences,
+    clusterPreferences: {
+      ...preferences.clusterPreferences,
+      pinnedResources:
+        preferences.clusterPreferences?.pinnedResources?.resourceIds ?? [],
+    },
+  };
+}
+
+export function convertBackendUserPreferences(
+  preferences: BackendUserPreferences
+): UserPreferences {
+  return {
+    ...preferences,
+    clusterPreferences: convertBackendClusterUserPreferences(
+      preferences.clusterPreferences
+    ),
+    unifiedResourcePreferences: {
+      availableResourceMode: AvailableResourceMode.NONE,
+      ...preferences.unifiedResourcePreferences,
+    },
+  };
+}
+
+export function convertBackendClusterUserPreferences(
+  clusterPreferences: BackendClusterUserPreferences
+): ClusterUserPreferences {
+  return {
+    ...clusterPreferences,
+    pinnedResources: {
+      resourceIds: clusterPreferences?.pinnedResources ?? [],
+    },
+  };
+}
+
+export function isBackendUserPreferences(
+  preferences: UserPreferences | BackendUserPreferences
+): preferences is BackendUserPreferences {
+  return Array.isArray(
+    (preferences as BackendUserPreferences).clusterPreferences?.pinnedResources
+  );
 }

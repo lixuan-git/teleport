@@ -1,16 +1,20 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package proxy
 
@@ -21,12 +25,12 @@ import (
 	"io"
 	"net/http"
 	"path"
+	"slices"
 
 	"github.com/gravitational/trace"
 	"github.com/julienschmidt/httprouter"
 	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
 	oteltrace "go.opentelemetry.io/otel/trace"
-	"golang.org/x/exp/slices"
 	authv1 "k8s.io/api/authorization/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 
@@ -59,7 +63,7 @@ func (f *Forwarder) selfSubjectAccessReviews(authCtx *authContext, w http.Respon
 	if err != nil {
 		// This error goes to kubernetes client and is not visible in the logs
 		// of the teleport server if not logged here.
-		f.log.Errorf("Failed to create cluster session: %v.", err)
+		f.log.ErrorContext(req.Context(), "Failed to create cluster session", "error", err)
 		return nil, trace.Wrap(err)
 	}
 	// sess.Close cancels the connection monitor context to release it sooner.
@@ -76,7 +80,7 @@ func (f *Forwarder) selfSubjectAccessReviews(authCtx *authContext, w http.Respon
 
 	// only allow self subject access reviews for the service that proxies the
 	// request to the kubernetes API server.
-	if f.isLocalKubeCluster(sess.teleportCluster.isRemote, sess.kubeClusterName) {
+	if sess.isLocalKubernetesCluster {
 		if err := f.validateSelfSubjectAccessReview(sess, w, req); trace.IsAccessDenied(err) {
 			return nil, nil
 		} else if err != nil {
@@ -87,7 +91,7 @@ func (f *Forwarder) selfSubjectAccessReviews(authCtx *authContext, w http.Respon
 	if err := f.setupForwardingHeaders(sess, req, true /* withImpersonationHeaders */); err != nil {
 		// This error goes to kubernetes client and is not visible in the logs
 		// of the teleport server if not logged here.
-		f.log.Errorf("Failed to set up forwarding headers: %v.", err)
+		f.log.ErrorContext(req.Context(), "Failed to set up forwarding headers", "error", err)
 		return nil, trace.Wrap(err)
 	}
 	rw := httplib.NewResponseStatusRecorder(w)
@@ -237,7 +241,8 @@ func parseSelfSubjectAccessReviewRequest(decoder runtime.Decoder, req *http.Requ
 	req.Body.Close()
 
 	req.Body = io.NopCloser(bytes.NewReader(payload))
-	obj, err := decodeAndSetGVK(decoder, payload)
+	gvk := authv1.SchemeGroupVersion.WithKind("SelfSubjectAccessReview")
+	obj, err := decodeAndSetGVK(decoder, payload, &gvk)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}

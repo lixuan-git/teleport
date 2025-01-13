@@ -1,34 +1,39 @@
 /**
- * Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 import { useState } from 'react';
+
 import useAttempt from 'shared/hooks/useAttemptNext';
 
-import useTeleport from 'teleport/useTeleport';
+import {
+  getDatabaseProtocol,
+  type ResourceSpec,
+} from 'teleport/Discover/SelectResource';
 import { useDiscover } from 'teleport/Discover/useDiscover';
-import { DiscoverEventStatus } from 'teleport/services/userEvent';
-import auth from 'teleport/services/auth/auth';
-import { getDatabaseProtocol } from 'teleport/Discover/SelectResource';
-
-import type {
-  ConnectionDiagnostic,
-  ConnectionDiagnosticRequest,
+import {
+  agentService,
+  type ConnectionDiagnostic,
+  type ConnectionDiagnosticRequest,
 } from 'teleport/services/agents';
-import type { MfaAuthnResponse } from 'teleport/services/mfa';
-import type { ResourceSpec } from 'teleport/Discover/SelectResource';
+import auth from 'teleport/services/auth/auth';
+import type { MfaChallengeResponse } from 'teleport/services/mfa';
+import { DiscoverEventStatus } from 'teleport/services/userEvent';
+import useTeleport from 'teleport/useTeleport';
 
 export function useConnectionDiagnostic() {
   const ctx = useTeleport();
@@ -44,17 +49,21 @@ export function useConnectionDiagnostic() {
 
   const [showMfaDialog, setShowMfaDialog] = useState(false);
 
-  // runConnectionDiagnostic depending on the value of `mfaAuthnResponse` does the following:
-  //   1) If param `mfaAuthnResponse` is undefined or null, it will check if MFA is required.
-  //      - If MFA is required, it sets a flag that indicates a users
-  //        MFA credentials are required, and skips the request to test connection.
-  //      - If MFA is NOT required, it makes the request to test connection.
-  //   2) If param `mfaAuthnResponse` is defined, it skips checking if MFA is required,
-  //      and makes the request to test connection.
+  /**
+   * runConnectionDiagnostic depending on the value of `mfaAuthnResponse` does the following:
+   *   1) If param `mfaAuthnResponse` is undefined or null, it will check if MFA is required.
+   *      - If MFA is required, it sets a flag that indicates a users
+   *        MFA credentials are required, and skips the request to test connection.
+   *      - If MFA is NOT required, it makes the request to test connection.
+   *   2) If param `mfaAuthnResponse` is defined, it skips checking if MFA is required,
+   *      and makes the request to test connection.
+   *
+   * The return value can be used within event handlers where you cannot depend on React state.
+   */
   async function runConnectionDiagnostic(
     req: ConnectionDiagnosticRequest,
-    mfaAuthnResponse?: MfaAuthnResponse
-  ) {
+    mfaAuthnResponse?: MfaChallengeResponse
+  ): Promise<{ mfaRequired: boolean }> {
     setDiagnosis(null); // reset since user's can re-test connection.
     setRanDiagnosis(true);
     setShowMfaDialog(false);
@@ -67,11 +76,11 @@ export function useConnectionDiagnostic() {
         const sessionMfa = await auth.checkMfaRequired(mfaReq);
         if (sessionMfa.required) {
           setShowMfaDialog(true);
-          return;
+          return { mfaRequired: true };
         }
       }
 
-      const diag = await ctx.agentService.createConnectionDiagnostic({
+      const diag = await agentService.createConnectionDiagnostic({
         ...req,
         mfaAuthnResponse,
       });
@@ -97,6 +106,8 @@ export function useConnectionDiagnostic() {
       handleError(err);
       emitErrorEvent(err.message);
     }
+
+    return { mfaRequired: false };
   }
 
   function cancelMfaDialog() {
@@ -123,6 +134,12 @@ export function useConnectionDiagnostic() {
     canTestConnection,
     username,
     authType,
+    /**
+     * @deprecated Get clusterId from resource, for example (agentMeta as NodeMeta).node.clusterId
+     * Alternatively, call useTeleport and then ctx.storeUser.getClusterId.
+     *
+     * Hooks should not reexport values that are already made available by other hooks.
+     */
     clusterId: ctx.storeUser.getClusterId(),
     showMfaDialog,
     cancelMfaDialog,

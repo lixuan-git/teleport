@@ -1,29 +1,31 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package discovery
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	"github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/api/utils/retryutils"
@@ -34,13 +36,17 @@ import (
 // instances.
 const minBatchSize = 5
 
+// serverExpirationDuration is the amount of time a Server should stay alive after being discovered.
+// To be used with a jitter when creating the non-Teleport Server's Expiration.
+const serverExpirationDuration = 90 * time.Minute
+
 type serverInfoUpserter interface {
 	UpsertServerInfo(ctx context.Context, si types.ServerInfo) error
 }
 
 type labelReconcilerConfig struct {
 	clock       clockwork.Clock
-	log         logrus.FieldLogger
+	log         *slog.Logger
 	accessPoint serverInfoUpserter
 }
 
@@ -52,7 +58,7 @@ func (c *labelReconcilerConfig) checkAndSetDefaults() error {
 		c.clock = clockwork.NewRealClock()
 	}
 	if c.log == nil {
-		c.log = logrus.New()
+		c.log = slog.Default()
 	}
 	return nil
 }
@@ -78,7 +84,7 @@ func newLabelReconciler(cfg *labelReconcilerConfig) (*labelReconciler, error) {
 		discoveredServers: make(map[string]types.ServerInfo),
 		serverInfoQueue:   make([]types.ServerInfo, 0, minBatchSize),
 		lastBatchSize:     minBatchSize,
-		jitter:            retryutils.NewSeventhJitter(),
+		jitter:            retryutils.SeventhJitter,
 	}, nil
 }
 
@@ -118,7 +124,7 @@ func (r *labelReconciler) run(ctx context.Context) {
 
 			for _, si := range batch {
 				if err := r.cfg.accessPoint.UpsertServerInfo(ctx, si); err != nil {
-					r.cfg.log.WithError(err).Error("Failed to upsert server info.")
+					r.cfg.log.ErrorContext(ctx, "Failed to upsert server info", "error", err)
 					// Allow the server info to be queued again.
 					delete(r.discoveredServers, si.GetName())
 				}
@@ -146,7 +152,7 @@ func (r *labelReconciler) queueServerInfos(serverInfos []types.ServerInfo) {
 			!utils.StringMapsEqual(si.GetNewLabels(), existingInfo.GetNewLabels()) ||
 			existingInfo.Expiry().Before(now.Add(30*time.Minute)) {
 
-			si.SetExpiry(now.Add(r.jitter(90 * time.Minute)))
+			si.SetExpiry(now.Add(r.jitter(serverExpirationDuration)))
 			r.discoveredServers[si.GetName()] = si
 			r.serverInfoQueue = append(r.serverInfoQueue, si)
 		}

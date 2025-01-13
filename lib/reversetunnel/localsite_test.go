@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package reversetunnel
 
@@ -33,15 +37,13 @@ import (
 
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/api/utils/sshutils"
-	"github.com/gravitational/teleport/lib/auth"
-	"github.com/gravitational/teleport/lib/auth/native"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/utils"
 )
 
 func TestMain(m *testing.M) {
 	utils.InitLoggerForTests()
-	native.PrecomputeTestKeys(m)
 
 	os.Exit(m.Run())
 }
@@ -56,14 +58,16 @@ func TestRemoteConnCleanup(t *testing.T) {
 
 	clock := clockwork.NewFakeClock()
 
+	clt := &mockLocalSiteClient{}
 	watcher, err := services.NewProxyWatcher(ctx, services.ProxyWatcherConfig{
 		ResourceWatcherConfig: services.ResourceWatcherConfig{
 			Component: "test",
-			Log:       utils.NewLoggerForTests(),
+			Logger:    utils.NewSlogLoggerForTests(),
 			Clock:     clock,
-			Client:    &mockLocalSiteClient{},
+			Client:    clt,
 		},
-		ProxiesC: make(chan []types.Server, 2),
+		ProxyGetter: clt,
+		ProxiesC:    make(chan []types.Server, 2),
 	})
 	require.NoError(t, err)
 	require.NoError(t, watcher.WaitInitialization())
@@ -73,7 +77,7 @@ func TestRemoteConnCleanup(t *testing.T) {
 		ctx:              ctx,
 		Config:           Config{Clock: clock},
 		localAuthClient:  &mockLocalSiteClient{},
-		log:              utils.NewLoggerForTests(),
+		logger:           utils.NewSlogLoggerForTests(),
 		offlineThreshold: time.Second,
 		proxyWatcher:     watcher,
 	}
@@ -81,7 +85,6 @@ func TestRemoteConnCleanup(t *testing.T) {
 	site, err := newLocalSite(srv, "clustername", nil,
 		withPeriodicFunctionInterval(time.Hour),
 		withProxySyncInterval(time.Hour),
-		withCertificateCache(&certificateCache{}),
 	)
 	require.NoError(t, err)
 
@@ -99,7 +102,7 @@ func TestRemoteConnCleanup(t *testing.T) {
 
 	// terminated by too many missed heartbeats
 	go func() {
-		site.handleHeartbeat(conn1, nil, reqs)
+		site.handleHeartbeat(ctx, conn1, nil, reqs)
 		cancel()
 	}()
 
@@ -152,7 +155,6 @@ func TestLocalSiteOverlap(t *testing.T) {
 
 	site, err := newLocalSite(srv, "clustername", nil,
 		withPeriodicFunctionInterval(time.Hour),
-		withCertificateCache(&certificateCache{}),
 	)
 	require.NoError(t, err)
 
@@ -249,17 +251,19 @@ func TestProxyResync(t *testing.T) {
 	proxy2, err := types.NewServer(uuid.NewString(), types.KindProxy, types.ServerSpecV2{})
 	require.NoError(t, err)
 
+	clt := &mockLocalSiteClient{
+		proxies: []types.Server{proxy1, proxy2},
+	}
 	// set up the watcher and wait for it to be initialized
 	watcher, err := services.NewProxyWatcher(ctx, services.ProxyWatcherConfig{
 		ResourceWatcherConfig: services.ResourceWatcherConfig{
 			Component: "test",
-			Log:       utils.NewLoggerForTests(),
+			Logger:    utils.NewSlogLoggerForTests(),
 			Clock:     clock,
-			Client: &mockLocalSiteClient{
-				proxies: []types.Server{proxy1, proxy2},
-			},
+			Client:    clt,
 		},
-		ProxiesC: make(chan []types.Server, 2),
+		ProxyGetter: clt,
+		ProxiesC:    make(chan []types.Server, 2),
 	})
 	require.NoError(t, err)
 	require.NoError(t, watcher.WaitInitialization())
@@ -269,14 +273,13 @@ func TestProxyResync(t *testing.T) {
 		ctx:              ctx,
 		Config:           Config{Clock: clock},
 		localAuthClient:  &mockLocalSiteClient{},
-		log:              utils.NewLoggerForTests(),
+		logger:           utils.NewSlogLoggerForTests(),
 		offlineThreshold: 24 * time.Hour,
 		proxyWatcher:     watcher,
 	}
 	site, err := newLocalSite(srv, "clustername", nil,
 		withProxySyncInterval(time.Second),
 		withPeriodicFunctionInterval(24*time.Hour),
-		withCertificateCache(&certificateCache{}),
 	)
 	require.NoError(t, err)
 
@@ -284,7 +287,7 @@ func TestProxyResync(t *testing.T) {
 	discoveryCh := make(chan *discoveryRequest)
 
 	reqHandler := func(name string, wantReply bool, payload []byte) (bool, error) {
-		assert.Equal(t, name, chanDiscoveryReq)
+		assert.Equal(t, chanDiscoveryReq, name)
 
 		var req discoveryRequest
 		assert.NoError(t, json.Unmarshal(payload, &req))
@@ -292,7 +295,7 @@ func TestProxyResync(t *testing.T) {
 		return true, nil
 	}
 	channelCreator := func(name string) ssh.Channel {
-		assert.Equal(t, name, chanDiscovery)
+		assert.Equal(t, chanDiscovery, name)
 		return &mockedSSHChannel{reqHandler: reqHandler}
 	}
 
@@ -309,7 +312,7 @@ func TestProxyResync(t *testing.T) {
 
 	// terminated by canceled context
 	go func() {
-		site.handleHeartbeat(conn1, nil, reqs)
+		site.handleHeartbeat(ctx, conn1, nil, reqs)
 	}()
 
 	expected := []types.Server{proxy1, proxy2}
@@ -338,7 +341,7 @@ func TestProxyResync(t *testing.T) {
 }
 
 type mockLocalSiteClient struct {
-	auth.Client
+	authclient.Client
 
 	proxies []types.Server
 }

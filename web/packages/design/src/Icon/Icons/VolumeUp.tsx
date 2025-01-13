@@ -1,18 +1,20 @@
-/*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 /* MIT License
 
@@ -38,7 +40,7 @@ SOFTWARE.
 
 */
 
-import React from 'react';
+import { forwardRef } from 'react';
 
 import { Icon, IconProps } from '../Icon';
 
@@ -48,13 +50,14 @@ THIS FILE IS GENERATED. DO NOT EDIT.
 
 */
 
-export function VolumeUp({ size = 24, color, ...otherProps }: IconProps) {
-  return (
+export const VolumeUp = forwardRef<HTMLSpanElement, IconProps>(
+  ({ size = 24, color, ...otherProps }, ref) => (
     <Icon
       size={size}
       color={color}
       className="icon icon-volumeup"
       {...otherProps}
+      ref={ref}
     >
       <path
         fillRule="evenodd"
@@ -64,5 +67,5 @@ export function VolumeUp({ size = 24, color, ...otherProps }: IconProps) {
       <path d="M17.5043 9.45476C17.8151 9.18099 18.2891 9.21104 18.5628 9.52188C19.166 10.2067 19.4987 11.0879 19.4987 12.0004C19.4987 12.9129 19.166 13.7941 18.5628 14.4789C18.2891 14.7898 17.8151 14.8198 17.5043 14.546C17.1935 14.2723 17.1634 13.7984 17.4372 13.4875C17.799 13.0766 17.9987 12.5479 17.9987 12.0004C17.9987 11.4529 17.799 10.9242 17.4372 10.5133C17.1634 10.2024 17.1935 9.72853 17.5043 9.45476Z" />
       <path d="M21.3405 7.00001C21.0644 6.69127 20.5902 6.66485 20.2815 6.94099C19.9728 7.21713 19.9463 7.69127 20.2225 8.00001C21.2064 9.10005 21.7503 10.5241 21.7503 12C21.7503 13.4759 21.2064 14.9 20.2225 16C19.9463 16.3087 19.9728 16.7829 20.2815 17.059C20.5902 17.3352 21.0644 17.3087 21.3405 17C22.5704 15.625 23.2503 13.8448 23.2503 12C23.2503 10.1552 22.5704 8.37506 21.3405 7.00001Z" />
     </Icon>
-  );
-}
+  )
+);

@@ -1,31 +1,34 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package athena
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/big"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -37,8 +40,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/segmentio/parquet-go"
+	"github.com/parquet-go/parquet-go"
 	"github.com/stretchr/testify/require"
 
 	apievents "github.com/gravitational/teleport/api/types/events"
@@ -237,12 +239,17 @@ func Test_consumer_sqsMessagesCollector(t *testing.T) {
 }
 
 func validCollectCfgForTests(t *testing.T) sqsCollectConfig {
+	metrics, err := newAthenaMetrics(athenaMetricsConfig{
+		batchInterval:        defaultBatchInterval,
+		externalAuditStorage: false,
+	})
+	require.NoError(t, err)
 	return sqsCollectConfig{
 		sqsReceiver:       &mockReceiver{},
 		queueURL:          "test-queue",
 		payloadBucket:     "bucket",
 		payloadDownloader: &fakeS3manager{},
-		logger:            utils.NewLoggerForTests(),
+		logger:            slog.Default(),
 		errHandlingFn: func(ctx context.Context, errC chan error) {
 			err, ok := <-errC
 			if ok && err != nil {
@@ -251,7 +258,7 @@ func validCollectCfgForTests(t *testing.T) sqsCollectConfig {
 				t.Fail()
 			}
 		},
-		metricConsumerBatchProcessingDuration: prometheus.NewHistogram(prometheus.HistogramOpts{Name: "for_tests"}),
+		metrics: metrics,
 	}
 }
 
@@ -407,7 +414,7 @@ func (m *mockReceiver) ReceiveMessage(ctx context.Context, params *sqs.ReceiveMe
 }
 
 func TestConsumerRunContinuouslyOnSingleAuth(t *testing.T) {
-	log := utils.NewLoggerForTests()
+	log := slog.Default()
 	backend, err := memory.New(memory.Config{})
 	require.NoError(t, err)
 	defer backend.Close()
@@ -552,90 +559,6 @@ func TestRunWithMinInterval(t *testing.T) {
 	})
 }
 
-func TestErrHandlingFnFromSQS(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
-	defer cancel()
-
-	log := utils.NewLoggerForTests()
-	// buf is used as output of logs, that we will use for assertions.
-	var buf bytes.Buffer
-	log.SetOutput(&buf)
-
-	t.Run("a lot of errors, make sure only up to maxErrorCountForLogsOnSQSReceive are printed and total count", func(t *testing.T) {
-		buf.Reset()
-		noOfErrors := maxErrorCountForLogsOnSQSReceive + 1
-		errorC := make(chan error, noOfErrors)
-		go func() {
-			for i := 0; i < noOfErrors; i++ {
-				errorC <- errors.New("some error")
-			}
-			close(errorC)
-		}()
-		errHandlingFnFromSQS(log)(ctx, errorC)
-		require.Equal(t, maxErrorCountForLogsOnSQSReceive, strings.Count(buf.String(), "some error"), "number of error log messages does not match")
-		require.Contains(t, buf.String(), fmt.Sprintf("Got %d errors from SQS collector, printed only first", noOfErrors))
-	})
-
-	t.Run("few errors, no total count should be printed", func(t *testing.T) {
-		buf.Reset()
-		noOfErrors := 5
-		errorC := make(chan error, noOfErrors)
-		go func() {
-			for i := 0; i < noOfErrors; i++ {
-				errorC <- errors.New("some error")
-			}
-			close(errorC)
-		}()
-		errHandlingFnFromSQS(log)(ctx, errorC)
-		require.Equal(t, noOfErrors, strings.Count(buf.String(), "some error"), "number of error log messages does not match")
-		require.NotContains(t, buf.String(), "printed only first")
-	})
-	t.Run("no errors at all", func(t *testing.T) {
-		buf.Reset()
-		errorC := make(chan error, 10)
-		go func() {
-			// close without any errors sent means receiving loop finished without any err
-			close(errorC)
-		}()
-		errHandlingFnFromSQS(log)(ctx, errorC)
-		require.Empty(t, buf.String())
-	})
-	t.Run("no errors at all - stopped via ctx cancel", func(t *testing.T) {
-		buf.Reset()
-		errorC := make(chan error, 10)
-		defer close(errorC)
-
-		ctx, inCancel := context.WithCancel(ctx)
-		inCancel()
-
-		errHandlingFnFromSQS(log)(ctx, errorC)
-		require.Empty(t, buf.String())
-	})
-
-	t.Run("there were a lot of errors, stopped via ctx cancel", func(t *testing.T) {
-		buf.Reset()
-		// unbuffered channel and a more messages,
-		// just make sure that errors are processed
-		// before cancel happen, used to avoid sleeping.
-		noOfErrors := maxErrorCountForLogsOnSQSReceive + 10
-
-		errorC := make(chan error)
-		defer close(errorC)
-
-		ctx, inCancel := context.WithCancel(ctx)
-		go func() {
-			for i := 0; i < noOfErrors; i++ {
-				errorC <- errors.New("some error")
-			}
-			inCancel()
-		}()
-
-		errHandlingFnFromSQS(log)(ctx, errorC)
-		require.Equal(t, maxErrorCountForLogsOnSQSReceive, strings.Count(buf.String(), "some error"), "number of error log messages does not match")
-		require.Contains(t, buf.String(), "printed only first")
-	})
-}
-
 // TestConsumerWriteToS3 checks if writing parquet files per date works.
 // It receives events from different dates and make sure that multiple
 // files are created and compare it against file in testdata.
@@ -681,7 +604,9 @@ func TestConsumerWriteToS3(t *testing.T) {
 		close(eventsC)
 	}()
 
-	c := &consumer{}
+	c := &consumer{
+		collectConfig: validCollectCfgForTests(t),
+	}
 	gotHandlesToDelete, err := c.writeToS3(ctx, eventsC, localWriter)
 	require.NoError(t, err)
 	// Make sure that all events are marked to delete.
@@ -749,6 +674,8 @@ func TestDeleteMessagesFromQueue(t *testing.T) {
 	noOfHandles := 18
 	handles := handlesGen(noOfHandles)
 
+	collectConfig := validCollectCfgForTests(t)
+
 	tests := []struct {
 		name       string
 		mockRespFn func(ctx context.Context, params *sqs.DeleteMessageBatchInput) (*sqs.DeleteMessageBatchOutput, error)
@@ -810,8 +737,8 @@ func TestDeleteMessagesFromQueue(t *testing.T) {
 			},
 			wantCheck: func(t *testing.T, err error, mock *mockSQSDeleter) {
 				require.Error(t, err)
-				agg, ok := trace.Unwrap(err).(trace.Aggregate)
-				require.True(t, ok)
+				var agg trace.Aggregate
+				require.ErrorAs(t, trace.Unwrap(err), &agg)
 				for _, errFromAgg := range agg.Errors() {
 					require.ErrorContains(t, errFromAgg, "entry failed")
 				}
@@ -824,8 +751,9 @@ func TestDeleteMessagesFromQueue(t *testing.T) {
 				respFn: tt.mockRespFn,
 			}
 			c := consumer{
-				sqsDeleter: mock,
-				queueURL:   "queue-url",
+				sqsDeleter:    mock,
+				queueURL:      "queue-url",
+				collectConfig: collectConfig,
 			}
 			err := c.deleteMessagesFromQueue(ctx, handles)
 			tt.wantCheck(t, err, mock)

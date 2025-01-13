@@ -1,17 +1,19 @@
-/**
- * Copyright 2023 Gravitational, Inc.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 package web
@@ -24,6 +26,7 @@ import (
 
 	userpreferencesv1 "github.com/gravitational/teleport/api/gen/proto/go/userpreferences/v1"
 	"github.com/gravitational/teleport/lib/httplib"
+	"github.com/gravitational/teleport/lib/reversetunnelclient"
 )
 
 // AssistUserPreferencesResponse is the JSON response for the assist user preferences.
@@ -44,14 +47,71 @@ type OnboardUserPreferencesResponse struct {
 	MarketingParams    preferencesMarketingParams   `json:"marketingParams"`
 }
 
-// UserPreferencesResponse is the JSON response for the user preferences.
-type UserPreferencesResponse struct {
-	Assist  AssistUserPreferencesResponse  `json:"assist"`
-	Theme   userpreferencesv1.Theme        `json:"theme"`
-	Onboard OnboardUserPreferencesResponse `json:"onboard"`
+// ClusterUserPreferencesResponse is the JSON response for the user's cluster preferences.
+type ClusterUserPreferencesResponse struct {
+	PinnedResources []string `json:"pinnedResources"`
 }
 
-// getUserPreferences is a handler for GET /webapi/user/preferences
+type UnifiedResourcePreferencesResponse struct {
+	DefaultTab            userpreferencesv1.DefaultTab            `json:"defaultTab"`
+	ViewMode              userpreferencesv1.ViewMode              `json:"viewMode"`
+	LabelsViewMode        userpreferencesv1.LabelsViewMode        `json:"labelsViewMode"`
+	AvailableResourceMode userpreferencesv1.AvailableResourceMode `json:"availableResourceMode"`
+}
+
+// AccessGraphPreferencesResponse is the JSON response for Access Graph preferences.
+type AccessGraphPreferencesResponse struct {
+	HasBeenRedirected bool `json:"hasBeenRedirected"`
+}
+
+// UserPreferencesResponse is the JSON response for the user preferences.
+type UserPreferencesResponse struct {
+	Assist                     AssistUserPreferencesResponse       `json:"assist"`
+	Theme                      userpreferencesv1.Theme             `json:"theme"`
+	UnifiedResourcePreferences UnifiedResourcePreferencesResponse  `json:"unifiedResourcePreferences"`
+	Onboard                    OnboardUserPreferencesResponse      `json:"onboard"`
+	ClusterPreferences         ClusterUserPreferencesResponse      `json:"clusterPreferences,omitempty"`
+	AccessGraph                AccessGraphPreferencesResponse      `json:"accessGraph,omitempty"`
+	SideNavDrawerMode          userpreferencesv1.SideNavDrawerMode `json:"sideNavDrawerMode"`
+}
+
+func (h *Handler) getUserClusterPreferences(_ http.ResponseWriter, r *http.Request, p httprouter.Params, sctx *SessionContext, site reversetunnelclient.RemoteSite) (interface{}, error) {
+	authClient, err := sctx.GetUserClient(r.Context(), site)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	resp, err := authClient.GetUserPreferences(r.Context(), &userpreferencesv1.GetUserPreferencesRequest{})
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return clusterPreferencesResponse(resp.Preferences.ClusterPreferences), nil
+}
+
+// updateUserClusterPreferences is a handler for PUT /webapi/user/preferences.
+func (h *Handler) updateUserClusterPreferences(_ http.ResponseWriter, r *http.Request, p httprouter.Params, sctx *SessionContext, site reversetunnelclient.RemoteSite) (any, error) {
+	req := UserPreferencesResponse{}
+
+	if err := httplib.ReadResourceJSON(r, &req); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	authClient, err := sctx.GetUserClient(r.Context(), site)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	preferences := makePreferenceRequest(req)
+
+	if err := authClient.UpsertUserPreferences(r.Context(), preferences); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return OK(), nil
+}
+
+// getUserPreferences is a handler for GET /webapi/user/preferences.
 func (h *Handler) getUserPreferences(_ http.ResponseWriter, r *http.Request, _ httprouter.Params, sctx *SessionContext) (any, error) {
 	authClient, err := sctx.GetClient()
 	if err != nil {
@@ -66,25 +126,15 @@ func (h *Handler) getUserPreferences(_ http.ResponseWriter, r *http.Request, _ h
 	return userPreferencesResponse(resp.Preferences), nil
 }
 
-// updateUserPreferences is a handler for PUT /webapi/user/preferences.
-func (h *Handler) updateUserPreferences(_ http.ResponseWriter, r *http.Request, _ httprouter.Params, sctx *SessionContext) (any, error) {
-	req := UserPreferencesResponse{}
-
-	if err := httplib.ReadJSON(r, &req); err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	authClient, err := sctx.GetClient()
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	preferences := &userpreferencesv1.UpsertUserPreferencesRequest{
+func makePreferenceRequest(req UserPreferencesResponse) *userpreferencesv1.UpsertUserPreferencesRequest {
+	return &userpreferencesv1.UpsertUserPreferencesRequest{
 		Preferences: &userpreferencesv1.UserPreferences{
 			Theme: req.Theme,
-			Assist: &userpreferencesv1.AssistUserPreferences{
-				PreferredLogins: req.Assist.PreferredLogins,
-				ViewMode:        req.Assist.ViewMode,
+			UnifiedResourcePreferences: &userpreferencesv1.UnifiedResourcePreferences{
+				DefaultTab:            req.UnifiedResourcePreferences.DefaultTab,
+				ViewMode:              req.UnifiedResourcePreferences.ViewMode,
+				LabelsViewMode:        req.UnifiedResourcePreferences.LabelsViewMode,
+				AvailableResourceMode: req.UnifiedResourcePreferences.AvailableResourceMode,
 			},
 			Onboard: &userpreferencesv1.OnboardUserPreferences{
 				PreferredResources: req.Onboard.PreferredResources,
@@ -95,9 +145,33 @@ func (h *Handler) updateUserPreferences(_ http.ResponseWriter, r *http.Request, 
 					Intent:   req.Onboard.MarketingParams.Intent,
 				},
 			},
+			ClusterPreferences: &userpreferencesv1.ClusterUserPreferences{
+				PinnedResources: &userpreferencesv1.PinnedResourcesUserPreferences{
+					ResourceIds: req.ClusterPreferences.PinnedResources,
+				},
+			},
+			AccessGraph: &userpreferencesv1.AccessGraphUserPreferences{
+				HasBeenRedirected: req.AccessGraph.HasBeenRedirected,
+			},
+			SideNavDrawerMode: req.SideNavDrawerMode,
 		},
 	}
+}
 
+// updateUserPreferences is a handler for PUT /webapi/user/preferences.
+func (h *Handler) updateUserPreferences(_ http.ResponseWriter, r *http.Request, _ httprouter.Params, sctx *SessionContext) (any, error) {
+	var req UserPreferencesResponse
+
+	if err := httplib.ReadResourceJSON(r, &req); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	authClient, err := sctx.GetClient()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	preferences := makePreferenceRequest(req)
 	if err := authClient.UpsertUserPreferences(r.Context(), preferences); err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -108,24 +182,36 @@ func (h *Handler) updateUserPreferences(_ http.ResponseWriter, r *http.Request, 
 // userPreferencesResponse creates a JSON response for the user preferences.
 func userPreferencesResponse(resp *userpreferencesv1.UserPreferences) *UserPreferencesResponse {
 	jsonResp := &UserPreferencesResponse{
-		Assist:  assistUserPreferencesResponse(resp.Assist),
-		Theme:   resp.Theme,
-		Onboard: onboardUserPreferencesResponse(resp.Onboard),
+		Theme:                      resp.Theme,
+		Onboard:                    onboardUserPreferencesResponse(resp.Onboard),
+		ClusterPreferences:         clusterPreferencesResponse(resp.ClusterPreferences),
+		UnifiedResourcePreferences: unifiedResourcePreferencesResponse(resp.UnifiedResourcePreferences),
+		AccessGraph:                accessGraphPreferencesResponse(resp.AccessGraph),
+		SideNavDrawerMode:          resp.SideNavDrawerMode,
 	}
 
 	return jsonResp
 }
 
-// assistUserPreferencesResponse creates a JSON response for the assist user preferences.
-func assistUserPreferencesResponse(resp *userpreferencesv1.AssistUserPreferences) AssistUserPreferencesResponse {
-	jsonResp := AssistUserPreferencesResponse{
-		PreferredLogins: make([]string, 0, len(resp.PreferredLogins)),
-		ViewMode:        resp.ViewMode,
+func clusterPreferencesResponse(prefs *userpreferencesv1.ClusterUserPreferences) ClusterUserPreferencesResponse {
+	resp := ClusterUserPreferencesResponse{}
+
+	if prefs == nil {
+		return resp
 	}
 
-	jsonResp.PreferredLogins = append(jsonResp.PreferredLogins, resp.PreferredLogins...)
+	resp.PinnedResources = append(resp.PinnedResources, prefs.PinnedResources.ResourceIds...)
+	return resp
+}
 
-	return jsonResp
+// unifiedResourcePreferencesResponse creates a JSON response for the assist user preferences.
+func unifiedResourcePreferencesResponse(resp *userpreferencesv1.UnifiedResourcePreferences) UnifiedResourcePreferencesResponse {
+	return UnifiedResourcePreferencesResponse{
+		DefaultTab:            resp.DefaultTab,
+		ViewMode:              resp.ViewMode,
+		LabelsViewMode:        resp.LabelsViewMode,
+		AvailableResourceMode: resp.AvailableResourceMode,
+	}
 }
 
 // onboardUserPreferencesResponse creates a JSON response for the onboard user preferences.
@@ -143,4 +229,17 @@ func onboardUserPreferencesResponse(resp *userpreferencesv1.OnboardUserPreferenc
 	jsonResp.PreferredResources = append(jsonResp.PreferredResources, resp.PreferredResources...)
 
 	return jsonResp
+}
+
+// accessGraphPreferencesResponse creates a JSON response for the access graph preferences.
+func accessGraphPreferencesResponse(resp *userpreferencesv1.AccessGraphUserPreferences) AccessGraphPreferencesResponse {
+	if resp == nil {
+		return AccessGraphPreferencesResponse{
+			HasBeenRedirected: false,
+		}
+	}
+
+	return AccessGraphPreferencesResponse{
+		HasBeenRedirected: resp.HasBeenRedirected,
+	}
 }

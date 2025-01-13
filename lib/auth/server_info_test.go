@@ -1,18 +1,20 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package auth
 
@@ -20,67 +22,78 @@ import (
 	"context"
 	"testing"
 
+	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
 	"github.com/stretchr/testify/require"
 
-	"github.com/gravitational/teleport"
-	"github.com/gravitational/teleport/api/client"
 	"github.com/gravitational/teleport/api/client/proto"
+	"github.com/gravitational/teleport/api/internalutils/stream"
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/lib/defaults"
+	"github.com/gravitational/teleport/lib/utils"
 )
 
-type mockUpstream struct {
-	client.UpstreamInventoryControlStream
-	updatedLabels map[string]string
+type mockServerInfoAccessPoint struct {
+	clock         clockwork.FakeClock
+	nodes         []types.Server
+	nodesErr      error
+	serverInfos   map[string]types.ServerInfo
+	serverInfoErr error
+	updatedLabels map[string]map[string]string
 }
 
-func (m *mockUpstream) Send(_ context.Context, msg proto.DownstreamInventoryMessage) error {
-	if labelMsg, ok := msg.(proto.DownstreamInventoryUpdateLabels); ok {
-		m.updatedLabels = labelMsg.Labels
+func newMockServerInfoAccessPoint() *mockServerInfoAccessPoint {
+	return &mockServerInfoAccessPoint{
+		clock:         clockwork.NewFakeClock(),
+		serverInfos:   make(map[string]types.ServerInfo),
+		updatedLabels: make(map[string]map[string]string),
 	}
+}
+
+func (m *mockServerInfoAccessPoint) GetNodeStream(_ context.Context, _ string) stream.Stream[types.Server] {
+	if m.nodesErr != nil {
+		return stream.Fail[types.Server](m.nodesErr)
+	}
+	return stream.Slice(m.nodes)
+}
+
+func (m *mockServerInfoAccessPoint) GetServerInfo(_ context.Context, name string) (types.ServerInfo, error) {
+	if m.serverInfoErr != nil {
+		return nil, m.serverInfoErr
+	}
+	si, ok := m.serverInfos[name]
+	if !ok {
+		return nil, trace.NotFound("no server info named %q", name)
+	}
+	return si, nil
+}
+
+func (m *mockServerInfoAccessPoint) UpdateLabels(_ context.Context, req proto.InventoryUpdateLabelsRequest) error {
+	m.updatedLabels[req.ServerID] = req.Labels
 	return nil
 }
 
-func (m *mockUpstream) Recv() <-chan proto.UpstreamInventoryMessage {
-	return make(chan proto.UpstreamInventoryMessage)
+func (m *mockServerInfoAccessPoint) GetClock() clockwork.Clock {
+	return m.clock
 }
 
-func (m *mockUpstream) Done() <-chan struct{} {
-	return make(chan struct{})
-}
-
-func (m *mockUpstream) Close() error {
-	return nil
-}
-
-// TestReconcileLabels verifies that an SSH server's labels can be updated by
-// upserting a corresponding ServerInfo to the auth server.
-func TestReconcileLabels(t *testing.T) {
+func TestReconcileServerInfo(t *testing.T) {
 	t.Parallel()
 
 	const serverName = "test-server"
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
 
-	// Create auth server and fake inventory stream.
-	clock := clockwork.NewFakeClock()
-	pack, err := newTestPack(ctx, t.TempDir(), WithClock(clock))
+	awsServerInfo, err := types.NewServerInfo(types.Metadata{
+		Name: types.ServerInfoNameFromAWS("my-account", "my-instance"),
+	}, types.ServerInfoSpecV1{
+		NewLabels: map[string]string{"a": "1", "b": "2"},
+	})
 	require.NoError(t, err)
-	t.Cleanup(func() {
-		require.NoError(t, pack.a.Close())
-		require.NoError(t, pack.bk.Close())
+	regularServerInfo, err := types.NewServerInfo(types.Metadata{
+		Name: types.ServerInfoNameFromNodeName(serverName),
+	}, types.ServerInfoSpecV1{
+		NewLabels: map[string]string{"b": "3", "c": "4"},
 	})
-	upstream := &mockUpstream{}
-	t.Cleanup(func() {
-		require.NoError(t, upstream.Close())
-	})
-	require.NoError(t, pack.a.RegisterInventoryControlStream(upstream, proto.UpstreamInventoryHello{
-		Version:  teleport.Version,
-		ServerID: serverName,
-		Services: []types.SystemRole{types.RoleNode},
-	}))
-
-	// Create server.
+	require.NoError(t, err)
 	server, err := types.NewServer(serverName, types.KindNode, types.ServerSpecV2{
 		CloudMetadata: &types.CloudMetadata{
 			AWS: &types.AWSInfo{
@@ -90,22 +103,75 @@ func TestReconcileLabels(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	_, err = pack.a.UpsertNode(ctx, server)
-	require.NoError(t, err)
 
-	// Update the server's labels.
-	labels := map[string]string{"a": "1", "b": "2"}
-	serverInfo, err := types.NewServerInfo(types.Metadata{
-		Name:   "aws-my-account-my-instance",
-		Labels: labels,
-	}, types.ServerInfoSpecV1{})
-	require.NoError(t, err)
-	serverInfo.SetSubKind(types.SubKindCloudInfo)
-	require.NoError(t, pack.a.UpsertServerInfo(ctx, serverInfo))
+	t.Run("ok", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
 
-	go pack.a.ReconcileServerInfos(ctx)
-	// Wait until the reconciler finishes processing the serverinfo.
-	clock.BlockUntil(1)
-	// Check that labels were received downstream.
-	require.Equal(t, labels, upstream.updatedLabels)
+		ap := newMockServerInfoAccessPoint()
+		ap.nodes = []types.Server{server}
+		ap.serverInfos = map[string]types.ServerInfo{
+			awsServerInfo.GetName():     awsServerInfo,
+			regularServerInfo.GetName(): regularServerInfo,
+		}
+
+		utils.RunTestBackgroundTask(ctx, t, &utils.TestBackgroundTask{
+			Name: "ReconcileServerInfos",
+			Task: func(ctx context.Context) error {
+				return trace.Wrap(ReconcileServerInfos(ctx, ap))
+			},
+		})
+
+		// Wait until the reconciler finishes processing a batch.
+		ap.clock.BlockUntil(1)
+		// Check that the right labels were updated.
+		require.Equal(t, map[string]string{
+			"aws/a":     "1",
+			"aws/b":     "2",
+			"dynamic/b": "3",
+			"dynamic/c": "4",
+		}, ap.updatedLabels[serverName])
+	})
+
+	t.Run("restart on error", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+
+		ap := newMockServerInfoAccessPoint()
+		ap.nodes = []types.Server{server}
+		ap.nodesErr = trace.Errorf("an error")
+		ap.serverInfos = map[string]types.ServerInfo{
+			awsServerInfo.GetName():     awsServerInfo,
+			regularServerInfo.GetName(): regularServerInfo,
+		}
+
+		utils.RunTestBackgroundTask(ctx, t, &utils.TestBackgroundTask{
+			Name: "ReconcileServerInfos",
+			Task: func(ctx context.Context) error {
+				return trace.Wrap(ReconcileServerInfos(ctx, ap))
+			},
+		})
+
+		// Block until we hit the retryer.
+		ap.clock.BlockUntil(1)
+		// Return the error at a different place and advance to the next batch.
+		ap.nodesErr = nil
+		ap.serverInfoErr = trace.Errorf("an error")
+		ap.clock.Advance(defaults.MaxWatcherBackoff)
+		// Block until we hit the retryer again.
+		ap.clock.BlockUntil(1)
+		// Clear the error and allow a successful run.
+		ap.serverInfoErr = nil
+		ap.clock.Advance(defaults.MaxWatcherBackoff)
+		// Block until we hit the loop waiter (meaning the server infos were
+		// successfully processed).
+		ap.clock.BlockUntil(1)
+		// Check that the right labels were updated.
+		require.Equal(t, map[string]string{
+			"aws/a":     "1",
+			"aws/b":     "2",
+			"dynamic/b": "3",
+			"dynamic/c": "4",
+		}, ap.updatedLabels[serverName])
+	})
 }

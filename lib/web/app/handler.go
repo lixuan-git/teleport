@@ -1,18 +1,20 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 // Package app connections to applications over a reverse tunnel and forwards
 // HTTP requests to them.
@@ -23,19 +25,21 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
+	"path"
+	"time"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
 	"github.com/julienschmidt/httprouter"
-	"github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/types"
 	apievents "github.com/gravitational/teleport/api/types/events"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/httplib/reverseproxy"
 	"github.com/gravitational/teleport/lib/reversetunnelclient"
@@ -48,9 +52,9 @@ type HandlerConfig struct {
 	// Clock is used to control time in tests.
 	Clock clockwork.Clock
 	// AuthClient is a direct client to auth.
-	AuthClient auth.ClientI
+	AuthClient authclient.ClientI
 	// AccessPoint is caching client to auth.
-	AccessPoint auth.ProxyAccessPoint
+	AccessPoint authclient.ProxyAccessPoint
 	// ProxyClient holds connections to leaf clusters.
 	ProxyClient reversetunnelclient.Tunnel
 	// ProxyPublicAddrs contains web proxy public addresses.
@@ -60,6 +64,9 @@ type HandlerConfig struct {
 	CipherSuites []uint16
 	// WebPublicAddr
 	WebPublicAddr string
+	// IntegrationAppHandler handles App Access requests directly - not requiring an AppService.
+	// Only available for AWS OIDC Integrations.
+	IntegrationAppHandler ServerHandler
 }
 
 // CheckAndSetDefaults validates configuration.
@@ -77,6 +84,9 @@ func (c *HandlerConfig) CheckAndSetDefaults() error {
 	if len(c.CipherSuites) == 0 {
 		return trace.BadParameter("ciphersuites missing")
 	}
+	if c.IntegrationAppHandler == nil {
+		return trace.BadParameter("integration app handler missing")
+	}
 
 	return nil
 }
@@ -89,11 +99,11 @@ type Handler struct {
 
 	router *httprouter.Router
 
-	cache *sessionCache
+	cache *utils.FnCache
 
 	clusterName string
 
-	log *logrus.Entry
+	logger *slog.Logger
 }
 
 // NewHandler returns a new application handler.
@@ -106,14 +116,18 @@ func NewHandler(ctx context.Context, c *HandlerConfig) (*Handler, error) {
 	h := &Handler{
 		c:            c,
 		closeContext: ctx,
-		log: logrus.WithFields(logrus.Fields{
-			trace.Component: teleport.ComponentAppProxy,
-		}),
+		logger:       slog.With(teleport.ComponentKey, teleport.ComponentAppProxy),
 	}
 
 	// Create a new session cache, this holds sessions that can be used to
 	// forward requests.
-	h.cache, err = newSessionCache(ctx, h.log)
+	h.cache, err = utils.NewFnCache(utils.FnCacheConfig{
+		TTL:             time.Second, // Doesn't matter, TTL is always set on an item by item basis.
+		Clock:           h.c.Clock,
+		Context:         ctx,
+		CleanupInterval: time.Second,
+		ReloadOnErr:     true,
+	})
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -128,8 +142,8 @@ func NewHandler(ctx context.Context, c *HandlerConfig) (*Handler, error) {
 	// Create the application routes.
 	h.router = httprouter.New()
 	h.router.UseRawPath = true
-	h.router.POST("/x-teleport-auth", makeRouterHandler(h.withCustomCORS(h.handleAuth)))
-	h.router.OPTIONS("/x-teleport-auth", makeRouterHandler(h.withCustomCORS(nil)))
+	h.router.GET("/x-teleport-auth", makeRouterHandler(h.startAppAuthExchange))
+	h.router.POST("/x-teleport-auth", makeRouterHandler(h.completeAppAuthExchange))
 	h.router.GET("/teleport-logout", h.withRouterAuth(h.handleLogout))
 	h.router.NotFound = h.withAuth(h.handleHttp)
 
@@ -291,7 +305,7 @@ func (h *Handler) handleForwardError(w http.ResponseWriter, req *http.Request, e
 	// done to have a consistent UX to when launching an application.
 	session, err := h.renewSession(req)
 	if err != nil {
-		if redirectErr := h.redirectToLauncher(w, req); redirectErr == nil {
+		if redirectErr := h.redirectToLauncher(w, req, launcherURLParams{}); redirectErr == nil {
 			return
 		}
 
@@ -320,7 +334,7 @@ func (h *Handler) handleForwardError(w http.ResponseWriter, req *http.Request, e
 func (h *Handler) authenticate(ctx context.Context, r *http.Request) (*session, error) {
 	ws, err := h.getAppSession(r)
 	if err != nil {
-		h.log.Warnf("Failed to fetch application session: %v.", err)
+		h.logger.WarnContext(ctx, "Failed to fetch application session", "error", err)
 		return nil, trace.AccessDenied("invalid session")
 	}
 
@@ -328,7 +342,7 @@ func (h *Handler) authenticate(ctx context.Context, r *http.Request) (*session, 
 	// process has seen.
 	session, err := h.getSession(ctx, ws)
 	if err != nil {
-		h.log.Warnf("Failed to get session: %v.", err)
+		h.logger.WarnContext(ctx, "Failed to get session", "error", err)
 		return nil, trace.AccessDenied("invalid session")
 	}
 
@@ -341,18 +355,18 @@ func (h *Handler) authenticate(ctx context.Context, r *http.Request) (*session, 
 func (h *Handler) renewSession(r *http.Request) (*session, error) {
 	ws, err := h.getAppSession(r)
 	if err != nil {
-		h.log.Debugf("Failed to fetch application session: not found.")
+		h.logger.DebugContext(r.Context(), "Failed to fetch application session: not found")
 		return nil, trace.AccessDenied("invalid session")
 	}
 
 	// Remove the session from the cache, this will force a new session to be
 	// generated and cached.
-	h.cache.remove(ws.GetName())
+	h.cache.Remove(ws.GetName())
 
 	// Fetches a new session using the same flow as `authenticate`.
 	session, err := h.getSession(r.Context(), ws)
 	if err != nil {
-		h.log.Warnf("Failed to get session: %v.", err)
+		h.logger.WarnContext(r.Context(), "Failed to get session", "error", err)
 		return nil, trace.AccessDenied("invalid session")
 	}
 
@@ -371,7 +385,7 @@ func (h *Handler) getAppSession(r *http.Request) (ws types.WebSession, err error
 		ws, err = h.getAppSessionFromCookie(r)
 	}
 	if err != nil {
-		h.log.Warnf("Failed to get session: %v.", err)
+		h.logger.WarnContext(r.Context(), "Failed to get session", "error", err)
 		return nil, trace.AccessDenied("invalid session")
 	}
 	return ws, nil
@@ -468,25 +482,13 @@ func (h *Handler) getAppSessionFromCookie(r *http.Request) (types.WebSession, er
 // application service. Always checks if the session is valid first and if so,
 // will return a cached session, otherwise will create one.
 func (h *Handler) getSession(ctx context.Context, ws types.WebSession) (*session, error) {
-	// If a cached session exists, return it right away.
-	session, err := h.cache.get(ws.GetName())
-	if err == nil {
-		return session, nil
-	}
-
-	// Create a new session with a forwarder in it.
-	session, err = h.newSession(ctx, ws)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
 	// Put the session in the cache so the next request can use it.
-	err = h.cache.set(ws.GetName(), session, ws.Expiry().Sub(h.c.Clock.Now()))
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	return session, nil
+	ttl := ws.Expiry().Sub(h.c.Clock.Now())
+	sess, err := utils.FnCacheGetWithTTL(ctx, h.cache, ws.GetName(), ttl, func(ctx context.Context) (*session, error) {
+		sess, err := h.newSession(ctx, ws)
+		return sess, trace.Wrap(err)
+	})
+	return sess, trace.Wrap(err)
 }
 
 // extractCookie extracts the cookie from the *http.Request.
@@ -508,8 +510,8 @@ func HasFragment(r *http.Request) bool {
 	return r.URL.Path == "/x-teleport-auth"
 }
 
-// HasSession checks if an application specific cookie exists.
-func HasSession(r *http.Request) bool {
+// HasSessionCookie checks if an application specific cookie exists.
+func HasSessionCookie(r *http.Request) bool {
 	_, err := r.Cookie(CookieName)
 	return err == nil
 }
@@ -549,7 +551,7 @@ func HasName(r *http.Request, proxyPublicAddrs []utils.NetAddr) (string, bool) {
 	// At this point, it is assumed the caller is requesting an application and
 	// not the proxy, redirect the caller to the application launcher.
 
-	urlString := makeAppRedirectURL(r, proxyPublicAddrs[0].String(), raddr.Host())
+	urlString := makeAppRedirectURL(r, proxyPublicAddrs[0].String(), raddr.Host(), launcherURLParams{})
 	return urlString, true
 }
 
@@ -559,61 +561,118 @@ const (
 
 	// SubjectCookieName is the name of the application session subject cookie.
 	SubjectCookieName = "__Host-grv_app_session_subject"
+
+	// AuthStateCookieName is the name of the state cookie used during the
+	// initial authentication flow.
+	AuthStateCookieName = "__Host-grv_app_auth_state"
 )
 
 // makeAppRedirectURL constructs a URL that will redirect the user to the
 // application launcher route in the web UI.
 //
-// Given app URL example: some-domain.com/arbitrary/path?foo=bar&baz=qux
-// The original requested URL will be separated into three parts:
-//   - hostname (or fqdn): some-domain.com
-//   - path (the URL parts after the app's hostname): arbitrary/path
-//   - query: foo=bar&baz=qux
+// Depending on how user initially accesses the app, the URL construction
+// can take on two formats:
 //
-// which will be constructed into a redirect URL using this form:
-//   - /web/launch/<fqdn>?path=<encoded path>&query=<encoded query>
+//	1: When a user uses the web UI to launch the app, the webapp can
+//	   determine the app's clusterId, publicAddr, and its AWS role name
+//	   (this allows a direct lookup of the app when it's time to create an
+//	   app session) and the launcher route is created with format:
+//	     - /web/launch/<fqdn>/:clusterID?/:publicAddr?/:arn?
+//	   We will need to reconstruct this exact redirect URL when initiating
+//	   an auth exchange (with a stateToken query param).
 //
-// where the final result for the example URL will be:
-//   - /web/launch/some-domain.com?path=%2Farbitrary%2Fpath&query=foo%3Dbar%26baz%3Dqux
+//	2: When a user requests an app outside of web UI (eg. clicking on bookmark)
+//	   aside from knowing the `fqdn`, the other params of the web launcher
+//	   cannot be determined so the launcher route will be constructed as:
+//	     - /web/launch/<fqdn>?path=<encoded path>&query=<encoded query>
+//	   Often bookmarked links will have additional path and queries we will
+//	   need to preserve.
 //
-// The URL is formed this way to help isolate the `fqdn` param
-// from the rest of the URL.
+// Example Flow:
 //
-// The original path and query cannot be formed as `web/launch/<original URL>`
-// because `web/launch` route can differ depending on how the user hits the app
-// endpoint:
-//  1. /web/launch/:fqdn/:clusterID/:publicAddr?/:arn?
-//     This route is formed when user clicks on the web UI's app launcher
-//     button from the application listing screen. The app can be directly
-//     resolved since we are able to determine the app's cluster name,
-//     public address, and AWS role name (if defined).
-//  2. /web/launch/<fqdn>?path=<encoded path>&query=<encoded query>
-//     This route is formed when a user hits the app endpoint outside of
-//     the web UI (clicking from a link or copy/pasta link), and the app will
-//     have to be resolved by the fqdn.
+//  1. When a user requests the app endpoint directly, we will need to redirect
+//     the user to the web launcher first to start the auth exchange.
+//     Example app endpoint: https://some-domain.com/arbitrary/path?foo=bar&baz=qux
 //
-// Isolating the `fqdn` prevents confusing the rest of the param reserved for
-// clusterId, publicAddr, and arn (where the non-query param values are used to
-// create app session). The `web/launcher` will reconstruct the original
-// app URL when ready to redirect the user to the requested endpoint.
-func makeAppRedirectURL(r *http.Request, proxyPublicAddr, hostname string) string {
-	// Note that r.URL.Path field is stored in decoded form where:
-	//  - `/%47%6f%2f` becomes `/Go/`
-	//  - `siema%20elo` becomes `siema elo`
-	// And QueryEscape() will encode spaces as `+`
-	//
-	// QueryEscape is used on the `r.URL.Path` since it is being placed
-	// into the query part of the URL.
-	query := fmt.Sprintf("path=%s", url.QueryEscape(r.URL.Path))
-	if len(r.URL.RawQuery) > 0 {
-		query = fmt.Sprintf("%s&query=%s", query, url.QueryEscape(r.URL.RawQuery))
+//     The original requested URL will be separated into three parts:
+//     - hostname (or fqdn): some-domain.com
+//     - path (the URL parts after the app's hostname): arbitrary/path
+//     - query: foo=bar&baz=qux
+//
+//     which will be constructed into a redirect URL using this form:
+//     - /web/launch/<fqdn>?path=<encoded path>&query=<encoded query>
+//
+//     where the final result for the example URL will be:
+//     - /web/launch/some-domain.com?path=%2Farbitrary%2Fpath&query=foo%3Dbar%26baz%3Dqux
+//
+//  2. Building off from previous step, the web app launcher can now redirect the user
+//     to the apps "x-teleport-auth" endpoint to start the auth exchange:
+//     https://some-domain.com/x-teleport-auth?path=%2Farbitrary%2Fpath&query=foo%3Dbar%26baz%3Dqux
+//
+//     We will need to reconstruct the same URL ^ along with the stateToken created
+//     by server:
+//     - /web/launch/some-domain.com?path=%2Farbitrary%2Fpath&query=foo%3Dbar%26baz%3Dqux&state=ABCD
+//
+// The URL's are formed this way to help isolate the path params reserved for the app
+// launchers route, where order and existence of previous params matter for this route.
+func makeAppRedirectURL(r *http.Request, proxyPublicAddr, addr string, req launcherURLParams) string {
+	if req.requiresAppRedirect {
+		addr = req.publicAddr
+	}
+	u := url.URL{
+		Scheme: "https",
+		Host:   proxyPublicAddr,
+		Path:   fmt.Sprintf("/web/launch/%s", addr),
 	}
 
-	u := url.URL{
-		Scheme:   "https",
-		Host:     proxyPublicAddr,
-		Path:     fmt.Sprintf("/web/launch/%s", hostname),
-		RawQuery: query,
+	// Presence of a stateToken means we are beginning an app auth exchange.
+	if req.stateToken != "" || req.requiresAppRedirect {
+		v := url.Values{}
+		if req.stateToken != "" {
+			v.Add("state", req.stateToken)
+		}
+		v.Add("path", req.path)
+		v.Add("required-apps", req.requiredAppFQDNs)
+		u.RawQuery = v.Encode()
+
+		urlPath := []string{"web", "launch", addr}
+
+		// The order and existence of previous params matter.
+		//
+		// If the user requested app through our web UI (click launch button),
+		// the webapp populate these fields and will be defined.
+		//
+		// If the user requested the app endpoint outside of web UI (click from link),
+		// these fields can't be determined and will be empty.
+		if req.clusterName != "" && req.publicAddr != "" {
+			urlPath = append(urlPath, req.clusterName, req.publicAddr)
+
+			if req.arn != "" {
+				urlPath = append(urlPath, req.arn)
+			}
+		}
+
+		u.Path = path.Join(urlPath...)
+
+	} else {
+		// Hitting this case means the user has hit an endpoint directly
+		// and will need to be redirected to the web launcher to
+		// start the auth exchange.
+
+		// Note that r.URL.Path field is stored as decoded form where:
+		//  - `/%47%6f%2f` becomes `/Go/`
+		//  - `siema%20elo` becomes `siema elo`
+		// So Encode() will just encode it once (note that spaces will be convereted to `+`)
+		v := url.Values{}
+		v.Add("path", r.URL.Path)
+		if req.requiredAppFQDNs != "" {
+			v.Add("required-apps", req.requiredAppFQDNs)
+		}
+
+		if len(r.URL.RawQuery) > 0 {
+			v.Add("query", r.URL.RawQuery)
+		}
+		u.RawQuery = v.Encode()
 	}
 
 	return u.String()

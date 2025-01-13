@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package srv
 
@@ -60,7 +64,7 @@ func (m mockAccessPoint) GetClusterName(opts ...services.MarshalOption) (types.C
 	return m.clusterName, nil
 }
 
-func (m mockAccessPoint) GetClusterNetworkingConfig(ctx context.Context, opts ...services.MarshalOption) (types.ClusterNetworkingConfig, error) {
+func (m mockAccessPoint) GetClusterNetworkingConfig(ctx context.Context) (types.ClusterNetworkingConfig, error) {
 	return m.netConfig, nil
 }
 
@@ -96,8 +100,8 @@ func (m mockAccessChecker) MaxConnections() int64 {
 	return m.maxConnections
 }
 
-func (m mockAccessChecker) PrivateKeyPolicy(defaultPolicy keys.PrivateKeyPolicy) keys.PrivateKeyPolicy {
-	return m.keyPolicy
+func (m mockAccessChecker) PrivateKeyPolicy(defaultPolicy keys.PrivateKeyPolicy) (keys.PrivateKeyPolicy, error) {
+	return m.keyPolicy, nil
 }
 
 func (m mockAccessChecker) RoleNames() []string {
@@ -158,6 +162,10 @@ func TestSessionController_AcquireSessionContext(t *testing.T) {
 			},
 		}
 		return idCtx
+	}
+	assertTrustedDeviceRequired := func(t *testing.T, _ context.Context, err error, _ *eventstest.MockRecorderEmitter) {
+		assert.ErrorContains(t, err, "device", "AcquireSessionContext returned an unexpected error")
+		assert.True(t, trace.IsAccessDenied(err), "AcquireSessionContext returned an error other than trace.AccessDeniedError: %T", err)
 	}
 
 	cases := []struct {
@@ -447,22 +455,17 @@ func TestSessionController_AcquireSessionContext(t *testing.T) {
 			},
 		},
 		{
-			name:     "device extensions not enforced for OSS",
-			cfg:      cfgWithDeviceMode(constants.DeviceTrustModeRequired),
-			identity: minimalIdentity,
-			assertion: func(t *testing.T, _ context.Context, err error, _ *eventstest.MockRecorderEmitter) {
-				assert.NoError(t, err, "AcquireSessionContext returned an unexpected error")
-			},
+			name:      "device extensions enforced for OSS",
+			cfg:       cfgWithDeviceMode(constants.DeviceTrustModeRequired),
+			identity:  minimalIdentity,
+			assertion: assertTrustedDeviceRequired,
 		},
 		{
 			name:      "device extensions enforced for Enterprise",
 			buildType: modules.BuildEnterprise,
 			cfg:       cfgWithDeviceMode(constants.DeviceTrustModeRequired),
 			identity:  minimalIdentity,
-			assertion: func(t *testing.T, _ context.Context, err error, _ *eventstest.MockRecorderEmitter) {
-				assert.ErrorContains(t, err, "device", "AcquireSessionContext returned an unexpected error")
-				assert.True(t, trace.IsAccessDenied(err), "AcquireSessionContext returned an error other than trace.AccessDeniedError: %T", err)
-			},
+			assertion: assertTrustedDeviceRequired,
 		},
 		{
 			name:      "device extensions valid for Enterprise",

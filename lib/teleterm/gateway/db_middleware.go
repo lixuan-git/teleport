@@ -1,35 +1,39 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package gateway
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"errors"
-	"net"
+	"log/slog"
 
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 
 	alpn "github.com/gravitational/teleport/lib/srv/alpnproxy"
 	"github.com/gravitational/teleport/lib/tlsca"
 )
 
 type dbMiddleware struct {
-	onExpiredCert func(context.Context) error
-	log           *logrus.Entry
+	onExpiredCert func(context.Context) (tls.Certificate, error)
+	logger        *slog.Logger
 	dbRoute       tlsca.RouteToDatabase
 }
 
@@ -39,8 +43,8 @@ type dbMiddleware struct {
 //
 // In the future, DBCertChecker is going to be extended so that it's used by both tsh and Connect
 // and this middleware will be removed.
-func (m *dbMiddleware) OnNewConnection(ctx context.Context, lp *alpn.LocalProxy, conn net.Conn) error {
-	err := lp.CheckDBCerts(m.dbRoute)
+func (m *dbMiddleware) OnNewConnection(ctx context.Context, lp *alpn.LocalProxy) error {
+	err := lp.CheckDBCert(ctx, m.dbRoute)
 	if err == nil {
 		return nil
 	}
@@ -50,14 +54,19 @@ func (m *dbMiddleware) OnNewConnection(ctx context.Context, lp *alpn.LocalProxy,
 		return trace.Wrap(err)
 	}
 
-	m.log.WithError(err).Debug("Gateway certificates have expired")
+	m.logger.DebugContext(ctx, "Gateway certificates have expired", "error", err)
 
-	return trace.Wrap(m.onExpiredCert(ctx))
+	cert, err := m.onExpiredCert(ctx)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	lp.SetCert(cert)
+	return nil
 }
 
-// OnStart is a noop. client.DBCertChecker.OnStart checks cert validity too. However in Connect
-// there's no flow which would allow the user to create a local proxy without valid
-// certs.
+// OnStart is a noop. client.DBCertChecker.OnStart checks cert validity. However in Connect there's
+// no flow which would allow the user to create a local proxy without valid certs.
 func (m *dbMiddleware) OnStart(context.Context, *alpn.LocalProxy) error {
 	return nil
 }

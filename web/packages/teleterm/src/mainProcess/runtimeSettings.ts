@@ -1,17 +1,19 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 import fs from 'fs';
@@ -20,12 +22,9 @@ import path from 'path';
 
 import { app } from 'electron';
 
-import Logger from 'teleterm/logger';
-import { staticConfig } from 'teleterm/staticConfig';
-
-import { GrpcServerAddresses, RuntimeSettings } from './types';
 import { loadInstallationId } from './loadInstallationId';
-import { getAgentsDir } from './createAgentConfigFile';
+import { getAvailableShells, getDefaultShell } from './shell';
+import { GrpcServerAddresses, RuntimeSettings } from './types';
 
 const { argv, env } = process;
 
@@ -34,21 +33,30 @@ const RESOURCES_PATH = app.isPackaged
   : path.join(__dirname, '../../../../');
 
 const TSH_BIN_ENV_VAR = 'CONNECT_TSH_BIN_PATH';
-// __dirname of this file in dev mode is webapps/packages/teleterm/build/app/dist/main
-// We default to webapps/../teleport/build/tsh.
+// __dirname of this file in dev mode is teleport/web/packages/teleterm/build/app/main
+// We default to teleport/build/tsh.
 // prettier-ignore
 const TSH_BIN_DEFAULT_PATH_FOR_DEV = path.resolve(
   __dirname,
-  '..', '..', '..', '..', '..', '..', '..', '..',
-  'teleport', 'build', 'tsh',
+  '..', '..', '..', '..', '..', '..',
+  'build', 'tsh',
 );
 
-const dev = env.NODE_ENV === 'development' || env.DEBUG_PROD === 'true';
+// Refer to the docs of RuntimeSettings type for an explanation behind dev, debug and insecure.
+const dev = env.NODE_ENV === 'development';
+// --debug is reserved by Node, so we have to use another flag.
+const debug = argv.includes('--connect-debug') || dev;
+const insecure =
+  argv.includes('--insecure') ||
+  // --insecure is already in our docs, but let's add --connect-insecure too in case Node or
+  // Electron reserves it one day.
+  argv.includes('--connect-insecure') ||
+  // The flag is needed because it's not easy to pass a flag to the app in dev mode. `pnpm
+  // start-term` causes a bunch of package scripts to be executed and each would have to pass the
+  // flag one level down.
+  (dev && !!env.CONNECT_INSECURE);
 
-// Allows running tsh in insecure mode (development)
-const isInsecure = dev || argv.includes('--insecure');
-
-export function getRuntimeSettings(): RuntimeSettings {
+export async function getRuntimeSettings(): Promise<RuntimeSettings> {
   const userDataDir = app.getPath('userData');
   const sessionDataDir = app.getPath('sessionData');
   const tempDataDir = app.getPath('temp');
@@ -65,25 +73,14 @@ export function getRuntimeSettings(): RuntimeSettings {
   // Before switching to the recommended path, we need to investigate the impact of this change.
   // https://www.electronjs.org/docs/latest/api/app#appgetpathname
   const logsDir = path.join(userDataDir, 'logs');
-  // DO NOT expose agentsDir through RuntimeSettings. See the comment in getAgentsDir.
-  const agentsDir = getAgentsDir(userDataDir);
+  const installationId = loadInstallationId(
+    path.resolve(app.getPath('userData'), 'installation_id')
+  );
 
   const tshd = {
-    insecure: isInsecure,
     binaryPath: tshBinPath,
     homeDir: getTshHomeDir(),
     requestedNetworkAddress: tshAddress,
-    flags: [
-      'daemon',
-      'start',
-      // grpc-js requires us to pass localhost:port for TCP connections,
-      // for tshd we have to specify the protocol as well.
-      `--addr=${tshAddress}`,
-      `--certs-dir=${getCertsDir()}`,
-      `--prehog-addr=${staticConfig.prehogAddress}`,
-      `--kubeconfigs-dir=${kubeConfigsDir}`,
-      `--agents-dir=${agentsDir}`,
-    ],
   };
   const sharedProcess = {
     requestedNetworkAddress: sharedAddress,
@@ -93,21 +90,19 @@ export function getRuntimeSettings(): RuntimeSettings {
   };
 
   // To start the app in dev mode, we run `electron path_to_main.js`. It means
-  //  that the app is run without package.json context, so it can not read the version
+  // that the app is run without package.json context, so it can not read the version
   // from it.
   // The way we run Electron can be changed (`electron .`), but it has one major
   // drawback - dev app and bundled app will use the same app data directory.
   //
   // A workaround is to read the version from `process.env.npm_package_version`.
   const appVersion = dev ? process.env.npm_package_version : app.getVersion();
-
-  if (isInsecure) {
-    tshd.flags.unshift('--debug');
-    tshd.flags.unshift('--insecure');
-  }
+  const availableShells = await getAvailableShells();
 
   return {
     dev,
+    debug,
+    insecure,
     tshd,
     sharedProcess,
     tshdEvents,
@@ -117,13 +112,12 @@ export function getRuntimeSettings(): RuntimeSettings {
     binDir,
     agentBinaryPath: path.resolve(sessionDataDir, 'teleport', 'teleport'),
     certsDir: getCertsDir(),
-    defaultShell: getDefaultShell(),
+    availableShells,
+    defaultOsShellId: getDefaultShell(availableShells),
     kubeConfigsDir,
     logsDir,
     platform: process.platform,
-    installationId: loadInstallationId(
-      path.resolve(app.getPath('userData'), 'installation_id')
-    ),
+    installationId,
     arch: os.arch(),
     osVersion: os.release(),
     appVersion,
@@ -208,29 +202,6 @@ function getBinaryPaths(): { binDir?: string; tshBinPath: string } {
 
 export function getAssetPath(...paths: string[]): string {
   return path.join(RESOURCES_PATH, 'assets', ...paths);
-}
-
-function getDefaultShell(): string {
-  const logger = new Logger();
-  switch (process.platform) {
-    case 'linux':
-    case 'darwin': {
-      const fallbackShell = 'bash';
-      const { shell } = os.userInfo();
-
-      if (!shell) {
-        logger.error(
-          `Failed to read ${process.platform} platform default shell, using fallback: ${fallbackShell}.\n`
-        );
-
-        return fallbackShell;
-      }
-
-      return shell;
-    }
-    case 'win32':
-      return 'powershell.exe';
-  }
 }
 
 /**

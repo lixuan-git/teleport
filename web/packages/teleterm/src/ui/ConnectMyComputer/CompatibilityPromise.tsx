@@ -1,50 +1,57 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React from 'react';
-import { Text, ButtonPrimary, Alert } from 'design';
-
+import { Alert, ButtonPrimary, Flex, Text } from 'design';
 import Link from 'design/Link';
 
+import { RuntimeSettings } from 'teleterm/mainProcess/types';
 import { useAppContext } from 'teleterm/ui/appContextProvider';
 import { useWorkspaceContext } from 'teleterm/ui/Documents';
-import { RuntimeSettings } from 'teleterm/mainProcess/types';
 
 const CONNECT_MY_COMPUTER_RELEASE_VERSION = '14.1.0';
 const CONNECT_MY_COMPUTER_RELEASE_MAJOR_VERSION = 14;
 
-export function isAgentCompatible(
+export type AgentCompatibility = 'unknown' | 'compatible' | 'incompatible';
+
+export function checkAgentCompatibility(
   proxyVersion: string,
   runtimeSettings: Pick<RuntimeSettings, 'appVersion' | 'isLocalBuild'>
-): boolean {
-  if (proxyVersion === '') {
-    return false;
+): AgentCompatibility {
+  // The proxy version is not immediately available
+  // (it requires fetching a cluster with details).
+  // Because of that, we have to return 'unknown' when we do not yet know it.
+  if (!proxyVersion) {
+    return 'unknown';
   }
   if (runtimeSettings.isLocalBuild) {
-    return true;
+    return 'compatible';
   }
   const majorAppVersion = getMajorVersion(runtimeSettings.appVersion);
   const majorClusterVersion = getMajorVersion(proxyVersion);
-  return (
-    majorAppVersion === majorClusterVersion ||
+  return majorAppVersion === majorClusterVersion ||
     majorAppVersion === majorClusterVersion - 1 // app one major version behind the cluster
-  );
+    ? 'compatible'
+    : 'incompatible';
 }
 
-export function CompatibilityError(): JSX.Element {
+export function CompatibilityError(props: {
+  hideAlert?: boolean;
+}): JSX.Element {
   const { proxyVersion, appVersion } = useVersions();
 
   const clusterMajorVersion = getMajorVersion(proxyVersion);
@@ -85,8 +92,12 @@ export function CompatibilityError(): JSX.Element {
   }
 
   return (
-    <>
-      <Alert>Detected an incompatible agent version.</Alert>
+    <Flex flexDirection="column" gap={2}>
+      {!props.hideAlert && (
+        <Alert mb={0}>
+          The agent version is not compatible with the cluster version
+        </Alert>
+      )}
       <Text>
         The cluster is on version {proxyVersion} while Teleport Connect is on
         version {appVersion}. Per our{' '}
@@ -99,7 +110,6 @@ export function CompatibilityError(): JSX.Element {
         {$content}
       </Text>
       <ButtonPrimary
-        mt={3}
         mx="auto"
         type="button"
         as="a"
@@ -109,7 +119,7 @@ export function CompatibilityError(): JSX.Element {
       >
         Visit the downloads page
       </ButtonPrimary>
-    </>
+    </Flex>
   );
 }
 

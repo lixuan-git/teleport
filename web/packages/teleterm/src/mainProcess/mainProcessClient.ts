@@ -1,41 +1,98 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 import { ipcRenderer } from 'electron';
 
+import { CreateAgentConfigFileArgs } from 'teleterm/mainProcess/createAgentConfigFile';
 import { createFileStorageClient } from 'teleterm/services/fileStorage';
-import { AgentConfigFileClusterProperties } from 'teleterm/mainProcess/createAgentConfigFile';
 import { RootClusterUri } from 'teleterm/ui/uri';
 
 import { createConfigServiceClient } from '../services/config';
-
-import { openTerminalContextMenu } from './contextMenus/terminalContextMenu';
 import { openTabContextMenu } from './contextMenus/tabContextMenu';
-
+import { openTerminalContextMenu } from './contextMenus/terminalContextMenu';
 import {
-  MainProcessClient,
-  ChildProcessAddresses,
   AgentProcessState,
+  ChildProcessAddresses,
+  MainProcessClient,
+  MainProcessIpc,
+  RendererIpc,
+  WindowsManagerIpc,
 } from './types';
 
 export default function createMainProcessClient(): MainProcessClient {
   return {
-    getRuntimeSettings() {
-      return ipcRenderer.sendSync('main-process-get-runtime-settings');
+    /*
+     * Listeners for messages received by the renderer from the main process.
+     */
+    subscribeToNativeThemeUpdate: listener => {
+      const onThemeChange = (_, value: { shouldUseDarkColors: boolean }) =>
+        listener(value);
+      ipcRenderer.addListener(RendererIpc.NativeThemeUpdate, onThemeChange);
+      return {
+        cleanup: () =>
+          ipcRenderer.removeListener(
+            RendererIpc.NativeThemeUpdate,
+            onThemeChange
+          ),
+      };
     },
+    subscribeToAgentUpdate: (rootClusterUri, listener) => {
+      const onChange = (
+        _,
+        eventRootClusterUri: RootClusterUri,
+        eventState: AgentProcessState
+      ) => {
+        if (eventRootClusterUri === rootClusterUri) {
+          listener(eventState);
+        }
+      };
+      ipcRenderer.addListener(
+        RendererIpc.ConnectMyComputerAgentUpdate,
+        onChange
+      );
+      return {
+        cleanup: () =>
+          ipcRenderer.removeListener(
+            RendererIpc.ConnectMyComputerAgentUpdate,
+            onChange
+          ),
+      };
+    },
+    subscribeToDeepLinkLaunch: listener => {
+      const ipcListener = (event, args) => {
+        listener(args);
+      };
+
+      ipcRenderer.addListener(RendererIpc.DeepLinkLaunch, ipcListener);
+      return {
+        cleanup: () =>
+          ipcRenderer.removeListener(RendererIpc.DeepLinkLaunch, ipcListener),
+      };
+    },
+
+    /*
+     * Messages sent from the renderer to the main process.
+     */
+    getRuntimeSettings() {
+      return ipcRenderer.sendSync(MainProcessIpc.GetRuntimeSettings);
+    },
+    // TODO(ravicious): Convert the rest of IPC channels to use enums defined in types.ts such as
+    // MainProcessIpc rather than hardcoded strings.
     getResolvedChildProcessAddresses(): Promise<ChildProcessAddresses> {
       return ipcRenderer.invoke(
         'main-process-get-resolved-child-process-addresses'
@@ -66,89 +123,71 @@ export default function createMainProcessClient(): MainProcessClient {
     shouldUseDarkColors() {
       return ipcRenderer.sendSync('main-process-should-use-dark-colors');
     },
-    subscribeToNativeThemeUpdate: listener => {
-      const onThemeChange = (_, value: { shouldUseDarkColors: boolean }) =>
-        listener(value);
-      const channel = 'main-process-native-theme-update';
-      ipcRenderer.addListener(channel, onThemeChange);
-      return {
-        cleanup: () => ipcRenderer.removeListener(channel, onThemeChange),
-      };
-    },
     downloadAgent() {
-      return ipcRenderer.invoke(
-        'main-process-connect-my-computer-download-agent'
-      );
+      return ipcRenderer.invoke(MainProcessIpc.DownloadConnectMyComputerAgent);
     },
-    createAgentConfigFile(clusterProperties: AgentConfigFileClusterProperties) {
+    verifyAgent() {
+      return ipcRenderer.invoke(MainProcessIpc.VerifyConnectMyComputerAgent);
+    },
+    createAgentConfigFile(args: CreateAgentConfigFileArgs) {
       return ipcRenderer.invoke(
         'main-process-connect-my-computer-create-agent-config-file',
-        clusterProperties
+        args
       );
     },
-    isAgentConfigFileCreated(clusterProperties: {
-      rootClusterUri: RootClusterUri;
-    }) {
+    isAgentConfigFileCreated(args: { rootClusterUri: RootClusterUri }) {
       return ipcRenderer.invoke(
         'main-process-connect-my-computer-is-agent-config-file-created',
-        clusterProperties
+        args
       );
     },
-    removeAgentDirectory(clusterProperties: {
-      rootClusterUri: RootClusterUri;
-    }) {
+    removeAgentDirectory(args: { rootClusterUri: RootClusterUri }) {
       return ipcRenderer.invoke(
         'main-process-connect-my-computer-remove-agent-directory',
-        clusterProperties
+        args
       );
     },
-    openAgentLogsDirectory(clusterProperties: {
-      rootClusterUri: RootClusterUri;
-    }) {
+    tryRemoveConnectMyComputerAgentBinary() {
       return ipcRenderer.invoke(
-        'main-process-open-agent-logs-directory',
-        clusterProperties
+        MainProcessIpc.TryRemoveConnectMyComputerAgentBinary
       );
     },
-    killAgent(clusterProperties: { rootClusterUri: RootClusterUri }) {
+    openAgentLogsDirectory(args: { rootClusterUri: RootClusterUri }) {
+      return ipcRenderer.invoke('main-process-open-agent-logs-directory', args);
+    },
+    killAgent(args: { rootClusterUri: RootClusterUri }) {
       return ipcRenderer.invoke(
         'main-process-connect-my-computer-kill-agent',
-        clusterProperties
+        args
       );
     },
-    runAgent(clusterProperties: { rootClusterUri: RootClusterUri }) {
+    runAgent(args: { rootClusterUri: RootClusterUri }) {
       return ipcRenderer.invoke(
         'main-process-connect-my-computer-run-agent',
-        clusterProperties
+        args
       );
     },
-    getAgentState(clusterProperties: { rootClusterUri: RootClusterUri }) {
+    getAgentState(args: { rootClusterUri: RootClusterUri }) {
       return ipcRenderer.sendSync(
         'main-process-connect-my-computer-get-agent-state',
-        clusterProperties
+        args
       );
     },
-    getAgentLogs(clusterProperties: { rootClusterUri: RootClusterUri }) {
+    getAgentLogs(args: { rootClusterUri: RootClusterUri }) {
       return ipcRenderer.sendSync(
         'main-process-connect-my-computer-get-agent-logs',
-        clusterProperties
+        args
       );
     },
-    subscribeToAgentUpdate: (rootClusterUri, listener) => {
-      const onChange = (
-        _,
-        eventRootClusterUri: RootClusterUri,
-        eventState: AgentProcessState
-      ) => {
-        if (eventRootClusterUri === rootClusterUri) {
-          listener(eventState);
-        }
-      };
-      const channel = 'main-process-connect-my-computer-agent-update';
-      ipcRenderer.addListener(channel, onChange);
-      return {
-        cleanup: () => ipcRenderer.removeListener(channel, onChange),
-      };
+    /**
+     * Signals to the windows manager that the UI has been fully initialized, that is the user has
+     * interacted with the relevant modals during startup and is free to use the app.
+     */
+    signalUserInterfaceReadiness(args: { success: boolean }) {
+      ipcRenderer.send(WindowsManagerIpc.SignalUserInterfaceReadiness, args);
+    },
+    refreshClusterList() {
+      ipcRenderer.send(MainProcessIpc.RefreshClusterList);
     },
   };
 }

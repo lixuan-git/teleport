@@ -1,18 +1,20 @@
-/*
-Copyright 2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 // eventGroupTypes contains a map of events that were grouped under the same
 // event type but have different event codes. This is used to filter out duplicate
@@ -25,6 +27,7 @@ export const eventGroupTypes = {
   sftp: 'SFTP',
   subsystem: 'Subsystem Request',
   'user.login': 'User Logins',
+  'spiffe.svid.issued': 'SPIFFE SVID Issuance',
 };
 
 /**
@@ -65,6 +68,11 @@ export const eventCodes = {
   DATABASE_SESSION_STARTED_FAILURE: 'TDB00W',
   DATABASE_SESSION_STARTED: 'TDB00I',
   DATABASE_SESSION_MALFORMED_PACKET: 'TDB06I',
+  DATABASE_SESSION_PERMISSIONS_UPDATE: 'TDB07I',
+  DATABASE_SESSION_USER_CREATE: 'TDB08I',
+  DATABASE_SESSION_USER_CREATE_FAILURE: 'TDB08W',
+  DATABASE_SESSION_USER_DEACTIVATE: 'TDB09I',
+  DATABASE_SESSION_USER_DEACTIVATE_FAILURE: 'TDB09W',
   DATABASE_CREATED: 'TDB03I',
   DATABASE_UPDATED: 'TDB04I',
   DATABASE_DELETED: 'TDB05I',
@@ -116,10 +124,13 @@ export const eventCodes = {
   DEVICE_ENROLL: 'TV005I',
   DEVICE_AUTHENTICATE: 'TV006I',
   DEVICE_UPDATE: 'TV007I',
+  DEVICE_WEB_TOKEN_CREATE: 'TV008I',
+  DEVICE_AUTHENTICATE_CONFIRM: 'TV009I',
   EXEC_FAILURE: 'T3002E',
   EXEC: 'T3002I',
   GITHUB_CONNECTOR_CREATED: 'T8000I',
   GITHUB_CONNECTOR_DELETED: 'T8001I',
+  GITHUB_CONNECTOR_UPDATED: 'T80002I', // extra 0 is intentional
   KUBE_REQUEST: 'T3009I',
   KUBE_CREATED: 'T3010I',
   KUBE_UPDATED: 'T3011I',
@@ -130,7 +141,9 @@ export const eventCodes = {
   MFA_DEVICE_DELETE: 'T1007I',
   OIDC_CONNECTOR_CREATED: 'T8100I',
   OIDC_CONNECTOR_DELETED: 'T8101I',
+  OIDC_CONNECTOR_UPDATED: 'T8102I',
   PORTFORWARD_FAILURE: 'T3003E',
+  PORTFORWARD_STOP: 'T3003S',
   PORTFORWARD: 'T3003I',
   RECOVERY_TOKEN_CREATED: 'T6001I',
   PRIVILEGE_TOKEN_CREATED: 'T6002I',
@@ -140,28 +153,19 @@ export const eventCodes = {
   RESET_PASSWORD_TOKEN_CREATED: 'T6000I',
   ROLE_CREATED: 'T9000I',
   ROLE_DELETED: 'T9001I',
+  ROLE_UPDATED: 'T9002I',
   SAML_CONNECTOR_CREATED: 'T8200I',
   SAML_CONNECTOR_DELETED: 'T8201I',
+  SAML_CONNECTOR_UPDATED: 'T8202I',
   SCP_DOWNLOAD_FAILURE: 'T3004E',
   SCP_DOWNLOAD: 'T3004I',
   SCP_UPLOAD_FAILURE: 'T3005E',
   SCP_UPLOAD: 'T3005I',
+  SCP_DISALLOWED: 'T3010E',
   SFTP_OPEN_FAILURE: 'TS001E',
   SFTP_OPEN: 'TS001I',
-  SFTP_CLOSE_FAILURE: 'TS002E',
-  SFTP_CLOSE: 'TS002I',
-  SFTP_READ_FAILURE: 'TS003E',
-  SFTP_READ: 'TS003I',
-  SFTP_WRITE_FAILURE: 'TS004E',
-  SFTP_WRITE: 'TS004I',
-  SFTP_LSTAT_FAILURE: 'TS005E',
-  SFTP_LSTAT: 'TS005I',
-  SFTP_FSTAT_FAILURE: 'TS006E',
-  SFTP_FSTAT: 'TS006I',
   SFTP_SETSTAT_FAILURE: 'TS007E',
   SFTP_SETSTAT: 'TS007I',
-  SFTP_FSETSTAT_FAILURE: 'TS008E',
-  SFTP_FSETSTAT: 'TS008I',
   SFTP_OPENDIR_FAILURE: 'TS009E',
   SFTP_OPENDIR: 'TS009I',
   SFTP_READDIR_FAILURE: 'TS010E',
@@ -172,16 +176,14 @@ export const eventCodes = {
   SFTP_MKDIR: 'TS012I',
   SFTP_RMDIR_FAILURE: 'TS013E',
   SFTP_RMDIR: 'TS013I',
-  SFTP_REALPATH_FAILURE: 'TS014E',
-  SFTP_REALPATH: 'TS014I',
-  SFTP_STAT_FAILURE: 'TS015E',
-  SFTP_STAT: 'TS015I',
   SFTP_RENAME_FAILURE: 'TS016E',
   SFTP_RENAME: 'TS016I',
-  SFTP_READLINK_FAILURE: 'TS017E',
-  SFTP_READLINK: 'TS017I',
   SFTP_SYMLINK_FAILURE: 'TS018E',
   SFTP_SYMLINK: 'TS018I',
+  SFTP_LINK: 'TS019I',
+  SFTP_LINK_FAILURE: 'TS019E',
+  SFTP_DISALLOWED: 'TS020E',
+  SFTP_SUMMARY: 'TS021I',
   SESSION_COMMAND: 'T4000I',
   SESSION_DATA: 'T2006I',
   SESSION_DISK: 'T4001I',
@@ -214,13 +216,28 @@ export const eventCodes = {
   USER_SSO_LOGINFAILURE: 'T1001W',
   USER_SSO_TEST_FLOW_LOGIN: 'T1010I',
   USER_SSO_TEST_FLOW_LOGINFAILURE: 'T1011W',
+  USER_HEADLESS_LOGIN_REQUESTED: 'T1012I',
+  USER_HEADLESS_LOGIN_APPROVED: 'T1013I',
+  USER_HEADLESS_LOGIN_APPROVEDFAILURE: 'T1013W',
+  USER_HEADLESS_LOGIN_REJECTED: 'T1014W',
+  CREATE_MFA_AUTH_CHALLENGE: 'T1015I',
+  VALIDATE_MFA_AUTH_RESPONSE: 'T1016I',
+  VALIDATE_MFA_AUTH_RESPONSEFAILURE: 'T1016W',
   USER_UPDATED: 'T1003I',
   X11_FORWARD: 'T3008I',
   X11_FORWARD_FAILURE: 'T3008W',
   CERTIFICATE_CREATED: 'TC000I',
   UPGRADE_WINDOW_UPDATED: 'TUW01I',
   BOT_JOIN: 'TJ001I',
+  BOT_JOIN_FAILURE: 'TJ001E',
   INSTANCE_JOIN: 'TJ002I',
+  INSTANCE_JOIN_FAILURE: 'TJ002E',
+  BOT_CREATED: 'TB001I',
+  BOT_UPDATED: 'TB002I',
+  BOT_DELETED: 'TB003I',
+  WORKLOAD_IDENTITY_CREATE: `WID001I`,
+  WORKLOAD_IDENTITY_UPDATE: `WID002I`,
+  WORKLOAD_IDENTITY_DELETE: `WID003I`,
   LOGIN_RULE_CREATE: 'TLR00I',
   LOGIN_RULE_DELETE: 'TLR01I',
   SAML_IDP_AUTH_ATTEMPT: 'TSI000I',
@@ -239,6 +256,10 @@ export const eventCodes = {
   OKTA_ASSIGNMENT_PROCESS_FAILURE: 'TOK004E',
   OKTA_ASSIGNMENT_CLEANUP: 'TOK005I',
   OKTA_ASSIGNMENT_CLEANUP_FAILURE: 'TOK005E',
+  OKTA_ACCESS_LIST_SYNC: 'TOK006I',
+  OKTA_ACCESS_LIST_SYNC_FAILURE: 'TOK006E',
+  OKTA_USER_SYNC: 'TOK007I',
+  OKTA_USER_SYNC_FAILURE: 'TOK007E',
   ACCESS_LIST_CREATE: 'TAL001I',
   ACCESS_LIST_CREATE_FAILURE: 'TAL001E',
   ACCESS_LIST_UPDATE: 'TAL002I',
@@ -255,6 +276,42 @@ export const eventCodes = {
   ACCESS_LIST_MEMBER_DELETE_FAILURE: 'TAL007E',
   ACCESS_LIST_MEMBER_DELETE_ALL_FOR_ACCESS_LIST: 'TAL008I',
   ACCESS_LIST_MEMBER_DELETE_ALL_FOR_ACCESS_LIST_FAILURE: 'TAL008E',
+  USER_LOGIN_INVALID_ACCESS_LIST: 'TAL009W',
+  SECURITY_REPORT_AUDIT_QUERY_RUN: 'SRE001I',
+  SECURITY_REPORT_RUN: 'SRE002I',
+  EXTERNAL_AUDIT_STORAGE_ENABLE: 'TEA001I',
+  EXTERNAL_AUDIT_STORAGE_DISABLE: 'TEA002I',
+  SPIFFE_SVID_ISSUED: 'TSPIFFE000I',
+  SPIFFE_SVID_ISSUED_FAILURE: 'TSPIFFE000E',
+  AUTH_PREFERENCE_UPDATE: 'TCAUTH001I',
+  CLUSTER_NETWORKING_CONFIG_UPDATE: 'TCNET002I',
+  SESSION_RECORDING_CONFIG_UPDATE: 'TCREC003I',
+  ACCESS_GRAPH_PATH_CHANGED: 'TAG001I',
+  SPANNER_RPC: 'TSPN001I',
+  SPANNER_RPC_DENIED: 'TSPN001W',
+  DISCOVERY_CONFIG_CREATE: 'DC001I',
+  DISCOVERY_CONFIG_UPDATE: 'DC002I',
+  DISCOVERY_CONFIG_DELETE: 'DC003I',
+  DISCOVERY_CONFIG_DELETE_ALL: 'DC004I',
+  INTEGRATION_CREATE: 'IG001I',
+  INTEGRATION_UPDATE: 'IG002I',
+  INTEGRATION_DELETE: 'IG003I',
+  STATIC_HOST_USER_CREATE: 'SHU001I',
+  STATIC_HOST_USER_UPDATE: 'SHU002I',
+  STATIC_HOST_USER_DELETE: 'SHU003I',
+  CROWN_JEWEL_CREATE: 'CJ001I',
+  CROWN_JEWEL_UPDATE: 'CJ002I',
+  CROWN_JEWEL_DELETE: 'CJ003I',
+  USER_TASK_CREATE: 'UT001I',
+  USER_TASK_UPDATE: 'UT002I',
+  USER_TASK_DELETE: 'UT003I',
+  PLUGIN_CREATE: 'PG001I',
+  PLUGIN_UPDATE: 'PG002I',
+  PLUGIN_DELETE: 'PG003I',
+  CONTACT_CREATE: 'TCTC001I',
+  CONTACT_DELETE: 'TCTC002I',
+  GIT_COMMAND: 'TGIT001I',
+  GIT_COMMAND_FAILURE: 'TGIT001E',
 } as const;
 
 /**
@@ -275,7 +332,7 @@ export type RawEvents = {
   >;
   [eventCodes.ACCESS_REQUEST_RESOURCE_SEARCH]: RawEvent<
     typeof eventCodes.ACCESS_REQUEST_RESOURCE_SEARCH,
-    { resource_type: string; search_as_roles: string }
+    { resource_type: string; search_as_roles: string[] }
   >;
   [eventCodes.AUTH_ATTEMPT_FAILURE]: RawEventAuthFailure<
     typeof eventCodes.AUTH_ATTEMPT_FAILURE
@@ -331,13 +388,20 @@ export type RawEvents = {
   [eventCodes.GITHUB_CONNECTOR_DELETED]: RawEventConnector<
     typeof eventCodes.GITHUB_CONNECTOR_DELETED
   >;
+  [eventCodes.GITHUB_CONNECTOR_UPDATED]: RawEventConnector<
+    typeof eventCodes.GITHUB_CONNECTOR_UPDATED
+  >;
   [eventCodes.OIDC_CONNECTOR_CREATED]: RawEventConnector<
     typeof eventCodes.OIDC_CONNECTOR_CREATED
   >;
   [eventCodes.OIDC_CONNECTOR_DELETED]: RawEventConnector<
     typeof eventCodes.OIDC_CONNECTOR_DELETED
   >;
+  [eventCodes.OIDC_CONNECTOR_UPDATED]: RawEventConnector<
+    typeof eventCodes.OIDC_CONNECTOR_UPDATED
+  >;
   [eventCodes.PORTFORWARD]: RawEvent<typeof eventCodes.PORTFORWARD>;
+  [eventCodes.PORTFORWARD_STOP]: RawEvent<typeof eventCodes.PORTFORWARD_STOP>;
   [eventCodes.PORTFORWARD_FAILURE]: RawEvent<
     typeof eventCodes.PORTFORWARD_FAILURE,
     {
@@ -349,6 +413,9 @@ export type RawEvents = {
   >;
   [eventCodes.SAML_CONNECTOR_DELETED]: RawEventConnector<
     typeof eventCodes.SAML_CONNECTOR_DELETED
+  >;
+  [eventCodes.SAML_CONNECTOR_UPDATED]: RawEventConnector<
+    typeof eventCodes.SAML_CONNECTOR_UPDATED
   >;
   [eventCodes.SCP_DOWNLOAD]: RawEvent<
     typeof eventCodes.SCP_DOWNLOAD,
@@ -376,37 +443,19 @@ export type RawEvents = {
       exitError: string;
     }
   >;
+  [eventCodes.SCP_DISALLOWED]: RawEvent<
+    typeof eventCodes.SCP_DISALLOWED,
+    {
+      user: string;
+    }
+  >;
   [eventCodes.SFTP_OPEN]: RawEventSFTP<typeof eventCodes.SFTP_OPEN>;
   [eventCodes.SFTP_OPEN_FAILURE]: RawEventSFTP<
     typeof eventCodes.SFTP_OPEN_FAILURE
   >;
-  [eventCodes.SFTP_CLOSE]: RawEventSFTP<typeof eventCodes.SFTP_CLOSE>;
-  [eventCodes.SFTP_CLOSE_FAILURE]: RawEventSFTP<
-    typeof eventCodes.SFTP_CLOSE_FAILURE
-  >;
-  [eventCodes.SFTP_READ]: RawEventSFTP<typeof eventCodes.SFTP_READ>;
-  [eventCodes.SFTP_READ_FAILURE]: RawEventSFTP<
-    typeof eventCodes.SFTP_READ_FAILURE
-  >;
-  [eventCodes.SFTP_WRITE]: RawEventSFTP<typeof eventCodes.SFTP_WRITE>;
-  [eventCodes.SFTP_WRITE_FAILURE]: RawEventSFTP<
-    typeof eventCodes.SFTP_WRITE_FAILURE
-  >;
-  [eventCodes.SFTP_LSTAT]: RawEventSFTP<typeof eventCodes.SFTP_LSTAT>;
-  [eventCodes.SFTP_LSTAT_FAILURE]: RawEventSFTP<
-    typeof eventCodes.SFTP_LSTAT_FAILURE
-  >;
-  [eventCodes.SFTP_FSTAT]: RawEventSFTP<typeof eventCodes.SFTP_FSTAT>;
-  [eventCodes.SFTP_FSTAT_FAILURE]: RawEventSFTP<
-    typeof eventCodes.SFTP_FSTAT_FAILURE
-  >;
   [eventCodes.SFTP_SETSTAT]: RawEventSFTP<typeof eventCodes.SFTP_SETSTAT>;
   [eventCodes.SFTP_SETSTAT_FAILURE]: RawEventSFTP<
     typeof eventCodes.SFTP_SETSTAT_FAILURE
-  >;
-  [eventCodes.SFTP_FSETSTAT]: RawEventSFTP<typeof eventCodes.SFTP_FSETSTAT>;
-  [eventCodes.SFTP_FSETSTAT_FAILURE]: RawEventSFTP<
-    typeof eventCodes.SFTP_FSETSTAT_FAILURE
   >;
   [eventCodes.SFTP_OPENDIR]: RawEventSFTP<typeof eventCodes.SFTP_OPENDIR>;
   [eventCodes.SFTP_OPENDIR_FAILURE]: RawEventSFTP<
@@ -428,26 +477,19 @@ export type RawEvents = {
   [eventCodes.SFTP_RMDIR_FAILURE]: RawEventSFTP<
     typeof eventCodes.SFTP_RMDIR_FAILURE
   >;
-  [eventCodes.SFTP_REALPATH]: RawEventSFTP<typeof eventCodes.SFTP_REALPATH>;
-  [eventCodes.SFTP_REALPATH_FAILURE]: RawEventSFTP<
-    typeof eventCodes.SFTP_REALPATH_FAILURE
-  >;
-  [eventCodes.SFTP_STAT]: RawEventSFTP<typeof eventCodes.SFTP_STAT>;
-  [eventCodes.SFTP_STAT_FAILURE]: RawEventSFTP<
-    typeof eventCodes.SFTP_STAT_FAILURE
-  >;
   [eventCodes.SFTP_RENAME]: RawEventSFTP<typeof eventCodes.SFTP_RENAME>;
   [eventCodes.SFTP_RENAME_FAILURE]: RawEventSFTP<
     typeof eventCodes.SFTP_RENAME_FAILURE
-  >;
-  [eventCodes.SFTP_READLINK]: RawEventSFTP<typeof eventCodes.SFTP_READLINK>;
-  [eventCodes.SFTP_READLINK_FAILURE]: RawEventSFTP<
-    typeof eventCodes.SFTP_READLINK_FAILURE
   >;
   [eventCodes.SFTP_SYMLINK]: RawEventSFTP<typeof eventCodes.SFTP_SYMLINK>;
   [eventCodes.SFTP_SYMLINK_FAILURE]: RawEventSFTP<
     typeof eventCodes.SFTP_SYMLINK_FAILURE
   >;
+  [eventCodes.SFTP_LINK]: RawEventSFTP<typeof eventCodes.SFTP_LINK>;
+  [eventCodes.SFTP_LINK_FAILURE]: RawEventSFTP<
+    typeof eventCodes.SFTP_LINK_FAILURE
+  >;
+  [eventCodes.SFTP_DISALLOWED]: RawEventSFTP<typeof eventCodes.SFTP_DISALLOWED>;
   [eventCodes.SESSION_COMMAND]: RawEventCommand<
     typeof eventCodes.SESSION_COMMAND
   >;
@@ -498,6 +540,11 @@ export type RawEvents = {
     typeof eventCodes.SESSION_START,
     {
       sid: string;
+      kubernetes_cluster: string;
+      proto: string;
+      server_hostname: string;
+      server_addr: string;
+      server_id: string;
     }
   >;
   [eventCodes.SESSION_REJECT]: RawEvent<
@@ -594,8 +641,24 @@ export type RawEvents = {
       error: string;
     }
   >;
+  [eventCodes.USER_HEADLESS_LOGIN_REQUESTED]: RawEvent<
+    typeof eventCodes.USER_HEADLESS_LOGIN_REQUESTED
+  >;
+  [eventCodes.USER_HEADLESS_LOGIN_APPROVED]: RawEvent<
+    typeof eventCodes.USER_HEADLESS_LOGIN_APPROVED
+  >;
+  [eventCodes.USER_HEADLESS_LOGIN_APPROVEDFAILURE]: RawEvent<
+    typeof eventCodes.USER_HEADLESS_LOGIN_APPROVEDFAILURE,
+    {
+      error: string;
+    }
+  >;
+  [eventCodes.USER_HEADLESS_LOGIN_REJECTED]: RawEvent<
+    typeof eventCodes.USER_HEADLESS_LOGIN_REJECTED
+  >;
   [eventCodes.ROLE_CREATED]: RawEvent<typeof eventCodes.ROLE_CREATED, HasName>;
   [eventCodes.ROLE_DELETED]: RawEvent<typeof eventCodes.ROLE_DELETED, HasName>;
+  [eventCodes.ROLE_UPDATED]: RawEvent<typeof eventCodes.ROLE_UPDATED, HasName>;
   [eventCodes.TRUSTED_CLUSTER_TOKEN_CREATED]: RawEvent<
     typeof eventCodes.TRUSTED_CLUSTER_TOKEN_CREATED
   >;
@@ -700,6 +763,47 @@ export type RawEvents = {
       name: string;
       db_service: string;
       db_name: string;
+    }
+  >;
+  [eventCodes.DATABASE_SESSION_PERMISSIONS_UPDATE]: RawEvent<
+    typeof eventCodes.DATABASE_SESSION_PERMISSIONS_UPDATE,
+    {
+      name: string;
+      db_service: string;
+      db_name: string;
+      db_user: string;
+      permission_summary: {
+        permission: string;
+        counts: { [key: string]: number };
+      }[];
+    }
+  >;
+  [eventCodes.DATABASE_SESSION_USER_CREATE]: RawDatabaseSessionEvent<
+    typeof eventCodes.DATABASE_SESSION_USER_CREATE,
+    {
+      roles: string[];
+    }
+  >;
+  [eventCodes.DATABASE_SESSION_USER_CREATE_FAILURE]: RawDatabaseSessionEvent<
+    typeof eventCodes.DATABASE_SESSION_USER_CREATE_FAILURE,
+    {
+      error: string;
+      message: string;
+      roles: string[];
+    }
+  >;
+  [eventCodes.DATABASE_SESSION_USER_DEACTIVATE]: RawDatabaseSessionEvent<
+    typeof eventCodes.DATABASE_SESSION_USER_DEACTIVATE,
+    {
+      delete: boolean;
+    }
+  >;
+  [eventCodes.DATABASE_SESSION_USER_DEACTIVATE_FAILURE]: RawDatabaseSessionEvent<
+    typeof eventCodes.DATABASE_SESSION_USER_DEACTIVATE_FAILURE,
+    {
+      error: string;
+      message: string;
+      delete: boolean;
     }
   >;
   [eventCodes.DATABASE_CREATED]: RawEvent<
@@ -1020,6 +1124,8 @@ export type RawEvents = {
     typeof eventCodes.DESKTOP_SESSION_STARTED,
     {
       desktop_addr: string;
+      desktop_name: string;
+      sid: string;
       windows_user: string;
       windows_domain: string;
     }
@@ -1028,6 +1134,7 @@ export type RawEvents = {
     typeof eventCodes.DESKTOP_SESSION_STARTED_FAILED,
     {
       desktop_addr: string;
+      desktop_name: string;
       windows_user: string;
       windows_domain: string;
     }
@@ -1036,6 +1143,8 @@ export type RawEvents = {
     typeof eventCodes.DESKTOP_SESSION_ENDED,
     {
       desktop_addr: string;
+      desktop_name: string;
+      sid: string;
       windows_user: string;
       windows_domain: string;
     }
@@ -1125,6 +1234,12 @@ export type RawEvents = {
     typeof eventCodes.DEVICE_AUTHENTICATE
   >;
   [eventCodes.DEVICE_UPDATE]: RawDeviceEvent<typeof eventCodes.DEVICE_UPDATE>;
+  [eventCodes.DEVICE_WEB_TOKEN_CREATE]: RawDeviceEvent<
+    typeof eventCodes.DEVICE_WEB_TOKEN_CREATE
+  >;
+  [eventCodes.DEVICE_AUTHENTICATE_CONFIRM]: RawDeviceEvent<
+    typeof eventCodes.DEVICE_AUTHENTICATE_CONFIRM
+  >;
   [eventCodes.UNKNOWN]: RawEvent<
     typeof eventCodes.UNKNOWN,
     {
@@ -1190,6 +1305,13 @@ export type RawEvents = {
       method: string;
     }
   >;
+  [eventCodes.BOT_JOIN_FAILURE]: RawEvent<
+    typeof eventCodes.BOT_JOIN,
+    {
+      bot_name: string;
+      method: string;
+    }
+  >;
   [eventCodes.INSTANCE_JOIN]: RawEvent<
     typeof eventCodes.INSTANCE_JOIN,
     {
@@ -1197,6 +1319,29 @@ export type RawEvents = {
       method: string;
       role: string;
     }
+  >;
+  [eventCodes.INSTANCE_JOIN_FAILURE]: RawEvent<
+    typeof eventCodes.INSTANCE_JOIN,
+    {
+      node_name: string;
+      method: string;
+      role: string;
+    }
+  >;
+  [eventCodes.BOT_CREATED]: RawEvent<typeof eventCodes.BOT_CREATED, HasName>;
+  [eventCodes.BOT_UPDATED]: RawEvent<typeof eventCodes.BOT_UPDATED, HasName>;
+  [eventCodes.BOT_DELETED]: RawEvent<typeof eventCodes.BOT_DELETED, HasName>;
+  [eventCodes.WORKLOAD_IDENTITY_CREATE]: RawEvent<
+    typeof eventCodes.WORKLOAD_IDENTITY_CREATE,
+    HasName
+  >;
+  [eventCodes.WORKLOAD_IDENTITY_UPDATE]: RawEvent<
+    typeof eventCodes.WORKLOAD_IDENTITY_UPDATE,
+    HasName
+  >;
+  [eventCodes.WORKLOAD_IDENTITY_DELETE]: RawEvent<
+    typeof eventCodes.WORKLOAD_IDENTITY_DELETE,
+    HasName
   >;
   [eventCodes.LOGIN_RULE_CREATE]: RawEvent<
     typeof eventCodes.LOGIN_RULE_CREATE,
@@ -1321,6 +1466,23 @@ export type RawEvents = {
       source: string;
     }
   >;
+  [eventCodes.OKTA_USER_SYNC]: RawEvent<
+    typeof eventCodes.OKTA_USER_SYNC,
+    {
+      num_users_created: number;
+      num_users_modified: number;
+      num_users_deleted: number;
+    }
+  >;
+  [eventCodes.OKTA_USER_SYNC_FAILURE]: RawEvent<
+    typeof eventCodes.OKTA_USER_SYNC_FAILURE
+  >;
+  [eventCodes.OKTA_ACCESS_LIST_SYNC]: RawEvent<
+    typeof eventCodes.OKTA_ACCESS_LIST_SYNC
+  >;
+  [eventCodes.OKTA_ACCESS_LIST_SYNC_FAILURE]: RawEvent<
+    typeof eventCodes.OKTA_ACCESS_LIST_SYNC_FAILURE
+  >;
   [eventCodes.ACCESS_LIST_CREATE]: RawEvent<
     typeof eventCodes.ACCESS_LIST_CREATE,
     {
@@ -1377,53 +1539,23 @@ export type RawEvents = {
       updated_by: string;
     }
   >;
-  [eventCodes.ACCESS_LIST_MEMBER_CREATE]: RawEvent<
-    typeof eventCodes.ACCESS_LIST_MEMBER_CREATE,
-    {
-      access_list_name: string;
-      member_name: string;
-      updated_by: string;
-    }
+  [eventCodes.ACCESS_LIST_MEMBER_CREATE]: RawEventAccessList<
+    typeof eventCodes.ACCESS_LIST_MEMBER_CREATE
   >;
-  [eventCodes.ACCESS_LIST_MEMBER_CREATE_FAILURE]: RawEvent<
-    typeof eventCodes.ACCESS_LIST_MEMBER_CREATE_FAILURE,
-    {
-      access_list_name: string;
-      member_name: string;
-      updated_by: string;
-    }
+  [eventCodes.ACCESS_LIST_MEMBER_CREATE_FAILURE]: RawEventAccessList<
+    typeof eventCodes.ACCESS_LIST_MEMBER_CREATE_FAILURE
   >;
-  [eventCodes.ACCESS_LIST_MEMBER_UPDATE]: RawEvent<
-    typeof eventCodes.ACCESS_LIST_MEMBER_UPDATE,
-    {
-      access_list_name: string;
-      member_name: string;
-      updated_by: string;
-    }
+  [eventCodes.ACCESS_LIST_MEMBER_UPDATE]: RawEventAccessList<
+    typeof eventCodes.ACCESS_LIST_MEMBER_UPDATE
   >;
-  [eventCodes.ACCESS_LIST_MEMBER_UPDATE_FAILURE]: RawEvent<
-    typeof eventCodes.ACCESS_LIST_MEMBER_UPDATE_FAILURE,
-    {
-      access_list_name: string;
-      member_name: string;
-      updated_by: string;
-    }
+  [eventCodes.ACCESS_LIST_MEMBER_UPDATE_FAILURE]: RawEventAccessList<
+    typeof eventCodes.ACCESS_LIST_MEMBER_UPDATE_FAILURE
   >;
-  [eventCodes.ACCESS_LIST_MEMBER_DELETE]: RawEvent<
-    typeof eventCodes.ACCESS_LIST_MEMBER_DELETE,
-    {
-      access_list_name: string;
-      member_name: string;
-      updated_by: string;
-    }
+  [eventCodes.ACCESS_LIST_MEMBER_DELETE]: RawEventAccessList<
+    typeof eventCodes.ACCESS_LIST_MEMBER_DELETE
   >;
-  [eventCodes.ACCESS_LIST_MEMBER_DELETE_FAILURE]: RawEvent<
-    typeof eventCodes.ACCESS_LIST_MEMBER_DELETE_FAILURE,
-    {
-      access_list_name: string;
-      member_name: string;
-      updated_by: string;
-    }
+  [eventCodes.ACCESS_LIST_MEMBER_DELETE_FAILURE]: RawEventAccessList<
+    typeof eventCodes.ACCESS_LIST_MEMBER_DELETE_FAILURE
   >;
   [eventCodes.ACCESS_LIST_MEMBER_DELETE_ALL_FOR_ACCESS_LIST]: RawEvent<
     typeof eventCodes.ACCESS_LIST_MEMBER_DELETE_ALL_FOR_ACCESS_LIST,
@@ -1439,12 +1571,226 @@ export type RawEvents = {
       updated_by: string;
     }
   >;
+  [eventCodes.USER_LOGIN_INVALID_ACCESS_LIST]: RawEvent<
+    typeof eventCodes.USER_LOGIN_INVALID_ACCESS_LIST,
+    {
+      access_list_name: string;
+      user: string;
+      missing_roles: string[];
+    }
+  >;
+  [eventCodes.SECURITY_REPORT_AUDIT_QUERY_RUN]: RawEvent<
+    typeof eventCodes.SECURITY_REPORT_AUDIT_QUERY_RUN,
+    {
+      query: string;
+      total_execution_time_in_millis: string;
+      total_data_scanned_in_bytes: string;
+    }
+  >;
+  [eventCodes.SECURITY_REPORT_RUN]: RawEvent<
+    typeof eventCodes.SECURITY_REPORT_RUN,
+    {
+      name: string;
+      total_execution_time_in_millis: string;
+      total_data_scanned_in_bytes: string;
+    }
+  >;
+  [eventCodes.EXTERNAL_AUDIT_STORAGE_ENABLE]: RawEvent<
+    typeof eventCodes.EXTERNAL_AUDIT_STORAGE_ENABLE,
+    {
+      updated_by: string;
+    }
+  >;
+  [eventCodes.EXTERNAL_AUDIT_STORAGE_DISABLE]: RawEvent<
+    typeof eventCodes.EXTERNAL_AUDIT_STORAGE_DISABLE,
+    {
+      updated_by: string;
+    }
+  >;
+  [eventCodes.CREATE_MFA_AUTH_CHALLENGE]: RawEvent<
+    typeof eventCodes.CREATE_MFA_AUTH_CHALLENGE,
+    {
+      user: string;
+    }
+  >;
+  [eventCodes.VALIDATE_MFA_AUTH_RESPONSE]: RawEvent<
+    typeof eventCodes.VALIDATE_MFA_AUTH_RESPONSE,
+    {
+      user: string;
+    }
+  >;
+  [eventCodes.VALIDATE_MFA_AUTH_RESPONSEFAILURE]: RawEvent<
+    typeof eventCodes.VALIDATE_MFA_AUTH_RESPONSEFAILURE,
+    {
+      user: string;
+    }
+  >;
+  [eventCodes.SPIFFE_SVID_ISSUED]: RawEvent<
+    typeof eventCodes.SPIFFE_SVID_ISSUED,
+    {
+      spiffe_id: string;
+    }
+  >;
+  [eventCodes.SPIFFE_SVID_ISSUED_FAILURE]: RawEvent<
+    typeof eventCodes.SPIFFE_SVID_ISSUED_FAILURE,
+    {
+      spiffe_id: string;
+    }
+  >;
+  [eventCodes.AUTH_PREFERENCE_UPDATE]: RawEvent<
+    typeof eventCodes.AUTH_PREFERENCE_UPDATE,
+    {
+      user: string;
+    }
+  >;
+  [eventCodes.CLUSTER_NETWORKING_CONFIG_UPDATE]: RawEvent<
+    typeof eventCodes.CLUSTER_NETWORKING_CONFIG_UPDATE,
+    {
+      user: string;
+    }
+  >;
+  [eventCodes.SESSION_RECORDING_CONFIG_UPDATE]: RawEvent<
+    typeof eventCodes.SESSION_RECORDING_CONFIG_UPDATE,
+    {
+      user: string;
+    }
+  >;
+  [eventCodes.ACCESS_GRAPH_PATH_CHANGED]: RawEvent<
+    typeof eventCodes.ACCESS_GRAPH_PATH_CHANGED,
+    {
+      change_id: string;
+      affected_resource_name: string;
+      affected_resource_source: string;
+      affected_resource_kind: string;
+    }
+  >;
+  [eventCodes.SPANNER_RPC]: RawSpannerRPCEvent<typeof eventCodes.SPANNER_RPC>;
+  [eventCodes.SPANNER_RPC_DENIED]: RawSpannerRPCEvent<
+    typeof eventCodes.SPANNER_RPC_DENIED
+  >;
+  [eventCodes.DISCOVERY_CONFIG_CREATE]: RawEvent<
+    typeof eventCodes.DISCOVERY_CONFIG_CREATE,
+    HasName
+  >;
+  [eventCodes.DISCOVERY_CONFIG_UPDATE]: RawEvent<
+    typeof eventCodes.DISCOVERY_CONFIG_UPDATE,
+    HasName
+  >;
+  [eventCodes.DISCOVERY_CONFIG_DELETE]: RawEvent<
+    typeof eventCodes.DISCOVERY_CONFIG_DELETE,
+    HasName
+  >;
+  [eventCodes.DISCOVERY_CONFIG_DELETE_ALL]: RawEvent<
+    typeof eventCodes.DISCOVERY_CONFIG_DELETE_ALL
+  >;
+  [eventCodes.INTEGRATION_CREATE]: RawEvent<
+    typeof eventCodes.INTEGRATION_CREATE,
+    HasName
+  >;
+  [eventCodes.INTEGRATION_UPDATE]: RawEvent<
+    typeof eventCodes.INTEGRATION_UPDATE,
+    HasName
+  >;
+  [eventCodes.INTEGRATION_DELETE]: RawEvent<
+    typeof eventCodes.INTEGRATION_DELETE,
+    HasName
+  >;
+  [eventCodes.STATIC_HOST_USER_CREATE]: RawEvent<
+    typeof eventCodes.STATIC_HOST_USER_CREATE,
+    HasName
+  >;
+  [eventCodes.STATIC_HOST_USER_UPDATE]: RawEvent<
+    typeof eventCodes.STATIC_HOST_USER_UPDATE,
+    HasName
+  >;
+  [eventCodes.STATIC_HOST_USER_DELETE]: RawEvent<
+    typeof eventCodes.STATIC_HOST_USER_DELETE,
+    HasName
+  >;
+  [eventCodes.CROWN_JEWEL_CREATE]: RawEvent<
+    typeof eventCodes.CROWN_JEWEL_CREATE,
+    HasName
+  >;
+  [eventCodes.CROWN_JEWEL_UPDATE]: RawEvent<
+    typeof eventCodes.CROWN_JEWEL_UPDATE,
+    HasName
+  >;
+  [eventCodes.CROWN_JEWEL_DELETE]: RawEvent<
+    typeof eventCodes.CROWN_JEWEL_DELETE,
+    HasName
+  >;
+  [eventCodes.USER_TASK_CREATE]: RawEvent<
+    typeof eventCodes.USER_TASK_CREATE,
+    HasName
+  >;
+  [eventCodes.USER_TASK_UPDATE]: RawEvent<
+    typeof eventCodes.USER_TASK_UPDATE,
+    HasName
+  >;
+  [eventCodes.USER_TASK_DELETE]: RawEvent<
+    typeof eventCodes.USER_TASK_DELETE,
+    HasName
+  >;
+  [eventCodes.PLUGIN_CREATE]: RawEvent<
+    typeof eventCodes.PLUGIN_CREATE,
+    Merge<HasName, { plugin_type: string }>
+  >;
+  [eventCodes.PLUGIN_UPDATE]: RawEvent<
+    typeof eventCodes.PLUGIN_UPDATE,
+    Merge<HasName, { plugin_type: string }>
+  >;
+  [eventCodes.PLUGIN_DELETE]: RawEvent<
+    typeof eventCodes.PLUGIN_DELETE,
+    Merge<HasName, { user: string }>
+  >;
+  [eventCodes.SFTP_SUMMARY]: RawEvent<
+    typeof eventCodes.SFTP_SUMMARY,
+    {
+      user: string;
+      server_hostname: string;
+    }
+  >;
+  [eventCodes.CONTACT_CREATE]: RawEvent<
+    typeof eventCodes.CONTACT_CREATE,
+    {
+      email: string;
+      contact_type: number;
+    }
+  >;
+  [eventCodes.CONTACT_DELETE]: RawEvent<
+    typeof eventCodes.CONTACT_DELETE,
+    {
+      email: string;
+      contact_type: number;
+    }
+  >;
+  [eventCodes.GIT_COMMAND]: RawEvent<
+    typeof eventCodes.GIT_COMMAND,
+    {
+      service: string;
+      path: string;
+      actions?: {
+        action: string;
+        reference: string;
+        new?: string;
+        old?: string;
+      }[];
+    }
+  >;
+  [eventCodes.GIT_COMMAND_FAILURE]: RawEvent<
+    typeof eventCodes.GIT_COMMAND_FAILURE,
+    {
+      service: string;
+      path: string;
+      exitError: string;
+    }
+  >;
 };
 
 /**
  * Event Code
  */
-export type EventCode = typeof eventCodes[keyof typeof eventCodes];
+export type EventCode = (typeof eventCodes)[keyof typeof eventCodes];
 
 type HasName = {
   name: string;
@@ -1575,6 +1921,15 @@ type RawEventUserToken<T extends EventCode> = RawEvent<
   }
 >;
 
+type RawEventAccessList<T extends EventCode> = RawEvent<
+  T,
+  {
+    access_list_name: string;
+    members: { member_name: string }[];
+    updated_by: string;
+  }
+>;
+
 type RawEventUser<T extends EventCode> = RawEvent<
   T,
   {
@@ -1603,6 +1958,30 @@ type RawEventSFTP<T extends EventCode> = RawEvent<
     path: string;
     error: string;
     ['addr.local']: string;
+  }
+>;
+
+type RawDatabaseSessionEvent<T extends EventCode, K = unknown> = Merge<
+  RawEvent<
+    T,
+    {
+      name: string;
+      db_service: string;
+      db_name: string;
+      db_user: string;
+      username: string;
+    }
+  >,
+  K
+>;
+
+type RawSpannerRPCEvent<T extends EventCode> = RawEvent<
+  T,
+  {
+    procedure: string;
+    db_service: string;
+    db_name: string;
+    args: { sql?: string };
   }
 >;
 

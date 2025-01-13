@@ -1,34 +1,33 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+import { render, screen } from 'design/utils/testing';
 import { Attempt } from 'shared/hooks/useAttemptNext';
 
-import { render, screen } from 'design/utils/testing';
-import React from 'react';
-
 import { RecoveryCodes, ResetToken } from 'teleport/services/auth';
-import { NewCredentialsProps } from 'teleport/Welcome/NewCredentials/types';
-import { NewCredentials } from 'teleport/Welcome/NewCredentials/NewCredentials';
-import { mockUserContextProviderWith } from 'teleport/User/testHelpers/mockUserContextWith';
 import { makeTestUserContext } from 'teleport/User/testHelpers/makeTestUserContext';
+import { mockUserContextProviderWith } from 'teleport/User/testHelpers/mockUserContextWith';
+import { NewCredentials } from 'teleport/Welcome/NewCredentials/NewCredentials';
+import { NewCredentialsProps } from 'teleport/Welcome/NewCredentials/types';
 
 const attempt: Attempt = { status: '' };
 const failedAttempt: Attempt = { status: 'failed' };
 const processingAttempt: Attempt = { status: 'processing' };
-const successAttempt: Attempt = { status: 'success', statusText: 'hey' };
 
 const resetToken: ResetToken = {
   tokenId: 'tokenId',
@@ -48,13 +47,13 @@ const makeProps = (): NewCredentialsProps => {
     submitAttempt: attempt,
     clearSubmitAttempt: () => {},
     onSubmit: () => {},
+    createNewWebAuthnDevice: () => {},
     onSubmitWithWebauthn: () => {},
     resetToken: resetToken,
     recoveryCodes: recoveryCodes,
     redirect: () => {},
     success: false,
     finishedRegister: () => {},
-    privateKeyPolicyEnabled: false,
     resetMode: false,
     isDashboard: false,
   };
@@ -80,32 +79,9 @@ test.each(nullCases)('renders $attempt as null', testCase => {
   expect(container).toBeEmptyDOMElement();
 });
 
-test('renders Reset Complete for success and private key policy enabled during reset', () => {
-  const props = makeProps();
-  props.fetchAttempt = successAttempt;
-  props.success = true;
-  props.privateKeyPolicyEnabled = true;
-  props.resetMode = true;
-  render(<NewCredentials {...props} />);
-
-  expect(screen.getByText(/Reset Complete/i)).toBeInTheDocument();
-});
-
-test('renders Registration Complete for success and private key policy enabled during registration', () => {
-  const props = makeProps();
-  props.fetchAttempt = { status: 'success' };
-  props.success = true;
-  props.privateKeyPolicyEnabled = true;
-  props.resetMode = false;
-  render(<NewCredentials {...props} />);
-
-  expect(screen.getByText(/Registration Complete/i)).toBeInTheDocument();
-});
-
 test('renders Register Success on success', () => {
   const props = makeProps();
   props.fetchAttempt = { status: 'success' };
-  props.privateKeyPolicyEnabled = false;
   props.recoveryCodes = undefined;
   props.success = true;
   render(<NewCredentials {...props} />);
@@ -137,7 +113,9 @@ test('renders credential flow for passwordless', () => {
   props.primaryAuthType = 'passwordless';
   render(<NewCredentials {...props} />);
 
-  expect(screen.getByText(/Set A Passwordless Device/i)).toBeInTheDocument();
+  expect(
+    screen.getByText(/Set up Passwordless Authentication/i)
+  ).toBeInTheDocument();
 });
 
 test('renders credential flow for local', () => {
@@ -172,6 +150,21 @@ test('renders questionnaire', () => {
   props.displayOnboardingQuestionnaire = true;
   props.setDisplayOnboardingQuestionnaire = () => {};
   props.Questionnaire = () => <div>Passed Component!</div>;
+  render(<NewCredentials {...props} />);
+
+  expect(screen.getByText(/Passed Component!/i)).toBeInTheDocument();
+});
+
+test('renders invite collaborators', () => {
+  mockUserContextProviderWith(makeTestUserContext());
+
+  const props = makeProps();
+  props.fetchAttempt = { status: 'success' };
+  props.success = true;
+  props.recoveryCodes = undefined;
+  props.displayInviteCollaborators = true;
+  props.setDisplayInviteCollaborators = () => {};
+  props.InviteCollaborators = () => <div>Passed Component!</div>;
   render(<NewCredentials {...props} />);
 
   expect(screen.getByText(/Passed Component!/i)).toBeInTheDocument();

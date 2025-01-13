@@ -1,18 +1,20 @@
-/*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 /* MIT License
 
@@ -38,7 +40,7 @@ SOFTWARE.
 
 */
 
-import React from 'react';
+import { forwardRef } from 'react';
 
 import { Icon, IconProps } from '../Icon';
 
@@ -48,9 +50,15 @@ THIS FILE IS GENERATED. DO NOT EDIT.
 
 */
 
-export function Sun({ size = 24, color, ...otherProps }: IconProps) {
-  return (
-    <Icon size={size} color={color} className="icon icon-sun" {...otherProps}>
+export const Sun = forwardRef<HTMLSpanElement, IconProps>(
+  ({ size = 24, color, ...otherProps }, ref) => (
+    <Icon
+      size={size}
+      color={color}
+      className="icon icon-sun"
+      {...otherProps}
+      ref={ref}
+    >
       <path d="M12 0.75C12.4142 0.75 12.75 1.08579 12.75 1.5V3.75C12.75 4.16421 12.4142 4.5 12 4.5C11.5858 4.5 11.25 4.16421 11.25 3.75V1.5C11.25 1.08579 11.5858 0.75 12 0.75Z" />
       <path
         fillRule="evenodd"
@@ -65,5 +73,5 @@ export function Sun({ size = 24, color, ...otherProps }: IconProps) {
       <path d="M12 19.5C12.4142 19.5 12.75 19.8358 12.75 20.25V22.5C12.75 22.9142 12.4142 23.25 12 23.25C11.5858 23.25 11.25 22.9142 11.25 22.5V20.25C11.25 19.8358 11.5858 19.5 12 19.5Z" />
       <path d="M20.25 11.25C19.8358 11.25 19.5 11.5858 19.5 12C19.5 12.4142 19.8358 12.75 20.25 12.75H22.5C22.9142 12.75 23.25 12.4142 23.25 12C23.25 11.5858 22.9142 11.25 22.5 11.25H20.25Z" />
     </Icon>
-  );
-}
+  )
+);

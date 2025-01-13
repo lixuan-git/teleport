@@ -1,42 +1,51 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package common
 
 import (
+	"bufio"
 	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"os"
 	"os/user"
+	"path"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gogo/protobuf/jsonpb"
 	"github.com/gravitational/trace"
 	"github.com/pkg/sftp"
-	log "github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 
 	"github.com/gravitational/teleport"
 	apievents "github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/events"
-	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/lib/srv"
 )
 
 const (
@@ -73,17 +82,97 @@ func (c compositeCh) Close() error {
 	return trace.NewAggregate(c.r.Close(), c.w.Close())
 }
 
-// sftpHandler provides handlers for a SFTP server.
-type sftpHandler struct {
-	logger *log.Entry
-	events chan<- *apievents.SFTP
+type allowedOps struct {
+	write bool
+	path  string
 }
 
-func newSFTPHandler(logger *log.Entry, events chan<- *apievents.SFTP) *sftpHandler {
-	return &sftpHandler{
-		logger: logger,
-		events: events,
+// sftpHandler provides handlers for a SFTP server.
+type sftpHandler struct {
+	logger  *slog.Logger
+	allowed *allowedOps
+
+	// mtx protects files
+	mtx   sync.Mutex
+	files []*trackedFile
+
+	events chan<- apievents.AuditEvent
+}
+
+type trackedFile struct {
+	file         *os.File
+	bytesRead    atomic.Uint64
+	bytesWritten atomic.Uint64
+}
+
+func (t *trackedFile) ReadAt(b []byte, off int64) (int, error) {
+	n, err := t.file.ReadAt(b, off)
+	t.bytesRead.Add(uint64(n))
+	return n, err
+}
+
+func (t *trackedFile) WriteAt(b []byte, off int64) (int, error) {
+	n, err := t.file.WriteAt(b, off)
+	t.bytesWritten.Add(uint64(n))
+	return n, err
+}
+
+func (t *trackedFile) Close() error {
+	return t.file.Close()
+}
+
+func newSFTPHandler(logger *slog.Logger, req *srv.FileTransferRequest, events chan<- apievents.AuditEvent) (*sftpHandler, error) {
+	var allowed *allowedOps
+	if req != nil {
+		allowed = &allowedOps{
+			write: !req.Download,
+		}
+		// TODO(capnspacehook): reject relative paths and symlinks
+		// make filepaths consistent by ensuring all separators use backslashes
+		allowed.path = path.Clean(req.Location)
 	}
+
+	return &sftpHandler{
+		logger:  logger,
+		allowed: allowed,
+		events:  events,
+	}, nil
+}
+
+func newDisallowedErr(req *sftp.Request) error {
+	return fmt.Errorf("method %s is not allowed on %s", strings.ToLower(req.Method), req.Filepath)
+}
+
+// ensureReqIsAllowed returns an error if the SFTP request isn't
+// allowed based on the approved file transfer request for this session.
+func (s *sftpHandler) ensureReqIsAllowed(req *sftp.Request) error {
+	// no specifically allowed operations, all requests are allowed
+	if s.allowed == nil {
+		return nil
+	}
+
+	if s.allowed.path != path.Clean(req.Filepath) {
+		return newDisallowedErr(req)
+	}
+
+	switch req.Method {
+	case methodLstat, methodStat:
+		// these methods are allowed
+	case methodGet:
+		// only allow reads for downloads
+		if s.allowed.write {
+			return newDisallowedErr(req)
+		}
+	case methodPut, methodSetStat:
+		// only allow writes and chmods for uploads
+		if !s.allowed.write {
+			return newDisallowedErr(req)
+		}
+	default:
+		return newDisallowedErr(req)
+	}
+
+	return nil
 }
 
 // OpenFile handles 'open' requests when opening a file for reading
@@ -128,7 +217,11 @@ func (s *sftpHandler) Filewrite(req *sftp.Request) (_ io.WriterAt, retErr error)
 	return s.openFile(req)
 }
 
-func (s *sftpHandler) openFile(req *sftp.Request) (*os.File, error) {
+func (s *sftpHandler) openFile(req *sftp.Request) (sftp.WriterAtReaderAt, error) {
+	if err := s.ensureReqIsAllowed(req); err != nil {
+		return nil, err
+	}
+
 	var flags int
 	pflags := req.Pflags()
 	if pflags.Append {
@@ -156,14 +249,18 @@ func (s *sftpHandler) openFile(req *sftp.Request) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
+	trackFile := &trackedFile{file: f}
+	s.mtx.Lock()
+	s.files = append(s.files, trackFile)
+	s.mtx.Unlock()
 
-	return f, nil
+	return trackFile, nil
 }
 
 // Filecmd handles file modification requests.
 func (s *sftpHandler) Filecmd(req *sftp.Request) (retErr error) {
 	defer func() {
-		if retErr == sftp.ErrSSHFxOpUnsupported {
+		if errors.Is(retErr, sftp.ErrSSHFxOpUnsupported) {
 			return
 		}
 		s.sendSFTPEvent(req, retErr)
@@ -171,6 +268,9 @@ func (s *sftpHandler) Filecmd(req *sftp.Request) (retErr error) {
 
 	if req.Filepath == "" {
 		return os.ErrInvalid
+	}
+	if err := s.ensureReqIsAllowed(req); err != nil {
+		return err
 	}
 
 	switch req.Method {
@@ -306,6 +406,9 @@ func (s *sftpHandler) Filelist(req *sftp.Request) (_ sftp.ListerAt, retErr error
 	if req.Filepath == "" {
 		return nil, os.ErrInvalid
 	}
+	if err := s.ensureReqIsAllowed(req); err != nil {
+		return nil, err
+	}
 
 	switch req.Method {
 	case methodList:
@@ -344,6 +447,9 @@ func (s *sftpHandler) Lstat(req *sftp.Request) (sftp.ListerAt, error) {
 	if req.Filepath == "" {
 		return nil, os.ErrInvalid
 	}
+	if err := s.ensureReqIsAllowed(req); err != nil {
+		return nil, err
+	}
 
 	fi, err := os.Lstat(req.Filepath)
 	if err != nil {
@@ -354,6 +460,7 @@ func (s *sftpHandler) Lstat(req *sftp.Request) (sftp.ListerAt, error) {
 }
 
 func (s *sftpHandler) sendSFTPEvent(req *sftp.Request, reqErr error) {
+	ctx := context.TODO()
 	event := &apievents.SFTP{
 		Metadata: apievents.Metadata{
 			Type: events.SFTPEvent,
@@ -426,13 +533,13 @@ func (s *sftpHandler) sendSFTPEvent(req *sftp.Request, reqErr error) {
 		}
 		event.Action = apievents.SFTPAction_LINK
 	default:
-		s.logger.Warnf("Unknown SFTP request %q", req.Method)
+		s.logger.WarnContext(ctx, "Unknown SFTP request", "request", req.Method)
 		return
 	}
 
 	wd, err := os.Getwd()
 	if err != nil {
-		s.logger.WithError(err).Warn("Failed to get working dir.")
+		s.logger.WarnContext(ctx, "Failed to get working dir", "error", err)
 	}
 
 	event.WorkingDirectory = wd
@@ -463,7 +570,7 @@ func (s *sftpHandler) sendSFTPEvent(req *sftp.Request, reqErr error) {
 		}
 	}
 	if reqErr != nil {
-		s.logger.Debugf("%s: %v", req.Method, reqErr)
+		s.logger.DebugContext(ctx, "failed handling SFTP request", "request", req.Method, "error", reqErr)
 		// If possible, strip the filename from the error message. The
 		// path will be included in audit events already, no need to
 		// make the error message longer than it needs to be.
@@ -492,7 +599,6 @@ func onSFTP() error {
 		return trace.Wrap(err)
 	}
 	defer chw.Close()
-	ch := compositeCh{chr, chw}
 	auditFile, err := openFD(5, "audit")
 	if err != nil {
 		return trace.Wrap(err)
@@ -500,9 +606,7 @@ func onSFTP() error {
 	defer auditFile.Close()
 
 	// Ensure the parent process will receive log messages from us
-	l := utils.NewLogger()
-	l.SetOutput(os.Stderr)
-	logger := l.WithField(trace.Component, teleport.ComponentSubsystemSFTP)
+	logger := slog.With(teleport.ComponentKey, teleport.ComponentSubsystemSFTP)
 
 	currentUser, err := user.Current()
 	if err != nil {
@@ -513,8 +617,34 @@ func onSFTP() error {
 		return trace.Wrap(err)
 	}
 
-	sftpEvents := make(chan *apievents.SFTP, 1)
-	h := newSFTPHandler(logger, sftpEvents)
+	// Read the file transfer request for this session if one exists
+	bufferedReader := bufio.NewReader(chr)
+	var encodedReq []byte
+	var fileTransferReq *srv.FileTransferRequest
+	for {
+		b, err := bufferedReader.ReadByte()
+		if err != nil {
+			return trace.Wrap(err)
+		}
+		// the encoded request will end with a null byte
+		if b == 0x0 {
+			break
+		}
+		encodedReq = append(encodedReq, b)
+	}
+	if len(encodedReq) != 0 {
+		fileTransferReq = new(srv.FileTransferRequest)
+		if err := json.Unmarshal(encodedReq, fileTransferReq); err != nil {
+			return trace.Wrap(err)
+		}
+	}
+	ch := compositeCh{io.NopCloser(bufferedReader), chw}
+
+	sftpEvents := make(chan apievents.AuditEvent, 1)
+	h, err := newSFTPHandler(logger, fileTransferReq, sftpEvents)
+	if err != nil {
+		return trace.Wrap(err)
+	}
 	handler := sftp.Handlers{
 		FileGet:  h,
 		FilePut:  h,
@@ -523,6 +653,7 @@ func onSFTP() error {
 	}
 	sftpSrv := sftp.NewRequestServer(ch, handler, sftp.WithStartDirectory(currentUser.HomeDir))
 
+	ctx := context.TODO()
 	// Start a goroutine to marshal and send audit events to the parent
 	// process to avoid blocking the SFTP connection on event handling
 	done := make(chan struct{})
@@ -530,17 +661,24 @@ func onSFTP() error {
 		var m jsonpb.Marshaler
 		var buf bytes.Buffer
 		for event := range sftpEvents {
+			oneOfEvent, err := apievents.ToOneOf(event)
+			if err != nil {
+				logger.WarnContext(ctx, "Failed to convert SFTP event to OneOf", "error", err)
+				continue
+			}
+
 			buf.Reset()
-			if err := m.Marshal(&buf, event); err != nil {
-				logger.WithError(err).Warn("Failed to marshal SFTP event.")
-			} else {
-				// Append a NULL byte so the parent process will know where
-				// this event ends
-				buf.WriteByte(0x0)
-				_, err = io.Copy(auditFile, &buf)
-				if err != nil {
-					logger.WithError(err).Warn("Failed to send SFTP event to parent.")
-				}
+			if err := m.Marshal(&buf, oneOfEvent); err != nil {
+				logger.WarnContext(ctx, "Failed to marshal SFTP event", "error", err)
+				continue
+			}
+
+			// Append a NULL byte so the parent process will know where
+			// this event ends
+			buf.WriteByte(0x0)
+			_, err = io.Copy(auditFile, &buf)
+			if err != nil {
+				logger.WarnContext(ctx, "Failed to send SFTP event to parent", "error", err)
 			}
 		}
 
@@ -553,6 +691,25 @@ func onSFTP() error {
 	} else {
 		serveErr = trace.Wrap(serveErr)
 	}
+
+	// Send a summary event last
+	summaryEvent := &apievents.SFTPSummary{
+		Metadata: apievents.Metadata{
+			Type: events.SFTPSummaryEvent,
+			Code: events.SFTPSummaryCode,
+			Time: time.Now(),
+		},
+	}
+	// We don't need to worry about closing these files, handler will
+	// take care of that for us
+	for _, f := range h.files {
+		summaryEvent.FileTransferStats = append(summaryEvent.FileTransferStats, &apievents.FileTransferStat{
+			Path:         f.file.Name(),
+			BytesRead:    f.bytesRead.Load(),
+			BytesWritten: f.bytesWritten.Load(),
+		})
+	}
+	sftpEvents <- summaryEvent
 
 	// Wait until event marshaling goroutine is finished
 	close(sftpEvents)

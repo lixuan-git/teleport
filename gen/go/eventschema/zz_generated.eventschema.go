@@ -1,16 +1,20 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package eventschema
 
@@ -32,6 +36,759 @@ type EventField struct {
 
 // Events is a map containing the description and schema for all Teleport events
 var events = map[string]*Event{
+	"AccessListCreate": {
+		Description: "is emitted when an access list is created",
+		Fields: []*EventField{
+			{
+				Name:        "cluster_name",
+				Description: "identifies the originating teleport cluster",
+				Type:        "string",
+			},
+			{
+				Name:        "code",
+				Description: "is a unique event code",
+				Type:        "string",
+			},
+			{
+				Name:        "ei",
+				Description: "is a monotonically incremented index in the event sequence",
+				Type:        "integer",
+			},
+			{
+				Name:        "error",
+				Description: "includes system error message for the failed attempt",
+				Type:        "string",
+			},
+			{
+				Name:        "event",
+				Description: "is the event type",
+				Type:        "string",
+			},
+			{
+				Name:        "expires",
+				Description: "is set if resource expires",
+				Type:        "string",
+			},
+			{
+				Name:        "message",
+				Description: "is a user-friendly message for successfull or unsuccessfull auth attempt",
+				Type:        "string",
+			},
+			{
+				Name:        "name",
+				Description: "is a resource name",
+				Type:        "string",
+			},
+			{
+				Name:        "success",
+				Description: "indicates the success or failure of the operation",
+				Type:        "boolean",
+			},
+			{
+				Name:        "time",
+				Description: "is event time",
+				Type:        "string",
+			},
+			{
+				Name:        "ttl",
+				Description: "is a TTL of reset password token represented as duration, e.g. \"10m\" used for compatibility purposes for some events, Expires should be used instead as it's more useful (contains exact expiration date/time)",
+				Type:        "string",
+			},
+			{
+				Name:        "uid",
+				Description: "is a unique event identifier",
+				Type:        "string",
+			},
+			{
+				Name:        "updated_by",
+				Description: "if set indicates the user who modified the resource",
+				Type:        "string",
+			},
+		},
+	},
+	"AccessListDelete": {
+		Description: "is emitted when an access list is deleted",
+		Fields: []*EventField{
+			{
+				Name:        "cluster_name",
+				Description: "identifies the originating teleport cluster",
+				Type:        "string",
+			},
+			{
+				Name:        "code",
+				Description: "is a unique event code",
+				Type:        "string",
+			},
+			{
+				Name:        "ei",
+				Description: "is a monotonically incremented index in the event sequence",
+				Type:        "integer",
+			},
+			{
+				Name:        "error",
+				Description: "includes system error message for the failed attempt",
+				Type:        "string",
+			},
+			{
+				Name:        "event",
+				Description: "is the event type",
+				Type:        "string",
+			},
+			{
+				Name:        "expires",
+				Description: "is set if resource expires",
+				Type:        "string",
+			},
+			{
+				Name:        "message",
+				Description: "is a user-friendly message for successfull or unsuccessfull auth attempt",
+				Type:        "string",
+			},
+			{
+				Name:        "name",
+				Description: "is a resource name",
+				Type:        "string",
+			},
+			{
+				Name:        "success",
+				Description: "indicates the success or failure of the operation",
+				Type:        "boolean",
+			},
+			{
+				Name:        "time",
+				Description: "is event time",
+				Type:        "string",
+			},
+			{
+				Name:        "ttl",
+				Description: "is a TTL of reset password token represented as duration, e.g. \"10m\" used for compatibility purposes for some events, Expires should be used instead as it's more useful (contains exact expiration date/time)",
+				Type:        "string",
+			},
+			{
+				Name:        "uid",
+				Description: "is a unique event identifier",
+				Type:        "string",
+			},
+			{
+				Name:        "updated_by",
+				Description: "if set indicates the user who modified the resource",
+				Type:        "string",
+			},
+		},
+	},
+	"AccessListMemberCreate": {
+		Description: "is emitted when an access list member is created",
+		Fields: []*EventField{
+			{
+				Name:        "access_list_name",
+				Description: "is the name of the access list the members are being added to or removed from",
+				Type:        "string",
+			},
+			{
+				Name:        "cluster_name",
+				Description: "identifies the originating teleport cluster",
+				Type:        "string",
+			},
+			{
+				Name:        "code",
+				Description: "is a unique event code",
+				Type:        "string",
+			},
+			{
+				Name:        "ei",
+				Description: "is a monotonically incremented index in the event sequence",
+				Type:        "integer",
+			},
+			{
+				Name:        "error",
+				Description: "includes system error message for the failed attempt",
+				Type:        "string",
+			},
+			{
+				Name:        "event",
+				Description: "is the event type",
+				Type:        "string",
+			},
+			{
+				Name:        "expires",
+				Description: "is set if resource expires",
+				Type:        "string",
+			},
+			{
+				Name:        "members",
+				Description: "are all members affected by the access list membership change",
+				Type:        "array",
+				Items: &EventField{
+					Type: "object",
+					Fields: []*EventField{
+						{
+							Name:        "joined_on",
+							Description: "is the date that the member joined",
+							Type:        "string",
+						},
+						{
+							Name:        "member_name",
+							Description: "is the name of the member",
+							Type:        "string",
+						},
+						{
+							Name:        "reason",
+							Description: "is the reason that the member was added, modified, or removed",
+							Type:        "string",
+						},
+						{
+							Name:        "removed_on",
+							Description: "is the date that the access list member was removed. Will only be populated for deletion",
+							Type:        "string",
+						},
+					},
+				},
+			},
+			{
+				Name:        "message",
+				Description: "is a user-friendly message for successfull or unsuccessfull auth attempt",
+				Type:        "string",
+			},
+			{
+				Name:        "name",
+				Description: "is a resource name",
+				Type:        "string",
+			},
+			{
+				Name:        "success",
+				Description: "indicates the success or failure of the operation",
+				Type:        "boolean",
+			},
+			{
+				Name:        "time",
+				Description: "is event time",
+				Type:        "string",
+			},
+			{
+				Name:        "ttl",
+				Description: "is a TTL of reset password token represented as duration, e.g. \"10m\" used for compatibility purposes for some events, Expires should be used instead as it's more useful (contains exact expiration date/time)",
+				Type:        "string",
+			},
+			{
+				Name:        "uid",
+				Description: "is a unique event identifier",
+				Type:        "string",
+			},
+			{
+				Name:        "updated_by",
+				Description: "if set indicates the user who modified the resource",
+				Type:        "string",
+			},
+		},
+	},
+	"AccessListMemberDelete": {
+		Description: "is emitted when an access list member is deleted",
+		Fields: []*EventField{
+			{
+				Name:        "access_list_name",
+				Description: "is the name of the access list the members are being added to or removed from",
+				Type:        "string",
+			},
+			{
+				Name:        "cluster_name",
+				Description: "identifies the originating teleport cluster",
+				Type:        "string",
+			},
+			{
+				Name:        "code",
+				Description: "is a unique event code",
+				Type:        "string",
+			},
+			{
+				Name:        "ei",
+				Description: "is a monotonically incremented index in the event sequence",
+				Type:        "integer",
+			},
+			{
+				Name:        "error",
+				Description: "includes system error message for the failed attempt",
+				Type:        "string",
+			},
+			{
+				Name:        "event",
+				Description: "is the event type",
+				Type:        "string",
+			},
+			{
+				Name:        "expires",
+				Description: "is set if resource expires",
+				Type:        "string",
+			},
+			{
+				Name:        "members",
+				Description: "are all members affected by the access list membership change",
+				Type:        "array",
+				Items: &EventField{
+					Type: "object",
+					Fields: []*EventField{
+						{
+							Name:        "joined_on",
+							Description: "is the date that the member joined",
+							Type:        "string",
+						},
+						{
+							Name:        "member_name",
+							Description: "is the name of the member",
+							Type:        "string",
+						},
+						{
+							Name:        "reason",
+							Description: "is the reason that the member was added, modified, or removed",
+							Type:        "string",
+						},
+						{
+							Name:        "removed_on",
+							Description: "is the date that the access list member was removed. Will only be populated for deletion",
+							Type:        "string",
+						},
+					},
+				},
+			},
+			{
+				Name:        "message",
+				Description: "is a user-friendly message for successfull or unsuccessfull auth attempt",
+				Type:        "string",
+			},
+			{
+				Name:        "name",
+				Description: "is a resource name",
+				Type:        "string",
+			},
+			{
+				Name:        "success",
+				Description: "indicates the success or failure of the operation",
+				Type:        "boolean",
+			},
+			{
+				Name:        "time",
+				Description: "is event time",
+				Type:        "string",
+			},
+			{
+				Name:        "ttl",
+				Description: "is a TTL of reset password token represented as duration, e.g. \"10m\" used for compatibility purposes for some events, Expires should be used instead as it's more useful (contains exact expiration date/time)",
+				Type:        "string",
+			},
+			{
+				Name:        "uid",
+				Description: "is a unique event identifier",
+				Type:        "string",
+			},
+			{
+				Name:        "updated_by",
+				Description: "if set indicates the user who modified the resource",
+				Type:        "string",
+			},
+		},
+	},
+	"AccessListMemberDeleteAllForAccessList": {
+		Description: "is emitted when all members are deleted for an access list",
+		Fields: []*EventField{
+			{
+				Name:        "access_list_name",
+				Description: "is the name of the access list the members are being added to or removed from",
+				Type:        "string",
+			},
+			{
+				Name:        "cluster_name",
+				Description: "identifies the originating teleport cluster",
+				Type:        "string",
+			},
+			{
+				Name:        "code",
+				Description: "is a unique event code",
+				Type:        "string",
+			},
+			{
+				Name:        "ei",
+				Description: "is a monotonically incremented index in the event sequence",
+				Type:        "integer",
+			},
+			{
+				Name:        "error",
+				Description: "includes system error message for the failed attempt",
+				Type:        "string",
+			},
+			{
+				Name:        "event",
+				Description: "is the event type",
+				Type:        "string",
+			},
+			{
+				Name:        "expires",
+				Description: "is set if resource expires",
+				Type:        "string",
+			},
+			{
+				Name:        "members",
+				Description: "are all members affected by the access list membership change",
+				Type:        "array",
+				Items: &EventField{
+					Type: "object",
+					Fields: []*EventField{
+						{
+							Name:        "joined_on",
+							Description: "is the date that the member joined",
+							Type:        "string",
+						},
+						{
+							Name:        "member_name",
+							Description: "is the name of the member",
+							Type:        "string",
+						},
+						{
+							Name:        "reason",
+							Description: "is the reason that the member was added, modified, or removed",
+							Type:        "string",
+						},
+						{
+							Name:        "removed_on",
+							Description: "is the date that the access list member was removed. Will only be populated for deletion",
+							Type:        "string",
+						},
+					},
+				},
+			},
+			{
+				Name:        "message",
+				Description: "is a user-friendly message for successfull or unsuccessfull auth attempt",
+				Type:        "string",
+			},
+			{
+				Name:        "name",
+				Description: "is a resource name",
+				Type:        "string",
+			},
+			{
+				Name:        "success",
+				Description: "indicates the success or failure of the operation",
+				Type:        "boolean",
+			},
+			{
+				Name:        "time",
+				Description: "is event time",
+				Type:        "string",
+			},
+			{
+				Name:        "ttl",
+				Description: "is a TTL of reset password token represented as duration, e.g. \"10m\" used for compatibility purposes for some events, Expires should be used instead as it's more useful (contains exact expiration date/time)",
+				Type:        "string",
+			},
+			{
+				Name:        "uid",
+				Description: "is a unique event identifier",
+				Type:        "string",
+			},
+			{
+				Name:        "updated_by",
+				Description: "if set indicates the user who modified the resource",
+				Type:        "string",
+			},
+		},
+	},
+	"AccessListMemberUpdate": {
+		Description: "is emitted when an access list member is updated",
+		Fields: []*EventField{
+			{
+				Name:        "access_list_name",
+				Description: "is the name of the access list the members are being added to or removed from",
+				Type:        "string",
+			},
+			{
+				Name:        "cluster_name",
+				Description: "identifies the originating teleport cluster",
+				Type:        "string",
+			},
+			{
+				Name:        "code",
+				Description: "is a unique event code",
+				Type:        "string",
+			},
+			{
+				Name:        "ei",
+				Description: "is a monotonically incremented index in the event sequence",
+				Type:        "integer",
+			},
+			{
+				Name:        "error",
+				Description: "includes system error message for the failed attempt",
+				Type:        "string",
+			},
+			{
+				Name:        "event",
+				Description: "is the event type",
+				Type:        "string",
+			},
+			{
+				Name:        "expires",
+				Description: "is set if resource expires",
+				Type:        "string",
+			},
+			{
+				Name:        "members",
+				Description: "are all members affected by the access list membership change",
+				Type:        "array",
+				Items: &EventField{
+					Type: "object",
+					Fields: []*EventField{
+						{
+							Name:        "joined_on",
+							Description: "is the date that the member joined",
+							Type:        "string",
+						},
+						{
+							Name:        "member_name",
+							Description: "is the name of the member",
+							Type:        "string",
+						},
+						{
+							Name:        "reason",
+							Description: "is the reason that the member was added, modified, or removed",
+							Type:        "string",
+						},
+						{
+							Name:        "removed_on",
+							Description: "is the date that the access list member was removed. Will only be populated for deletion",
+							Type:        "string",
+						},
+					},
+				},
+			},
+			{
+				Name:        "message",
+				Description: "is a user-friendly message for successfull or unsuccessfull auth attempt",
+				Type:        "string",
+			},
+			{
+				Name:        "name",
+				Description: "is a resource name",
+				Type:        "string",
+			},
+			{
+				Name:        "success",
+				Description: "indicates the success or failure of the operation",
+				Type:        "boolean",
+			},
+			{
+				Name:        "time",
+				Description: "is event time",
+				Type:        "string",
+			},
+			{
+				Name:        "ttl",
+				Description: "is a TTL of reset password token represented as duration, e.g. \"10m\" used for compatibility purposes for some events, Expires should be used instead as it's more useful (contains exact expiration date/time)",
+				Type:        "string",
+			},
+			{
+				Name:        "uid",
+				Description: "is a unique event identifier",
+				Type:        "string",
+			},
+			{
+				Name:        "updated_by",
+				Description: "if set indicates the user who modified the resource",
+				Type:        "string",
+			},
+		},
+	},
+	"AccessListReview": {
+		Description: "is emitted when an access list is reviewed",
+		Fields: []*EventField{
+			{
+				Name:        "cluster_name",
+				Description: "identifies the originating teleport cluster",
+				Type:        "string",
+			},
+			{
+				Name:        "code",
+				Description: "is a unique event code",
+				Type:        "string",
+			},
+			{
+				Name:        "ei",
+				Description: "is a monotonically incremented index in the event sequence",
+				Type:        "integer",
+			},
+			{
+				Name:        "error",
+				Description: "includes system error message for the failed attempt",
+				Type:        "string",
+			},
+			{
+				Name:        "event",
+				Description: "is the event type",
+				Type:        "string",
+			},
+			{
+				Name:        "expires",
+				Description: "is set if resource expires",
+				Type:        "string",
+			},
+			{
+				Name:        "membership_requirements_changed",
+				Description: "is populated if the memrship requirements have changed",
+				Type:        "object",
+				Fields: []*EventField{
+					{
+						Name:        "roles",
+						Description: "are the roles that changed as part of a review",
+						Type:        "array",
+						Items: &EventField{
+							Type: "string",
+						},
+					},
+					{
+						Name:        "traits",
+						Description: "are the traits that changed as part of a review",
+						Type:        "object",
+						Fields: []*EventField{
+							{
+								Name: "key",
+								Type: "string",
+							},
+							{
+								Name: "value",
+								Type: "string",
+							},
+						},
+					},
+				},
+			},
+			{
+				Name:        "message",
+				Description: "is a user-friendly message for successfull or unsuccessfull auth attempt",
+				Type:        "string",
+			},
+			{
+				Name:        "name",
+				Description: "is a resource name",
+				Type:        "string",
+			},
+			{
+				Name:        "removed_members",
+				Description: "are the members that were removed as part of the review",
+				Type:        "array",
+				Items: &EventField{
+					Type: "string",
+				},
+			},
+			{
+				Name:        "review_day_of_month_changed",
+				Description: "is populated if the review day of month has changed",
+				Type:        "string",
+			},
+			{
+				Name:        "review_frequency_changed",
+				Description: "is populated if the review frequency has changed",
+				Type:        "string",
+			},
+			{
+				Name:        "review_id",
+				Description: "is the ID of the review",
+				Type:        "string",
+			},
+			{
+				Name:        "success",
+				Description: "indicates the success or failure of the operation",
+				Type:        "boolean",
+			},
+			{
+				Name:        "time",
+				Description: "is event time",
+				Type:        "string",
+			},
+			{
+				Name:        "ttl",
+				Description: "is a TTL of reset password token represented as duration, e.g. \"10m\" used for compatibility purposes for some events, Expires should be used instead as it's more useful (contains exact expiration date/time)",
+				Type:        "string",
+			},
+			{
+				Name:        "uid",
+				Description: "is a unique event identifier",
+				Type:        "string",
+			},
+			{
+				Name:        "updated_by",
+				Description: "if set indicates the user who modified the resource",
+				Type:        "string",
+			},
+		},
+	},
+	"AccessListUpdate": {
+		Description: "is emitted when an access list is updated",
+		Fields: []*EventField{
+			{
+				Name:        "cluster_name",
+				Description: "identifies the originating teleport cluster",
+				Type:        "string",
+			},
+			{
+				Name:        "code",
+				Description: "is a unique event code",
+				Type:        "string",
+			},
+			{
+				Name:        "ei",
+				Description: "is a monotonically incremented index in the event sequence",
+				Type:        "integer",
+			},
+			{
+				Name:        "error",
+				Description: "includes system error message for the failed attempt",
+				Type:        "string",
+			},
+			{
+				Name:        "event",
+				Description: "is the event type",
+				Type:        "string",
+			},
+			{
+				Name:        "expires",
+				Description: "is set if resource expires",
+				Type:        "string",
+			},
+			{
+				Name:        "message",
+				Description: "is a user-friendly message for successfull or unsuccessfull auth attempt",
+				Type:        "string",
+			},
+			{
+				Name:        "name",
+				Description: "is a resource name",
+				Type:        "string",
+			},
+			{
+				Name:        "success",
+				Description: "indicates the success or failure of the operation",
+				Type:        "boolean",
+			},
+			{
+				Name:        "time",
+				Description: "is event time",
+				Type:        "string",
+			},
+			{
+				Name:        "ttl",
+				Description: "is a TTL of reset password token represented as duration, e.g. \"10m\" used for compatibility purposes for some events, Expires should be used instead as it's more useful (contains exact expiration date/time)",
+				Type:        "string",
+			},
+			{
+				Name:        "uid",
+				Description: "is a unique event identifier",
+				Type:        "string",
+			},
+			{
+				Name:        "updated_by",
+				Description: "if set indicates the user who modified the resource",
+				Type:        "string",
+			},
+		},
+	},
 	"AccessRequestCreate": {
 		Description: "is emitted when access request has been created or updated",
 		Fields: []*EventField{
@@ -47,6 +804,11 @@ var events = map[string]*Event{
 				Name:        "annotations",
 				Description: "is an optional set of attributes supplied by a plugin during approval/denial of the request",
 				Type:        "object",
+			},
+			{
+				Name:        "assume_start_time",
+				Description: "is the time the requested roles can be assumed",
+				Type:        "string",
 			},
 			{
 				Name:        "aws_role_arn",
@@ -119,6 +881,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "promoted_access_list_name",
+				Description: "is the name of the access list that this request was promoted to. This field is only populated when the request is in the PROMOTED state",
+				Type:        "string",
+			},
+			{
 				Name:        "proposed_state",
 				Description: "is the state proposed by a review (only used in the access_request.review event variant)",
 				Type:        "string",
@@ -126,6 +893,11 @@ var events = map[string]*Event{
 			{
 				Name:        "reason",
 				Description: "is an optional description of why the request is being created or updated",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -200,6 +972,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -292,6 +1069,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -315,6 +1097,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -417,6 +1204,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "resource_type",
 				Description: "is the type of resource being searched for",
 				Type:        "string",
@@ -461,6 +1253,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -578,6 +1375,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -601,6 +1403,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -698,6 +1505,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -721,6 +1533,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -858,8 +1675,18 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "proto",
 				Description: "specifies protocol that was captured",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -931,6 +1758,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -1083,6 +1915,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "session_chunk_id",
 				Description: "is the ID of the app session chunk that this request belongs to. This is more appropriate to include than the app session id, since it is the chunk id that is needed to play back the session chunk with tsh. The session chunk event already includes the app session id",
 				Type:        "string",
@@ -1121,6 +1958,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -1248,8 +2090,18 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "proto",
 				Description: "specifies protocol that was captured",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -1316,6 +2168,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -1553,6 +2410,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "proto",
 				Description: "specifies protocol that was captured",
 				Type:        "string",
@@ -1560,6 +2422,11 @@ var events = map[string]*Event{
 			{
 				Name:        "public_addr",
 				Description: "is the public address of the application being requested. DELETE IN 10.0: this information is also present on the AppMetadata",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -1626,6 +2493,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -1748,6 +2620,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -1773,6 +2650,11 @@ var events = map[string]*Event{
 						Type:        "string",
 					},
 					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
+					},
+					{
 						Name:        "os_type",
 						Description: "of the device",
 						Type:        "integer",
@@ -1792,6 +2674,156 @@ var events = map[string]*Event{
 			{
 				Name:        "updated_by",
 				Description: "if set indicates the user who modified the resource",
+				Type:        "string",
+			},
+			{
+				Name:        "user",
+				Description: "is teleport user name",
+				Type:        "string",
+			},
+		},
+	},
+	"AuditQueryRun": {
+		Description: "is emitted when a user runs an audit query",
+		Fields: []*EventField{
+			{
+				Name:        "access_requests",
+				Description: "are the IDs of access requests created by the user",
+				Type:        "array",
+				Items: &EventField{
+					Type: "string",
+				},
+			},
+			{
+				Name:        "aws_role_arn",
+				Description: "is AWS IAM role user assumes when accessing AWS console",
+				Type:        "string",
+			},
+			{
+				Name:        "azure_identity",
+				Description: "is the Azure identity user assumes when accessing Azure API",
+				Type:        "string",
+			},
+			{
+				Name:        "cluster_name",
+				Description: "identifies the originating teleport cluster",
+				Type:        "string",
+			},
+			{
+				Name:        "code",
+				Description: "is a unique event code",
+				Type:        "string",
+			},
+			{
+				Name:        "data_scanned_in_bytes",
+				Description: "is the amount of data scanned by the query",
+				Type:        "integer",
+			},
+			{
+				Name:        "days",
+				Description: "is the number of days time range for the query",
+				Type:        "integer",
+			},
+			{
+				Name:        "ei",
+				Description: "is a monotonically incremented index in the event sequence",
+				Type:        "integer",
+			},
+			{
+				Name:        "error",
+				Description: "includes system error message for the failed attempt",
+				Type:        "string",
+			},
+			{
+				Name:        "event",
+				Description: "is the event type",
+				Type:        "string",
+			},
+			{
+				Name:        "gcp_service_account",
+				Description: "is the GCP service account user assumes when accessing GCP API",
+				Type:        "string",
+			},
+			{
+				Name:        "impersonator",
+				Description: "is a user acting on behalf of another user",
+				Type:        "string",
+			},
+			{
+				Name:        "login",
+				Description: "is OS login",
+				Type:        "string",
+			},
+			{
+				Name:        "message",
+				Description: "is a user-friendly message for successfull or unsuccessfull auth attempt",
+				Type:        "string",
+			},
+			{
+				Name:        "name",
+				Description: "is the name of the query",
+				Type:        "string",
+			},
+			{
+				Name:        "query",
+				Description: "is the query that was run",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
+				Name:        "success",
+				Description: "indicates the success or failure of the operation",
+				Type:        "boolean",
+			},
+			{
+				Name:        "time",
+				Description: "is event time",
+				Type:        "string",
+			},
+			{
+				Name:        "total_execution_time_in_millis",
+				Description: "is the total execution time of the query",
+				Type:        "integer",
+			},
+			{
+				Name:        "trusted_device",
+				Description: "contains information about the users' trusted device. Requires a registered and enrolled device to be used during authentication",
+				Type:        "object",
+				Fields: []*EventField{
+					{
+						Name:        "asset_tag",
+						Description: "inventory identifier",
+						Type:        "string",
+					},
+					{
+						Name:        "credential_id",
+						Description: "credential identifier",
+						Type:        "string",
+					},
+					{
+						Name:        "device_id",
+						Description: "of the device",
+						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
+					},
+					{
+						Name:        "os_type",
+						Description: "of the device",
+						Type:        "integer",
+					},
+				},
+			},
+			{
+				Name:        "uid",
+				Description: "is a unique event identifier",
 				Type:        "string",
 			},
 			{
@@ -1883,6 +2915,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "success",
 				Description: "indicates the success or failure of the operation",
 				Type:        "boolean",
@@ -1911,6 +2948,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -1988,6 +3030,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -2011,6 +3058,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -2088,6 +3140,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -2111,6 +3168,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -2188,6 +3250,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -2211,6 +3278,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -2482,6 +3554,16 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "sid",
 				Description: "is a unique UUID of the session",
 				Type:        "string",
@@ -2510,6 +3592,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -2670,8 +3757,18 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "query_id",
 				Description: "is the prepared query id to execute",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -2703,6 +3800,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -2868,8 +3970,18 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "query",
 				Description: "is the CQL statement",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -2901,6 +4013,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -3069,6 +4186,16 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "sid",
 				Description: "is a unique UUID of the session",
 				Type:        "string",
@@ -3097,6 +4224,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -3290,6 +4422,11 @@ var events = map[string]*Event{
 					{
 						Name:        "prev_identity_expires",
 						Description: "is the expiry time of the identity/cert that this identity/cert was derived from. It is used to determine a session's hard deadline in cases where both require_session_mfa and disconnect_expired_cert are enabled. See https://github.com/gravitational/teleport/issues/18544",
+						Type:        "string",
+					},
+					{
+						Name:        "private_key_policy",
+						Description: "is the private key policy of the user's private key",
 						Type:        "string",
 					},
 					{
@@ -3498,6 +4635,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "server_addr",
 				Description: "is the address of the server the session occurred on",
 				Type:        "string",
@@ -3556,6 +4698,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -3721,6 +4868,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -3744,6 +4896,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -3841,6 +4998,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -3864,6 +5026,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -4029,6 +5196,16 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "sid",
 				Description: "is a unique UUID of the session",
 				Type:        "string",
@@ -4057,6 +5234,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -4217,6 +5399,16 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "sid",
 				Description: "is a unique UUID of the session",
 				Type:        "string",
@@ -4245,6 +5437,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -4428,6 +5625,16 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "sid",
 				Description: "is a unique UUID of the session",
 				Type:        "string",
@@ -4461,6 +5668,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -4651,8 +5863,18 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "proto",
 				Description: "specifies protocol that was captured",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -4724,6 +5946,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -4894,6 +6121,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -4917,6 +6149,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -5024,8 +6261,18 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "proto",
 				Description: "specifies protocol that was captured",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -5057,6 +6304,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -5159,8 +6411,18 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "proto",
 				Description: "specifies protocol that was captured",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -5192,6 +6454,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -5364,8 +6631,18 @@ var events = map[string]*Event{
 				Type:        "integer",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "proto",
 				Description: "specifies protocol that was captured",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -5402,6 +6679,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -5519,8 +6801,18 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "proto",
 				Description: "specifies protocol that was captured",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -5557,6 +6849,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -5689,8 +6986,18 @@ var events = map[string]*Event{
 				Type:        "integer",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "proto",
 				Description: "specifies protocol that was captured",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -5727,6 +7034,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -5784,6 +7096,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -5873,6 +7190,11 @@ var events = map[string]*Event{
 						Type:        "string",
 					},
 					{
+						Name:        "required_private_key_policy",
+						Description: "is the private key policy enforced for this login",
+						Type:        "string",
+					},
+					{
 						Name:        "trusted_device",
 						Description: "contains information about the users' trusted device. Requires a registered and enrolled device to be used during authentication",
 						Type:        "object",
@@ -5891,6 +7213,11 @@ var events = map[string]*Event{
 								Name:        "device_id",
 								Description: "of the device",
 								Type:        "string",
+							},
+							{
+								Name:        "device_origin",
+								Description: "origin",
+								Type:        "integer",
 							},
 							{
 								Name:        "os_type",
@@ -5960,6 +7287,11 @@ var events = map[string]*Event{
 						Type:        "string",
 					},
 					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
+					},
+					{
 						Name:        "os_type",
 						Description: "of the device",
 						Type:        "integer",
@@ -6002,6 +7334,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "success",
 				Description: "indicates the success or failure of the operation",
 				Type:        "boolean",
@@ -6030,6 +7367,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -6200,8 +7542,18 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "raw_query",
 				Description: "are the encoded query values",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -6242,6 +7594,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -6422,6 +7779,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "query",
 				Description: "is an optional text of query (e.g. an SQL select statement for _sql API), if a request includes it",
 				Type:        "string",
@@ -6429,6 +7791,11 @@ var events = map[string]*Event{
 			{
 				Name:        "raw_query",
 				Description: "are the encoded query values",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -6470,6 +7837,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -6648,8 +8020,18 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "proto",
 				Description: "specifies protocol that was captured",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -6718,6 +8100,11 @@ var events = map[string]*Event{
 						Type:        "string",
 					},
 					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
+					},
+					{
 						Name:        "os_type",
 						Description: "of the device",
 						Type:        "integer",
@@ -6741,8 +8128,222 @@ var events = map[string]*Event{
 			},
 		},
 	},
+	"ExternalAuditStorageDisable": {
+		Description: "is emitted when External Audit Storage is disabled",
+		Fields: []*EventField{
+			{
+				Name:        "cluster_name",
+				Description: "identifies the originating teleport cluster",
+				Type:        "string",
+			},
+			{
+				Name:        "code",
+				Description: "is a unique event code",
+				Type:        "string",
+			},
+			{
+				Name:        "details",
+				Description: "holds details about the External Audit Storage configuration that was disabled",
+				Type:        "object",
+				Fields: []*EventField{
+					{
+						Name:        "athenaResultsUri",
+						Description: "is the S3 path used to store temporary results generated by Athena",
+						Type:        "string",
+					},
+					{
+						Name:        "athenaWorkgroup",
+						Description: "is the workgroup used for Athena audit log queries",
+						Type:        "string",
+					},
+					{
+						Name:        "auditEventsLongTermUri",
+						Description: "is the S3 path used to store batched parquet files with audit events, partitioned by event date",
+						Type:        "string",
+					},
+					{
+						Name:        "glueDatabase",
+						Description: "is the database used for Athena audit log queries",
+						Type:        "string",
+					},
+					{
+						Name:        "glueTable",
+						Description: "is the table used for Athena audit log queries",
+						Type:        "string",
+					},
+					{
+						Name:        "integrationName",
+						Description: "is the name of the AWS OIDC integration used",
+						Type:        "string",
+					},
+					{
+						Name:        "policyName",
+						Description: "is the name of the IAM policy attached to the OIDC integration role",
+						Type:        "string",
+					},
+					{
+						Name:        "region",
+						Description: "is the AWS region where the infrastructure is hosted",
+						Type:        "string",
+					},
+					{
+						Name:        "sessionRecordingsUri",
+						Description: "is the S3 path used to store session recordings",
+						Type:        "string",
+					},
+				},
+			},
+			{
+				Name:        "ei",
+				Description: "is a monotonically incremented index in the event sequence",
+				Type:        "integer",
+			},
+			{
+				Name:        "event",
+				Description: "is the event type",
+				Type:        "string",
+			},
+			{
+				Name:        "expires",
+				Description: "is set if resource expires",
+				Type:        "string",
+			},
+			{
+				Name:        "name",
+				Description: "is a resource name",
+				Type:        "string",
+			},
+			{
+				Name:        "time",
+				Description: "is event time",
+				Type:        "string",
+			},
+			{
+				Name:        "ttl",
+				Description: "is a TTL of reset password token represented as duration, e.g. \"10m\" used for compatibility purposes for some events, Expires should be used instead as it's more useful (contains exact expiration date/time)",
+				Type:        "string",
+			},
+			{
+				Name:        "uid",
+				Description: "is a unique event identifier",
+				Type:        "string",
+			},
+			{
+				Name:        "updated_by",
+				Description: "if set indicates the user who modified the resource",
+				Type:        "string",
+			},
+		},
+	},
+	"ExternalAuditStorageEnable": {
+		Description: "is emitted when External Audit Storage is enabled",
+		Fields: []*EventField{
+			{
+				Name:        "cluster_name",
+				Description: "identifies the originating teleport cluster",
+				Type:        "string",
+			},
+			{
+				Name:        "code",
+				Description: "is a unique event code",
+				Type:        "string",
+			},
+			{
+				Name:        "details",
+				Description: "holds details about the External Audit Storage configuration that was enabled",
+				Type:        "object",
+				Fields: []*EventField{
+					{
+						Name:        "athenaResultsUri",
+						Description: "is the S3 path used to store temporary results generated by Athena",
+						Type:        "string",
+					},
+					{
+						Name:        "athenaWorkgroup",
+						Description: "is the workgroup used for Athena audit log queries",
+						Type:        "string",
+					},
+					{
+						Name:        "auditEventsLongTermUri",
+						Description: "is the S3 path used to store batched parquet files with audit events, partitioned by event date",
+						Type:        "string",
+					},
+					{
+						Name:        "glueDatabase",
+						Description: "is the database used for Athena audit log queries",
+						Type:        "string",
+					},
+					{
+						Name:        "glueTable",
+						Description: "is the table used for Athena audit log queries",
+						Type:        "string",
+					},
+					{
+						Name:        "integrationName",
+						Description: "is the name of the AWS OIDC integration used",
+						Type:        "string",
+					},
+					{
+						Name:        "policyName",
+						Description: "is the name of the IAM policy attached to the OIDC integration role",
+						Type:        "string",
+					},
+					{
+						Name:        "region",
+						Description: "is the AWS region where the infrastructure is hosted",
+						Type:        "string",
+					},
+					{
+						Name:        "sessionRecordingsUri",
+						Description: "is the S3 path used to store session recordings",
+						Type:        "string",
+					},
+				},
+			},
+			{
+				Name:        "ei",
+				Description: "is a monotonically incremented index in the event sequence",
+				Type:        "integer",
+			},
+			{
+				Name:        "event",
+				Description: "is the event type",
+				Type:        "string",
+			},
+			{
+				Name:        "expires",
+				Description: "is set if resource expires",
+				Type:        "string",
+			},
+			{
+				Name:        "name",
+				Description: "is a resource name",
+				Type:        "string",
+			},
+			{
+				Name:        "time",
+				Description: "is event time",
+				Type:        "string",
+			},
+			{
+				Name:        "ttl",
+				Description: "is a TTL of reset password token represented as duration, e.g. \"10m\" used for compatibility purposes for some events, Expires should be used instead as it's more useful (contains exact expiration date/time)",
+				Type:        "string",
+			},
+			{
+				Name:        "uid",
+				Description: "is a unique event identifier",
+				Type:        "string",
+			},
+			{
+				Name:        "updated_by",
+				Description: "if set indicates the user who modified the resource",
+				Type:        "string",
+			},
+		},
+	},
 	"GithubConnectorCreate": {
-		Description: "fires when a Github connector is created/updated",
+		Description: "fires when a Github connector is created",
 		Fields: []*EventField{
 			{
 				Name:        "access_requests",
@@ -6808,6 +8409,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -6831,6 +8437,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -6928,6 +8539,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -6951,6 +8567,141 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
+					},
+					{
+						Name:        "os_type",
+						Description: "of the device",
+						Type:        "integer",
+					},
+				},
+			},
+			{
+				Name:        "ttl",
+				Description: "is a TTL of reset password token represented as duration, e.g. \"10m\" used for compatibility purposes for some events, Expires should be used instead as it's more useful (contains exact expiration date/time)",
+				Type:        "string",
+			},
+			{
+				Name:        "uid",
+				Description: "is a unique event identifier",
+				Type:        "string",
+			},
+			{
+				Name:        "updated_by",
+				Description: "if set indicates the user who modified the resource",
+				Type:        "string",
+			},
+			{
+				Name:        "user",
+				Description: "is teleport user name",
+				Type:        "string",
+			},
+		},
+	},
+	"GithubConnectorUpdate": {
+		Description: "fires when a Github connector is updated",
+		Fields: []*EventField{
+			{
+				Name:        "access_requests",
+				Description: "are the IDs of access requests created by the user",
+				Type:        "array",
+				Items: &EventField{
+					Type: "string",
+				},
+			},
+			{
+				Name:        "aws_role_arn",
+				Description: "is AWS IAM role user assumes when accessing AWS console",
+				Type:        "string",
+			},
+			{
+				Name:        "azure_identity",
+				Description: "is the Azure identity user assumes when accessing Azure API",
+				Type:        "string",
+			},
+			{
+				Name:        "cluster_name",
+				Description: "identifies the originating teleport cluster",
+				Type:        "string",
+			},
+			{
+				Name:        "code",
+				Description: "is a unique event code",
+				Type:        "string",
+			},
+			{
+				Name:        "ei",
+				Description: "is a monotonically incremented index in the event sequence",
+				Type:        "integer",
+			},
+			{
+				Name:        "event",
+				Description: "is the event type",
+				Type:        "string",
+			},
+			{
+				Name:        "expires",
+				Description: "is set if resource expires",
+				Type:        "string",
+			},
+			{
+				Name:        "gcp_service_account",
+				Description: "is the GCP service account user assumes when accessing GCP API",
+				Type:        "string",
+			},
+			{
+				Name:        "impersonator",
+				Description: "is a user acting on behalf of another user",
+				Type:        "string",
+			},
+			{
+				Name:        "login",
+				Description: "is OS login",
+				Type:        "string",
+			},
+			{
+				Name:        "name",
+				Description: "is a resource name",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
+				Name:        "time",
+				Description: "is event time",
+				Type:        "string",
+			},
+			{
+				Name:        "trusted_device",
+				Description: "contains information about the users' trusted device. Requires a registered and enrolled device to be used during authentication",
+				Type:        "object",
+				Fields: []*EventField{
+					{
+						Name:        "asset_tag",
+						Description: "inventory identifier",
+						Type:        "string",
+					},
+					{
+						Name:        "credential_id",
+						Description: "credential identifier",
+						Type:        "string",
+					},
+					{
+						Name:        "device_id",
+						Description: "of the device",
+						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -7047,6 +8798,11 @@ var events = map[string]*Event{
 			{
 				Name:        "time",
 				Description: "is event time",
+				Type:        "string",
+			},
+			{
+				Name:        "token_expires",
+				Description: "contain information about token expiration time. In case of static token the TokenExpiration time is to the Unix epoch start time",
 				Type:        "string",
 			},
 			{
@@ -7174,6 +8930,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "proto",
 				Description: "specifies protocol that was captured",
 				Type:        "string",
@@ -7181,6 +8942,11 @@ var events = map[string]*Event{
 			{
 				Name:        "request_path",
 				Description: "is the raw request URL path",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -7244,6 +9010,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "sid",
+				Description: "is a unique UUID of the session",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -7269,6 +9040,11 @@ var events = map[string]*Event{
 						Type:        "string",
 					},
 					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
+					},
+					{
 						Name:        "os_type",
 						Description: "of the device",
 						Type:        "integer",
@@ -7288,6 +9064,11 @@ var events = map[string]*Event{
 			{
 				Name:        "verb",
 				Description: "is the HTTP verb used for this request (e.g. GET, POST, etc)",
+				Type:        "string",
+			},
+			{
+				Name:        "with_mfa",
+				Description: "is a UUID of an MFA device used to start this session",
 				Type:        "string",
 			},
 		},
@@ -7374,6 +9155,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -7397,6 +9183,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -7494,6 +9285,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -7517,6 +9313,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -7629,6 +9430,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -7652,6 +9458,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -7749,6 +9560,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "target",
 				Description: "describes the set of interactions that the lock applies to",
 				Type:        "object",
@@ -7824,6 +9640,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -7921,6 +9742,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -7944,6 +9770,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -8041,6 +9872,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -8064,6 +9900,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -8161,6 +10002,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -8184,6 +10030,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -8286,6 +10137,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -8309,6 +10165,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -8401,6 +10262,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -8424,6 +10290,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -8579,6 +10450,16 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "schema_name",
 				Description: "is the name of the schema to create",
 				Type:        "string",
@@ -8612,6 +10493,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -8772,6 +10658,16 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "sid",
 				Description: "is a unique UUID of the session",
 				Type:        "string",
@@ -8800,6 +10696,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -8960,6 +10861,16 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "schema_name",
 				Description: "is the name of the schema to drop",
 				Type:        "string",
@@ -8993,6 +10904,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -9153,6 +11069,16 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "schema_name",
 				Description: "is the name of the schema to use",
 				Type:        "string",
@@ -9186,6 +11112,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -9346,9 +11277,19 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "process_id",
 				Description: "is the process ID of a connection",
 				Type:        "integer",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
 			},
 			{
 				Name:        "sid",
@@ -9379,6 +11320,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -9539,6 +11485,16 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "sid",
 				Description: "is a unique UUID of the session",
 				Type:        "string",
@@ -9572,6 +11528,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -9732,6 +11693,16 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "sid",
 				Description: "is a unique UUID of the session",
 				Type:        "string",
@@ -9760,6 +11731,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -9928,6 +11904,16 @@ var events = map[string]*Event{
 				},
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "sid",
 				Description: "is a unique UUID of the session",
 				Type:        "string",
@@ -9961,6 +11947,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -10121,6 +12112,16 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "sid",
 				Description: "is a unique UUID of the session",
 				Type:        "string",
@@ -10154,6 +12155,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -10322,6 +12328,16 @@ var events = map[string]*Event{
 				},
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "sid",
 				Description: "is a unique UUID of the session",
 				Type:        "string",
@@ -10355,6 +12371,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -10515,6 +12536,16 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "rows_count",
 				Description: "is the number of rows to fetch",
 				Type:        "integer",
@@ -10553,6 +12584,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -10713,8 +12749,18 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "query",
 				Description: "is the prepared statement query",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -10746,6 +12792,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -10906,6 +12957,16 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "sid",
 				Description: "is a unique UUID of the session",
 				Type:        "string",
@@ -10939,6 +13000,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -11109,6 +13175,16 @@ var events = map[string]*Event{
 				Type:        "integer",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "sid",
 				Description: "is a unique UUID of the session",
 				Type:        "string",
@@ -11144,6 +13220,11 @@ var events = map[string]*Event{
 						Type:        "string",
 					},
 					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
+					},
+					{
 						Name:        "os_type",
 						Description: "of the device",
 						Type:        "integer",
@@ -11168,7 +13249,7 @@ var events = map[string]*Event{
 		},
 	},
 	"OIDCConnectorCreate": {
-		Description: "fires when OIDC connector is created/updated",
+		Description: "fires when OIDC connector is created",
 		Fields: []*EventField{
 			{
 				Name:        "access_requests",
@@ -11234,6 +13315,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -11257,6 +13343,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -11354,6 +13445,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -11377,6 +13473,141 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
+					},
+					{
+						Name:        "os_type",
+						Description: "of the device",
+						Type:        "integer",
+					},
+				},
+			},
+			{
+				Name:        "ttl",
+				Description: "is a TTL of reset password token represented as duration, e.g. \"10m\" used for compatibility purposes for some events, Expires should be used instead as it's more useful (contains exact expiration date/time)",
+				Type:        "string",
+			},
+			{
+				Name:        "uid",
+				Description: "is a unique event identifier",
+				Type:        "string",
+			},
+			{
+				Name:        "updated_by",
+				Description: "if set indicates the user who modified the resource",
+				Type:        "string",
+			},
+			{
+				Name:        "user",
+				Description: "is teleport user name",
+				Type:        "string",
+			},
+		},
+	},
+	"OIDCConnectorUpdate": {
+		Description: "fires when OIDC connector is updated",
+		Fields: []*EventField{
+			{
+				Name:        "access_requests",
+				Description: "are the IDs of access requests created by the user",
+				Type:        "array",
+				Items: &EventField{
+					Type: "string",
+				},
+			},
+			{
+				Name:        "aws_role_arn",
+				Description: "is AWS IAM role user assumes when accessing AWS console",
+				Type:        "string",
+			},
+			{
+				Name:        "azure_identity",
+				Description: "is the Azure identity user assumes when accessing Azure API",
+				Type:        "string",
+			},
+			{
+				Name:        "cluster_name",
+				Description: "identifies the originating teleport cluster",
+				Type:        "string",
+			},
+			{
+				Name:        "code",
+				Description: "is a unique event code",
+				Type:        "string",
+			},
+			{
+				Name:        "ei",
+				Description: "is a monotonically incremented index in the event sequence",
+				Type:        "integer",
+			},
+			{
+				Name:        "event",
+				Description: "is the event type",
+				Type:        "string",
+			},
+			{
+				Name:        "expires",
+				Description: "is set if resource expires",
+				Type:        "string",
+			},
+			{
+				Name:        "gcp_service_account",
+				Description: "is the GCP service account user assumes when accessing GCP API",
+				Type:        "string",
+			},
+			{
+				Name:        "impersonator",
+				Description: "is a user acting on behalf of another user",
+				Type:        "string",
+			},
+			{
+				Name:        "login",
+				Description: "is OS login",
+				Type:        "string",
+			},
+			{
+				Name:        "name",
+				Description: "is a resource name",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
+				Name:        "time",
+				Description: "is event time",
+				Type:        "string",
+			},
+			{
+				Name:        "trusted_device",
+				Description: "contains information about the users' trusted device. Requires a registered and enrolled device to be used during authentication",
+				Type:        "object",
+				Fields: []*EventField{
+					{
+						Name:        "asset_tag",
+						Description: "inventory identifier",
+						Type:        "string",
+					},
+					{
+						Name:        "credential_id",
+						Description: "credential identifier",
+						Type:        "string",
+					},
+					{
+						Name:        "device_id",
+						Description: "of the device",
+						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -11947,6 +14178,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "query",
 				Description: "is an optional text of query (e.g. an SQL select statement for _sql API), if a request includes it",
 				Type:        "string",
@@ -11954,6 +14190,11 @@ var events = map[string]*Event{
 			{
 				Name:        "raw_query",
 				Description: "are the encoded query values",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -11995,6 +14236,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -12107,6 +14353,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "success",
 				Description: "indicates the success or failure of the operation",
 				Type:        "boolean",
@@ -12135,6 +14386,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -12303,6 +14559,16 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "sid",
 				Description: "is a unique UUID of the session",
 				Type:        "string",
@@ -12336,6 +14602,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -12501,6 +14772,16 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "sid",
 				Description: "is a unique UUID of the session",
 				Type:        "string",
@@ -12534,6 +14815,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -12699,6 +14985,16 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "sid",
 				Description: "is a unique UUID of the session",
 				Type:        "string",
@@ -12727,6 +15023,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -12900,6 +15201,16 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "sid",
 				Description: "is a unique UUID of the session",
 				Type:        "string",
@@ -12928,6 +15239,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -13088,8 +15404,18 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "query",
 				Description: "is the prepared statement query",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -13126,6 +15452,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -13222,6 +15553,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name: "roles",
 				Type: "array",
 				Items: &EventField{
@@ -13252,6 +15588,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -13339,6 +15680,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -13362,6 +15708,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -13449,6 +15800,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "success",
 				Description: "indicates the success or failure of the operation",
 				Type:        "boolean",
@@ -13477,6 +15833,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -13554,6 +15915,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -13577,6 +15943,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -13735,8 +16106,18 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "proto",
 				Description: "specifies protocol that was captured",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -13808,6 +16189,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -13900,6 +16286,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -13923,6 +16314,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -14020,6 +16416,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -14043,6 +16444,141 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
+					},
+					{
+						Name:        "os_type",
+						Description: "of the device",
+						Type:        "integer",
+					},
+				},
+			},
+			{
+				Name:        "ttl",
+				Description: "is a TTL of reset password token represented as duration, e.g. \"10m\" used for compatibility purposes for some events, Expires should be used instead as it's more useful (contains exact expiration date/time)",
+				Type:        "string",
+			},
+			{
+				Name:        "uid",
+				Description: "is a unique event identifier",
+				Type:        "string",
+			},
+			{
+				Name:        "updated_by",
+				Description: "if set indicates the user who modified the resource",
+				Type:        "string",
+			},
+			{
+				Name:        "user",
+				Description: "is teleport user name",
+				Type:        "string",
+			},
+		},
+	},
+	"RoleUpdate": {
+		Description: "is emitted when a role is updated",
+		Fields: []*EventField{
+			{
+				Name:        "access_requests",
+				Description: "are the IDs of access requests created by the user",
+				Type:        "array",
+				Items: &EventField{
+					Type: "string",
+				},
+			},
+			{
+				Name:        "aws_role_arn",
+				Description: "is AWS IAM role user assumes when accessing AWS console",
+				Type:        "string",
+			},
+			{
+				Name:        "azure_identity",
+				Description: "is the Azure identity user assumes when accessing Azure API",
+				Type:        "string",
+			},
+			{
+				Name:        "cluster_name",
+				Description: "identifies the originating teleport cluster",
+				Type:        "string",
+			},
+			{
+				Name:        "code",
+				Description: "is a unique event code",
+				Type:        "string",
+			},
+			{
+				Name:        "ei",
+				Description: "is a monotonically incremented index in the event sequence",
+				Type:        "integer",
+			},
+			{
+				Name:        "event",
+				Description: "is the event type",
+				Type:        "string",
+			},
+			{
+				Name:        "expires",
+				Description: "is set if resource expires",
+				Type:        "string",
+			},
+			{
+				Name:        "gcp_service_account",
+				Description: "is the GCP service account user assumes when accessing GCP API",
+				Type:        "string",
+			},
+			{
+				Name:        "impersonator",
+				Description: "is a user acting on behalf of another user",
+				Type:        "string",
+			},
+			{
+				Name:        "login",
+				Description: "is OS login",
+				Type:        "string",
+			},
+			{
+				Name:        "name",
+				Description: "is a resource name",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
+				Name:        "time",
+				Description: "is event time",
+				Type:        "string",
+			},
+			{
+				Name:        "trusted_device",
+				Description: "contains information about the users' trusted device. Requires a registered and enrolled device to be used during authentication",
+				Type:        "object",
+				Fields: []*EventField{
+					{
+						Name:        "asset_tag",
+						Description: "inventory identifier",
+						Type:        "string",
+					},
+					{
+						Name:        "credential_id",
+						Description: "credential identifier",
+						Type:        "string",
+					},
+					{
+						Name:        "device_id",
+						Description: "of the device",
+						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -14140,6 +16676,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -14163,6 +16704,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -14260,6 +16806,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -14283,6 +16834,141 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
+					},
+					{
+						Name:        "os_type",
+						Description: "of the device",
+						Type:        "integer",
+					},
+				},
+			},
+			{
+				Name:        "ttl",
+				Description: "is a TTL of reset password token represented as duration, e.g. \"10m\" used for compatibility purposes for some events, Expires should be used instead as it's more useful (contains exact expiration date/time)",
+				Type:        "string",
+			},
+			{
+				Name:        "uid",
+				Description: "is a unique event identifier",
+				Type:        "string",
+			},
+			{
+				Name:        "updated_by",
+				Description: "if set indicates the user who modified the resource",
+				Type:        "string",
+			},
+			{
+				Name:        "user",
+				Description: "is teleport user name",
+				Type:        "string",
+			},
+		},
+	},
+	"SAMLConnectorUpdate": {
+		Description: "fires when SAML connector is updated",
+		Fields: []*EventField{
+			{
+				Name:        "access_requests",
+				Description: "are the IDs of access requests created by the user",
+				Type:        "array",
+				Items: &EventField{
+					Type: "string",
+				},
+			},
+			{
+				Name:        "aws_role_arn",
+				Description: "is AWS IAM role user assumes when accessing AWS console",
+				Type:        "string",
+			},
+			{
+				Name:        "azure_identity",
+				Description: "is the Azure identity user assumes when accessing Azure API",
+				Type:        "string",
+			},
+			{
+				Name:        "cluster_name",
+				Description: "identifies the originating teleport cluster",
+				Type:        "string",
+			},
+			{
+				Name:        "code",
+				Description: "is a unique event code",
+				Type:        "string",
+			},
+			{
+				Name:        "ei",
+				Description: "is a monotonically incremented index in the event sequence",
+				Type:        "integer",
+			},
+			{
+				Name:        "event",
+				Description: "is the event type",
+				Type:        "string",
+			},
+			{
+				Name:        "expires",
+				Description: "is set if resource expires",
+				Type:        "string",
+			},
+			{
+				Name:        "gcp_service_account",
+				Description: "is the GCP service account user assumes when accessing GCP API",
+				Type:        "string",
+			},
+			{
+				Name:        "impersonator",
+				Description: "is a user acting on behalf of another user",
+				Type:        "string",
+			},
+			{
+				Name:        "login",
+				Description: "is OS login",
+				Type:        "string",
+			},
+			{
+				Name:        "name",
+				Description: "is a resource name",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
+				Name:        "time",
+				Description: "is event time",
+				Type:        "string",
+			},
+			{
+				Name:        "trusted_device",
+				Description: "contains information about the users' trusted device. Requires a registered and enrolled device to be used during authentication",
+				Type:        "object",
+				Fields: []*EventField{
+					{
+						Name:        "asset_tag",
+						Description: "inventory identifier",
+						Type:        "string",
+					},
+					{
+						Name:        "credential_id",
+						Description: "credential identifier",
+						Type:        "string",
+					},
+					{
+						Name:        "device_id",
+						Description: "of the device",
+						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -14380,6 +17066,16 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "service_provider_entity_id",
 				Description: "is the entity ID of the service provider",
 				Type:        "string",
@@ -14423,6 +17119,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -14800,8 +17501,18 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "proto",
 				Description: "specifies protocol that was captured",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -14868,6 +17579,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -15055,8 +17771,18 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "proto",
 				Description: "specifies protocol that was captured",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -15128,6 +17854,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -15301,8 +18032,18 @@ var events = map[string]*Event{
 				},
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "proc_name",
 				Description: "is the RPC SQL Server procedure name",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -15334,6 +18075,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -15420,6 +18166,186 @@ var events = map[string]*Event{
 			{
 				Name:        "uid",
 				Description: "is a unique event identifier",
+				Type:        "string",
+			},
+		},
+	},
+	"SecurityReportRun": {
+		Description: "is emitted when a user runs an audit query",
+		Fields: []*EventField{
+			{
+				Name:        "access_requests",
+				Description: "are the IDs of access requests created by the user",
+				Type:        "array",
+				Items: &EventField{
+					Type: "string",
+				},
+			},
+			{
+				Name:        "audit_queries",
+				Description: "is the list of audit queries that were run",
+				Type:        "array",
+				Items: &EventField{
+					Type: "object",
+					Fields: []*EventField{
+						{
+							Name:        "data_scanned_in_bytes",
+							Description: "is the amount of data scanned by the query",
+							Type:        "integer",
+						},
+						{
+							Name:        "days",
+							Description: "is the number of days time range for the query",
+							Type:        "integer",
+						},
+						{
+							Name:        "name",
+							Description: "is the name of the query",
+							Type:        "string",
+						},
+						{
+							Name:        "query",
+							Description: "is the query that was run",
+							Type:        "string",
+						},
+						{
+							Name:        "total_execution_time_in_millis",
+							Description: "is the total execution time of the query",
+							Type:        "integer",
+						},
+					},
+				},
+			},
+			{
+				Name:        "aws_role_arn",
+				Description: "is AWS IAM role user assumes when accessing AWS console",
+				Type:        "string",
+			},
+			{
+				Name:        "azure_identity",
+				Description: "is the Azure identity user assumes when accessing Azure API",
+				Type:        "string",
+			},
+			{
+				Name:        "cluster_name",
+				Description: "identifies the originating teleport cluster",
+				Type:        "string",
+			},
+			{
+				Name:        "code",
+				Description: "is a unique event code",
+				Type:        "string",
+			},
+			{
+				Name:        "ei",
+				Description: "is a monotonically incremented index in the event sequence",
+				Type:        "integer",
+			},
+			{
+				Name:        "error",
+				Description: "includes system error message for the failed attempt",
+				Type:        "string",
+			},
+			{
+				Name:        "event",
+				Description: "is the event type",
+				Type:        "string",
+			},
+			{
+				Name:        "gcp_service_account",
+				Description: "is the GCP service account user assumes when accessing GCP API",
+				Type:        "string",
+			},
+			{
+				Name:        "impersonator",
+				Description: "is a user acting on behalf of another user",
+				Type:        "string",
+			},
+			{
+				Name:        "login",
+				Description: "is OS login",
+				Type:        "string",
+			},
+			{
+				Name:        "message",
+				Description: "is a user-friendly message for successfull or unsuccessfull auth attempt",
+				Type:        "string",
+			},
+			{
+				Name:        "name",
+				Description: "is the query that was run",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
+				Name:        "success",
+				Description: "indicates the success or failure of the operation",
+				Type:        "boolean",
+			},
+			{
+				Name:        "time",
+				Description: "is event time",
+				Type:        "string",
+			},
+			{
+				Name:        "total_data_scanned_in_bytes",
+				Description: "is the amount of data scanned by the query",
+				Type:        "integer",
+			},
+			{
+				Name:        "total_execution_time_in_millis",
+				Description: "is the total execution time of the query",
+				Type:        "integer",
+			},
+			{
+				Name:        "trusted_device",
+				Description: "contains information about the users' trusted device. Requires a registered and enrolled device to be used during authentication",
+				Type:        "object",
+				Fields: []*EventField{
+					{
+						Name:        "asset_tag",
+						Description: "inventory identifier",
+						Type:        "string",
+					},
+					{
+						Name:        "credential_id",
+						Description: "credential identifier",
+						Type:        "string",
+					},
+					{
+						Name:        "device_id",
+						Description: "of the device",
+						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
+					},
+					{
+						Name:        "os_type",
+						Description: "of the device",
+						Type:        "integer",
+					},
+				},
+			},
+			{
+				Name:        "uid",
+				Description: "is a unique event identifier",
+				Type:        "string",
+			},
+			{
+				Name:        "user",
+				Description: "is teleport user name",
+				Type:        "string",
+			},
+			{
+				Name:        "version",
+				Description: "is the version of security report",
 				Type:        "string",
 			},
 		},
@@ -15519,8 +18445,18 @@ var events = map[string]*Event{
 				Type:        "integer",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "program",
 				Description: "is name of the executable",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -15592,6 +18528,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -15789,8 +18730,18 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "proto",
 				Description: "specifies protocol that was captured",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -15862,6 +18813,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -15979,8 +18935,18 @@ var events = map[string]*Event{
 				Type:        "integer",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "program",
 				Description: "is name of the executable",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -16052,6 +19018,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -16241,8 +19212,18 @@ var events = map[string]*Event{
 				},
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "proto",
 				Description: "specifies protocol that was captured",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -16324,6 +19305,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -16462,8 +19448,18 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "proto",
 				Description: "specifies protocol that was captured",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -16530,6 +19526,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -16632,8 +19633,18 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "proto",
 				Description: "specifies protocol that was captured",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -16700,6 +19711,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -16822,8 +19838,18 @@ var events = map[string]*Event{
 				Type:        "integer",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "program",
 				Description: "is name of the executable",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -16895,6 +19921,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -17037,6 +20068,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "sid",
 				Description: "is the ID of the session",
 				Type:        "string",
@@ -17065,6 +20101,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -17177,6 +20218,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "server_addr",
 				Description: "is the address of the server the session occurred on",
 				Type:        "string",
@@ -17235,6 +20281,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -17401,8 +20452,18 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "proto",
 				Description: "specifies protocol that was captured",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -17481,6 +20542,11 @@ var events = map[string]*Event{
 						Type:        "string",
 					},
 					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
+					},
+					{
 						Name:        "os_type",
 						Description: "of the device",
 						Type:        "integer",
@@ -17525,6 +20591,11 @@ var events = map[string]*Event{
 			{
 				Name:        "event",
 				Description: "is the event type",
+				Type:        "string",
+			},
+			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
 				Type:        "string",
 			},
 			{
@@ -17636,6 +20707,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -17659,6 +20735,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -17746,6 +20827,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -17769,6 +20855,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -17866,6 +20957,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -17889,6 +20985,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -17986,6 +21087,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -18009,6 +21115,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -18146,6 +21257,16 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "sid",
 				Description: "is a unique UUID of the session",
 				Type:        "string",
@@ -18174,6 +21295,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -18205,7 +21331,7 @@ var events = map[string]*Event{
 		},
 	},
 	"UserCreate": {
-		Description: "is emitted when the user is created or updated (upsert)",
+		Description: "is emitted when the user is created or upserted",
 		Fields: []*EventField{
 			{
 				Name:        "access_requests",
@@ -18276,6 +21402,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "roles",
 				Description: "is a list of roles for the user",
 				Type:        "array",
@@ -18307,6 +21438,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -18404,6 +21540,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -18427,6 +21568,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -18579,6 +21725,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "success",
 				Description: "indicates the success or failure of the operation",
 				Type:        "boolean",
@@ -18607,6 +21758,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -18689,6 +21845,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -18712,6 +21873,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -18799,6 +21965,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "time",
 				Description: "is event time",
 				Type:        "string",
@@ -18822,6 +21993,154 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
+					},
+					{
+						Name:        "os_type",
+						Description: "of the device",
+						Type:        "integer",
+					},
+				},
+			},
+			{
+				Name:        "ttl",
+				Description: "is a TTL of reset password token represented as duration, e.g. \"10m\" used for compatibility purposes for some events, Expires should be used instead as it's more useful (contains exact expiration date/time)",
+				Type:        "string",
+			},
+			{
+				Name:        "uid",
+				Description: "is a unique event identifier",
+				Type:        "string",
+			},
+			{
+				Name:        "updated_by",
+				Description: "if set indicates the user who modified the resource",
+				Type:        "string",
+			},
+			{
+				Name:        "user",
+				Description: "is teleport user name",
+				Type:        "string",
+			},
+		},
+	},
+	"UserUpdate": {
+		Description: "is emitted when the user is updated",
+		Fields: []*EventField{
+			{
+				Name:        "access_requests",
+				Description: "are the IDs of access requests created by the user",
+				Type:        "array",
+				Items: &EventField{
+					Type: "string",
+				},
+			},
+			{
+				Name:        "aws_role_arn",
+				Description: "is AWS IAM role user assumes when accessing AWS console",
+				Type:        "string",
+			},
+			{
+				Name:        "azure_identity",
+				Description: "is the Azure identity user assumes when accessing Azure API",
+				Type:        "string",
+			},
+			{
+				Name:        "cluster_name",
+				Description: "identifies the originating teleport cluster",
+				Type:        "string",
+			},
+			{
+				Name:        "code",
+				Description: "is a unique event code",
+				Type:        "string",
+			},
+			{
+				Name:        "connector",
+				Description: "is the connector used to create the user",
+				Type:        "string",
+			},
+			{
+				Name:        "ei",
+				Description: "is a monotonically incremented index in the event sequence",
+				Type:        "integer",
+			},
+			{
+				Name:        "event",
+				Description: "is the event type",
+				Type:        "string",
+			},
+			{
+				Name:        "expires",
+				Description: "is set if resource expires",
+				Type:        "string",
+			},
+			{
+				Name:        "gcp_service_account",
+				Description: "is the GCP service account user assumes when accessing GCP API",
+				Type:        "string",
+			},
+			{
+				Name:        "impersonator",
+				Description: "is a user acting on behalf of another user",
+				Type:        "string",
+			},
+			{
+				Name:        "login",
+				Description: "is OS login",
+				Type:        "string",
+			},
+			{
+				Name:        "name",
+				Description: "is a resource name",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
+				Name:        "roles",
+				Description: "is a list of roles for the user",
+				Type:        "array",
+				Items: &EventField{
+					Type: "string",
+				},
+			},
+			{
+				Name:        "time",
+				Description: "is event time",
+				Type:        "string",
+			},
+			{
+				Name:        "trusted_device",
+				Description: "contains information about the users' trusted device. Requires a registered and enrolled device to be used during authentication",
+				Type:        "object",
+				Fields: []*EventField{
+					{
+						Name:        "asset_tag",
+						Description: "inventory identifier",
+						Type:        "string",
+					},
+					{
+						Name:        "credential_id",
+						Description: "credential identifier",
+						Type:        "string",
+					},
+					{
+						Name:        "device_id",
+						Description: "of the device",
+						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -18942,9 +22261,19 @@ var events = map[string]*Event{
 				},
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "recorded",
 				Description: "is true if the session was recorded, false otherwise",
 				Type:        "boolean",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
 			},
 			{
 				Name:        "session_start",
@@ -18985,6 +22314,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -19045,6 +22379,11 @@ var events = map[string]*Event{
 				Name:        "addr.remote",
 				Description: "is a client (user's) address",
 				Type:        "string",
+			},
+			{
+				Name:        "allow_user_creation",
+				Description: "indicates whether automatic local user creation is allowed for this session",
+				Type:        "boolean",
 			},
 			{
 				Name:        "aws_role_arn",
@@ -19127,8 +22466,18 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "private_key_policy",
+				Description: "is the private key policy of the private key used to start this session",
+				Type:        "string",
+			},
+			{
 				Name:        "proto",
 				Description: "specifies protocol that was captured",
+				Type:        "string",
+			},
+			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
 				Type:        "string",
 			},
 			{
@@ -19165,6 +22514,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",
@@ -19287,6 +22641,11 @@ var events = map[string]*Event{
 				Type:        "string",
 			},
 			{
+				Name:        "required_private_key_policy",
+				Description: "is the private key policy enforced for this login",
+				Type:        "string",
+			},
+			{
 				Name:        "success",
 				Description: "indicates the success or failure of the operation",
 				Type:        "boolean",
@@ -19315,6 +22674,11 @@ var events = map[string]*Event{
 						Name:        "device_id",
 						Description: "of the device",
 						Type:        "string",
+					},
+					{
+						Name:        "device_origin",
+						Description: "origin",
+						Type:        "integer",
 					},
 					{
 						Name:        "os_type",

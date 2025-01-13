@@ -77,48 +77,69 @@ const (
 	// device inventory.
 	// Device Trust requires Teleport Enteprise.
 	RoleMDM SystemRole = "MDM"
+
+	// RoleAccessGraphPlugin is a role for Access Graph plugins to access
+	// Teleport's internal API and access graph.
+	RoleAccessGraphPlugin SystemRole = "AccessGraphPlugin"
 )
 
 // roleMappings maps a set of allowed lowercase system role names
 // to the proper system role
 var roleMappings = map[string]SystemRole{
-	"auth":            RoleAuth,
-	"node":            RoleNode,
-	"proxy":           RoleProxy,
-	"admin":           RoleAdmin,
-	"provisiontoken":  RoleProvisionToken,
-	"trusted_cluster": RoleTrustedCluster,
-	"trustedcluster":  RoleTrustedCluster,
-	"signup":          RoleSignup,
-	"nop":             RoleNop,
-	"remoteproxy":     RoleRemoteProxy,
-	"remote_proxy":    RoleRemoteProxy,
-	"kube":            RoleKube,
-	"app":             RoleApp,
-	"db":              RoleDatabase,
-	"windowsdesktop":  RoleWindowsDesktop,
-	"windows_desktop": RoleWindowsDesktop,
-	"bot":             RoleBot,
-	"instance":        RoleInstance,
-	"discovery":       RoleDiscovery,
-	"okta":            RoleOkta,
-	"mdm":             RoleMDM,
+	"auth":              RoleAuth,
+	"node":              RoleNode,
+	"proxy":             RoleProxy,
+	"admin":             RoleAdmin,
+	"provisiontoken":    RoleProvisionToken,
+	"trusted_cluster":   RoleTrustedCluster,
+	"trustedcluster":    RoleTrustedCluster,
+	"signup":            RoleSignup,
+	"nop":               RoleNop,
+	"remoteproxy":       RoleRemoteProxy,
+	"remote_proxy":      RoleRemoteProxy,
+	"kube":              RoleKube,
+	"app":               RoleApp,
+	"db":                RoleDatabase,
+	"windowsdesktop":    RoleWindowsDesktop,
+	"windows_desktop":   RoleWindowsDesktop,
+	"bot":               RoleBot,
+	"instance":          RoleInstance,
+	"discovery":         RoleDiscovery,
+	"okta":              RoleOkta,
+	"mdm":               RoleMDM,
+	"accessgraphplugin": RoleAccessGraphPlugin,
+}
+
+func normalizedSystemRole(s string) SystemRole {
+	if role, ok := roleMappings[strings.ToLower(strings.TrimSpace(s))]; ok {
+		return role
+	}
+	return SystemRole(s)
+}
+
+func normalizedSystemRoles(s []string) []SystemRole {
+	roles := make([]SystemRole, 0, len(s))
+	for _, role := range s {
+		roles = append(roles, normalizedSystemRole(role))
+	}
+	return roles
 }
 
 // localServiceMappings is the subset of role mappings which happen to be true
 // teleport services (e.g. db, kube, etc), excluding those which represent remote
 // services (i.e. remoteproxy).
 var localServiceMappings = map[SystemRole]struct{}{
-	RoleAuth:           {},
-	RoleNode:           {},
-	RoleProxy:          {},
-	RoleKube:           {},
-	RoleApp:            {},
-	RoleDatabase:       {},
-	RoleWindowsDesktop: {},
-	RoleDiscovery:      {},
-	RoleOkta:           {},
-	RoleMDM:            {},
+	RoleAuth:              {},
+	RoleNode:              {},
+	RoleProxy:             {},
+	RoleKube:              {},
+	RoleApp:               {},
+	RoleDatabase:          {},
+	RoleWindowsDesktop:    {},
+	RoleDiscovery:         {},
+	RoleOkta:              {},
+	RoleMDM:               {},
+	RoleAccessGraphPlugin: {},
 }
 
 // controlPlaneMapping is the subset of local services which are definitively control plane
@@ -141,10 +162,7 @@ func LocalServiceMappings() SystemRoles {
 
 // NewTeleportRoles return a list of teleport roles from slice of strings
 func NewTeleportRoles(in []string) (SystemRoles, error) {
-	var roles SystemRoles
-	for _, val := range in {
-		roles = append(roles, SystemRole(val))
-	}
+	roles := SystemRoles(normalizedSystemRoles(in))
 	return roles, roles.Check()
 }
 
@@ -153,8 +171,7 @@ func NewTeleportRoles(in []string) (SystemRoles, error) {
 func ParseTeleportRoles(str string) (SystemRoles, error) {
 	var roles SystemRoles
 	for _, s := range strings.Split(str, ",") {
-		cleaned := strings.ToLower(strings.TrimSpace(s))
-		if r, ok := roleMappings[cleaned]; ok && r.Check() == nil {
+		if r := normalizedSystemRole(s); r.Check() == nil {
 			roles = append(roles, r)
 			continue
 		}
@@ -253,11 +270,11 @@ func (r *SystemRole) Set(v string) error {
 	return nil
 }
 
-// String returns debug-friendly representation of this teleport role.
+// String returns the system role string representation. Returned values must
+// match (case-insensitive) the role mappings; otherwise, the validation check
+// will fail.
 func (r *SystemRole) String() string {
 	switch *r {
-	case RoleSignup:
-		return "Password"
 	case RoleTrustedCluster:
 		return "trusted_cluster"
 	default:

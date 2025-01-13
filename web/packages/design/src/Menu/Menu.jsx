@@ -1,25 +1,25 @@
 /*
-Copyright 2019 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React from 'react';
 import PropTypes from 'prop-types';
-import ReactDOM from 'react-dom';
+import { Component, createRef } from 'react';
 
 import Popover from '../Popover';
-
 import getScrollbarSize from './../utils/scrollbarSize';
 import MenuList from './MenuList';
 
@@ -28,21 +28,13 @@ const POSITION = {
   horizontal: 'right',
 };
 
-class Menu extends React.Component {
-  getContentAnchorEl = () => {
-    if (this.menuListRef.selectedItemRef) {
-      return ReactDOM.findDOMNode(this.menuListRef.selectedItemRef);
-    }
+class Menu extends Component {
+  menuListRef = createRef();
 
-    return ReactDOM.findDOMNode(this.menuListRef).firstChild;
-  };
-
-  handleMenuListRef = ref => {
-    this.menuListRef = ref;
-  };
+  getContentAnchorEl = () => this.menuListRef.current?.firstChild;
 
   handleEntering = element => {
-    const menuList = ReactDOM.findDOMNode(this.menuListRef);
+    const menuList = this.menuListRef.current;
 
     // Let's ignore that piece of logic if users are already overriding the width
     // of the menu.
@@ -62,7 +54,8 @@ class Menu extends React.Component {
   };
 
   render() {
-    const { children, popoverCss, menuListCss, ...other } = this.props;
+    const { children, popoverCss, menuListCss, menuListProps, ...other } =
+      this.props;
 
     return (
       <Popover
@@ -73,7 +66,11 @@ class Menu extends React.Component {
         transformOrigin={POSITION}
         {...other}
       >
-        <MenuList menuListCss={menuListCss} ref={this.handleMenuListRef}>
+        <MenuList
+          {...menuListProps}
+          menuListCss={menuListCss}
+          ref={this.menuListRef}
+        >
           {children}
         </MenuList>
       </Popover>
@@ -114,6 +111,10 @@ Menu.propTypes = {
    * `menuListCss` property applied to the [`MenuList`] css.
    */
   menuListCss: PropTypes.func,
+  /**
+   * `menuListProps` are props passed to the underlying [`MenuList`].
+   */
+  menuListProps: PropTypes.shape(MenuList.propTypes),
 };
 
 export default Menu;

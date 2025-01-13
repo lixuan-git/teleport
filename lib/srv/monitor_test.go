@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-		http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package srv
 
@@ -20,12 +22,12 @@ import (
 	"context"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport/api/constants"
@@ -36,21 +38,26 @@ import (
 	"github.com/gravitational/teleport/lib/events/eventstest"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/tlsca"
+	"github.com/gravitational/teleport/lib/utils"
 )
 
 func newTestMonitor(ctx context.Context, t *testing.T, asrv *auth.TestAuthServer, mut ...func(*MonitorConfig)) (*mockTrackingConn, *eventstest.ChannelEmitter, MonitorConfig) {
+	ctx, cancel := context.WithCancel(ctx)
+	t.Cleanup(cancel)
+
 	conn := &mockTrackingConn{closedC: make(chan struct{})}
 	emitter := eventstest.NewChannelEmitter(1)
 	cfg := MonitorConfig{
-		Context:     ctx,
-		Conn:        conn,
-		Emitter:     emitter,
-		Clock:       asrv.Clock(),
-		Tracker:     &mockActivityTracker{asrv.Clock()},
-		Entry:       logrus.StandardLogger(),
-		LockWatcher: asrv.LockWatcher,
-		LockTargets: []types.LockTarget{{User: "test-user"}},
-		LockingMode: constants.LockingModeBestEffort,
+		Context:        ctx,
+		Conn:           conn,
+		Emitter:        emitter,
+		EmitterContext: context.Background(),
+		Clock:          asrv.Clock(),
+		Tracker:        &mockActivityTracker{asrv.Clock()},
+		Logger:         utils.NewSlogLoggerForTests(),
+		LockWatcher:    asrv.LockWatcher,
+		LockTargets:    []types.LockTarget{{User: "test-user"}},
+		LockingMode:    constants.LockingModeBestEffort,
 	}
 	for _, f := range mut {
 		f(&cfg)
@@ -75,12 +82,13 @@ func TestConnectionMonitorLockInForce(t *testing.T) {
 	// Auth server.
 	emitter := eventstest.NewChannelEmitter(1)
 	monitor, err := NewConnectionMonitor(ConnectionMonitorConfig{
-		AccessPoint: asrv.AuthServer,
-		Emitter:     emitter,
-		Clock:       asrv.Clock(),
-		Logger:      logrus.StandardLogger(),
-		LockWatcher: asrv.LockWatcher,
-		ServerID:    "test",
+		AccessPoint:    asrv.AuthServer,
+		Emitter:        emitter,
+		EmitterContext: ctx,
+		Clock:          asrv.Clock(),
+		Logger:         utils.NewSlogLoggerForTests(),
+		LockWatcher:    asrv.LockWatcher,
+		ServerID:       "test",
 	})
 	require.NoError(t, err)
 
@@ -105,7 +113,7 @@ func TestConnectionMonitorLockInForce(t *testing.T) {
 		tconn := &mockTrackingConn{closedC: make(chan struct{})}
 		monitorCtx, _, err := monitor.MonitorConn(ctx, authzCtx, tconn)
 		require.NoError(t, err)
-		require.Nil(t, monitorCtx.Err())
+		require.NoError(t, monitorCtx.Err())
 
 		// Create a lock targeting the user that was connected above.
 		require.NoError(t, asrv.AuthServer.UpsertLock(ctx, lock))
@@ -169,12 +177,21 @@ func TestMonitorLockInForce(t *testing.T) {
 	lock, err := types.NewLock("test-lock", types.LockSpecV2{Target: cfg.LockTargets[0]})
 	require.NoError(t, err)
 	require.NoError(t, asrv.AuthServer.UpsertLock(ctx, lock))
+
+	select {
+	case disconnectEvent := <-emitter.C():
+		reason := (disconnectEvent).(*apievents.ClientDisconnect).Reason
+		require.Equal(t, services.LockInForceAccessDenied(lock).Error(), reason, "expected error matching client disconnect")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timeout waiting for connection close event.")
+	}
+
 	select {
 	case <-conn.closedC:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Timeout waiting for connection close.")
+		// connection closed, continue
+	default:
+		t.Fatal("Connection not yet closed.")
 	}
-	require.Equal(t, services.LockInForceAccessDenied(lock).Error(), (<-emitter.C()).(*apievents.ClientDisconnect).Reason)
 
 	// Monitor should also detect preexistent locks.
 	conn, emitter, cfg = newTestMonitor(ctx, t, asrv)
@@ -237,6 +254,29 @@ func TestMonitorStaleLocks(t *testing.T) {
 		t.Fatal("Timeout waiting for connection close.")
 	}
 	require.Equal(t, services.StrictLockingModeAccessDenied.Error(), (<-emitter.C()).(*apievents.ClientDisconnect).Reason)
+}
+
+func TestWritesDisconnectMessage(t *testing.T) {
+	asrv, err := auth.NewTestAuthServer(auth.TestAuthServerConfig{
+		Dir:   t.TempDir(),
+		Clock: clockwork.NewFakeClock(),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, asrv.Close()) })
+
+	var sw strings.Builder
+
+	ctx := context.Background()
+	clock := clockwork.NewFakeClock()
+	conn, _, _ := newTestMonitor(ctx, t, asrv, func(cfg *MonitorConfig) {
+		cfg.ClientIdleTimeout = 1 * time.Second
+		cfg.Clock = clock
+		cfg.MessageWriter = &sw
+	})
+	clock.BlockUntil(1)
+	clock.Advance(2 * time.Second)
+	<-conn.closedC
+	require.Contains(t, sw.String(), "exceeded idle timeout")
 }
 
 type mockTrackingConn struct {
@@ -345,72 +385,4 @@ func (m mockChecker) AdjustClientIdleTimeout(ttl time.Duration) time.Duration {
 
 func (m mockChecker) LockingMode(defaultMode constants.LockingMode) constants.LockingMode {
 	return defaultMode
-}
-
-type mockAuthPreference struct {
-	types.AuthPreference
-}
-
-var disconnectExpiredCert bool
-
-func (m *mockAuthPreference) GetDisconnectExpiredCert() bool {
-	return disconnectExpiredCert
-}
-
-func TestGetDisconnectExpiredCertFromIdentity(t *testing.T) {
-	clock := clockwork.NewFakeClock()
-	now := clock.Now()
-	inAnHour := clock.Now().Add(time.Hour)
-	var unset time.Time
-	checker := mockChecker{}
-	authPref := &mockAuthPreference{}
-
-	for _, test := range []struct {
-		name                    string
-		expires                 time.Time
-		previousIdentityExpires time.Time
-		mfaVerified             bool
-		disconnectExpiredCert   bool
-		expected                time.Time
-	}{
-		{
-			name:                    "mfa overrides expires when set",
-			expires:                 now,
-			previousIdentityExpires: inAnHour,
-			mfaVerified:             true,
-			disconnectExpiredCert:   true,
-			expected:                inAnHour,
-		},
-		{
-			name:                    "expires returned when mfa unset",
-			expires:                 now,
-			previousIdentityExpires: unset,
-			mfaVerified:             false,
-			disconnectExpiredCert:   true,
-			expected:                now,
-		},
-		{
-			name:                    "unset when disconnectExpiredCert is false",
-			expires:                 now,
-			previousIdentityExpires: inAnHour,
-			mfaVerified:             true,
-			disconnectExpiredCert:   false,
-			expected:                unset,
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			var mfaVerified string
-			if test.mfaVerified {
-				mfaVerified = "1234"
-			}
-			identity := tlsca.Identity{
-				Expires:                 test.expires,
-				PreviousIdentityExpires: test.previousIdentityExpires,
-				MFAVerified:             mfaVerified,
-			}
-			disconnectExpiredCert = test.disconnectExpiredCert
-			got := GetDisconnectExpiredCertFromIdentity(checker, authPref, &identity)
-			require.Equal(t, test.expected, got)
-		})
-	}
 }

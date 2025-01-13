@@ -4,6 +4,11 @@ set -euo pipefail
 
 source vars.env
 
+if [[ "$TELEPORT_BACKEND" == "firestore" ]]; then
+  exit 0
+fi
+
+
 dynamo_policy="$STATE_DIR/dynamo-iam-policy"
 
 s3_policy="$STATE_DIR/s3-iam-policy"
@@ -38,8 +43,8 @@ cat > "$dynamo_policy" <<EOF
                 "dynamodb:UpdateContinuousBackups"
             ],
             "Resource": [
-                "arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${CLUSTER_NAME}-backend",
-                "arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${CLUSTER_NAME}-backend/stream/*"
+                "arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/${CLUSTER_NAME}-backend",
+                "arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/${CLUSTER_NAME}-backend/stream/*"
             ]
         },
         {
@@ -62,8 +67,8 @@ cat > "$dynamo_policy" <<EOF
                 "dynamodb:UpdateContinuousBackups"
             ],
             "Resource": [
-                "arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${CLUSTER_NAME}-events",
-                "arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${CLUSTER_NAME}-events/index/*"
+                "arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/${CLUSTER_NAME}-events",
+                "arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/${CLUSTER_NAME}-events/index/*"
             ]
         }
     ]

@@ -1,24 +1,26 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package mocks
 
 import (
 	"context"
-	"crypto/tls"
+	"crypto"
 	"time"
 
 	"github.com/gravitational/trace"
@@ -28,7 +30,6 @@ import (
 
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/cloud/gcp"
-	"github.com/gravitational/teleport/lib/tlsca"
 )
 
 var _ gcp.SQLAdminClient = (*GCPSQLAdminClientMock)(nil)
@@ -38,7 +39,16 @@ type GCPSQLAdminClientMock struct {
 	// DatabaseInstance is returned from GetDatabaseInstance.
 	DatabaseInstance *sqladmin.DatabaseInstance
 	// EphemeralCert is returned from GenerateEphemeralCert.
-	EphemeralCert *tls.Certificate
+	EphemeralCert string
+	// DatabaseUser is returned from GetUser.
+	DatabaseUser *sqladmin.User
+}
+
+func (g *GCPSQLAdminClientMock) GetUser(ctx context.Context, db types.Database, dbUser string) (*sqladmin.User, error) {
+	if g.DatabaseUser == nil {
+		return nil, trace.AccessDenied("unauthorized")
+	}
+	return g.DatabaseUser, nil
 }
 
 func (g *GCPSQLAdminClientMock) UpdateUser(ctx context.Context, db types.Database, dbUser string, user *sqladmin.User) error {
@@ -49,7 +59,7 @@ func (g *GCPSQLAdminClientMock) GetDatabaseInstance(ctx context.Context, db type
 	return g.DatabaseInstance, nil
 }
 
-func (g *GCPSQLAdminClientMock) GenerateEphemeralCert(ctx context.Context, db types.Database, identity tlsca.Identity) (*tls.Certificate, error) {
+func (g *GCPSQLAdminClientMock) GenerateEphemeralCert(_ context.Context, _ types.Database, _ time.Time, _ crypto.PublicKey) (string, error) {
 	return g.EphemeralCert, nil
 }
 

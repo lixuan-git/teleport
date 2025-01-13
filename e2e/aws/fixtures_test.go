@@ -1,26 +1,33 @@
 /*
-Copyright 2023 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package e2e
 
 import (
+	"crypto/x509"
+	"io"
+	"net/http"
 	"os"
 	"os/user"
 	"testing"
 	"time"
 
+	"github.com/gravitational/trace"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport/api/types"
@@ -32,15 +39,60 @@ import (
 	"github.com/gravitational/teleport/lib/utils"
 )
 
-// username is the name of the host user used for tests.
-var username string
+// hostUser is the name of the host user used for tests.
+var hostUser string
+
+// awsCertPool is an x509 cert pool containing the AWS global cert bundle.
+var awsCertPool *x509.CertPool
 
 func init() {
 	me, err := user.Current()
 	if err != nil {
 		panic(err)
 	}
-	username = me.Username
+	hostUser = me.Username
+
+	pool, err := getAWSGlobalCertBundlePool()
+	if err != nil {
+		panic(err)
+	}
+	awsCertPool = pool
+}
+
+func getAWSGlobalCertBundlePool() (*x509.CertPool, error) {
+	certPool := x509.NewCertPool()
+
+	// AWS global certificate bundles
+	for _, url := range []string{
+		"https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem",
+		"https://s3.amazonaws.com/redshift-downloads/amazon-trust-ca-bundle.crt",
+	} {
+		certBytes, err := getAWSCertBundle(url)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		ok := certPool.AppendCertsFromPEM(certBytes)
+		if !ok {
+			return nil, trace.BadParameter("failed to parse AWS cert bundle %v", url)
+		}
+	}
+
+	return certPool, nil
+}
+
+func getAWSCertBundle(url string) ([]byte, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer resp.Body.Close()
+
+	if http.StatusOK != resp.StatusCode {
+		return nil, trace.Errorf("got non-ok response from AWS: %d", resp.StatusCode)
+	}
+
+	certBytes, err := io.ReadAll(resp.Body)
+	return certBytes, trace.Wrap(err)
 }
 
 // mustGetEnv is a test helper that fetches an env variable or fails with an
@@ -64,6 +116,13 @@ func mustGetDiscoveryMatcherLabels(t *testing.T) types.Labels {
 	return out
 }
 
+func mustGetDBAdmin(t *testing.T, db types.Database) types.DatabaseAdminUser {
+	t.Helper()
+	adminUser := db.GetAdminUser()
+	require.NotEmpty(t, adminUser.Name, "unknown db auto user provisioning admin, should have been imported using the %q label", types.DatabaseAdminLabel)
+	return adminUser
+}
+
 // testOptionsFunc is a test option configuration func.
 type testOptionsFunc func(*testOptions)
 
@@ -75,15 +134,16 @@ type testOptions struct {
 	// serviceConfigFuncs are a list of functions that configure the Teleport
 	// cluster before it starts.
 	serviceConfigFuncs []func(*servicecfg.Config)
-	// userRoles are roles that will be bootstrapped and added to the Teleport
-	// user under test.
-	userRoles []types.Role
+	// userRoles is a map from username to that user's roles that will be
+	// bootstrapped and added to the Teleport test cluster.
+	userRoles map[string][]types.Role
 }
 
 // createTeleportCluster sets up a Teleport cluster for tests.
 func createTeleportCluster(t *testing.T, opts ...testOptionsFunc) *helpers.TeleInstance {
 	t.Helper()
 	var options testOptions
+	options.userRoles = make(map[string][]types.Role)
 	for _, opt := range opts {
 		opt(&options)
 	}
@@ -95,7 +155,9 @@ func createTeleportCluster(t *testing.T, opts ...testOptionsFunc) *helpers.TeleI
 	teleport := helpers.NewInstance(t, cfg)
 
 	// Create a new user with the role created above.
-	teleport.AddUserWithRole(username, options.userRoles...)
+	for name, roles := range options.userRoles {
+		teleport.AddUserWithRole(name, roles...)
+	}
 
 	tconf := newTeleportConfig(t)
 	for _, optFn := range options.serviceConfigFuncs {
@@ -128,7 +190,7 @@ func newInstanceConfig(t *testing.T) helpers.InstanceConfig {
 		NodeName:    host,
 		Priv:        priv,
 		Pub:         pub,
-		Log:         utils.NewLoggerForTests(),
+		Logger:      utils.NewSlogLoggerForTests(),
 	}
 }
 
@@ -136,23 +198,22 @@ func newTeleportConfig(t *testing.T) *servicecfg.Config {
 	tconf := servicecfg.MakeDefaultConfig()
 	// Replace the default auth and proxy listeners with the ones so we can
 	// run multiple tests in parallel.
-	tconf.Console = nil
 	tconf.Proxy.DisableWebInterface = true
 	tconf.PollingPeriod = 500 * time.Millisecond
-	tconf.ClientTimeout = time.Second
-	tconf.ShutdownTimeout = 2 * tconf.ClientTimeout
+	tconf.Testing.ClientTimeout = time.Second
+	tconf.Testing.ShutdownTimeout = 2 * tconf.Testing.ClientTimeout
 	return tconf
 }
 
 // withUserRole creates a new role that will be bootstraped and then granted to
 // the Teleport user under test.
-func withUserRole(t *testing.T, name string, spec types.RoleSpecV6) testOptionsFunc {
+func withUserRole(t *testing.T, user, name string, spec types.RoleSpecV6) testOptionsFunc {
 	t.Helper()
 	// Create a new role with full access to all databases.
 	role, err := types.NewRole(name, spec)
 	require.NoError(t, err)
 	return func(options *testOptions) {
-		options.userRoles = append(options.userRoles, role)
+		options.userRoles[user] = append(options.userRoles[user], role)
 	}
 }
 
@@ -179,10 +240,6 @@ func withDiscoveryService(t *testing.T, discoveryGroup string, awsMatchers ...ty
 		options.serviceConfigFuncs = append(options.serviceConfigFuncs, func(cfg *servicecfg.Config) {
 			cfg.Discovery.Enabled = true
 			cfg.Discovery.DiscoveryGroup = discoveryGroup
-			// Reduce the polling interval to speed up the test execution
-			// in the case of a failure of the first attempt.
-			// The default polling interval is 5 minutes.
-			cfg.Discovery.PollInterval = 1 * time.Minute
 			cfg.Discovery.AWSMatchers = append(cfg.Discovery.AWSMatchers, awsMatchers...)
 		})
 	}
@@ -205,11 +262,32 @@ func withDatabaseService(t *testing.T, matchers ...services.ResourceMatcher) tes
 func withFullDatabaseAccessUserRole(t *testing.T) testOptionsFunc {
 	t.Helper()
 	// Create a new role with full access to all databases.
-	return withUserRole(t, "db-access", types.RoleSpecV6{
+	return withUserRole(t, hostUser, "db-access", allowDatabaseAccessRoleSpec)
+}
+
+var allowDatabaseAccessRoleSpec = types.RoleSpecV6{
+	Allow: types.RoleConditions{
+		DatabaseLabels: types.Labels{types.Wildcard: []string{types.Wildcard}},
+		DatabaseUsers:  []string{types.Wildcard},
+		DatabaseNames:  []string{types.Wildcard},
+	},
+}
+
+func makeAutoUserKeepRoleSpec(roles ...string) types.RoleSpecV6 {
+	return types.RoleSpecV6{
 		Allow: types.RoleConditions{
 			DatabaseLabels: types.Labels{types.Wildcard: []string{types.Wildcard}},
-			DatabaseUsers:  []string{types.Wildcard},
 			DatabaseNames:  []string{types.Wildcard},
+			DatabaseRoles:  roles,
 		},
-	})
+		Options: types.RoleOptions{
+			CreateDatabaseUserMode: types.CreateDatabaseUserMode_DB_USER_MODE_KEEP,
+		},
+	}
+}
+
+func makeAutoUserDropRoleSpec(roles ...string) types.RoleSpecV6 {
+	spec := makeAutoUserKeepRoleSpec(roles...)
+	spec.Options.CreateDatabaseUserMode = types.CreateDatabaseUserMode_DB_USER_MODE_BEST_EFFORT_DROP
+	return spec
 }

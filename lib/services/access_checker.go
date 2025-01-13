@@ -1,38 +1,45 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
 import (
+	"cmp"
 	"context"
+	"fmt"
+	"log/slog"
+	"net"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/exp/slices"
 
 	"github.com/gravitational/teleport/api/constants"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/api/types/wrappers"
 	apiutils "github.com/gravitational/teleport/api/utils"
 	"github.com/gravitational/teleport/api/utils/keys"
+	"github.com/gravitational/teleport/lib/services/readonly"
 	"github.com/gravitational/teleport/lib/tlsca"
 	"github.com/gravitational/teleport/lib/utils"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
 // AccessChecker interface checks access to resources based on roles, traits,
@@ -57,7 +64,7 @@ type AccessChecker interface {
 	CheckAccessToRemoteCluster(cluster types.RemoteCluster) error
 
 	// CheckAccessToRule checks access to a rule within a namespace.
-	CheckAccessToRule(context RuleContext, namespace string, rule string, verb string, silent bool) error
+	CheckAccessToRule(context RuleContext, namespace string, rule string, verb string) error
 
 	// CheckLoginDuration checks if role set can login up to given duration and
 	// returns a combined list of allowed logins.
@@ -79,7 +86,7 @@ type AccessChecker interface {
 	// CheckAccessToSAMLIdP checks access to the SAML IdP.
 	//
 	//nolint:revive // Because we want this to be IdP.
-	CheckAccessToSAMLIdP(types.AuthPreference) error
+	CheckAccessToSAMLIdP(readonly.AuthPreference, AccessState) error
 
 	// AdjustSessionTTL will reduce the requested ttl to lowest max allowed TTL
 	// for this role set, otherwise it returns ttl unchanged
@@ -104,6 +111,9 @@ type AccessChecker interface {
 
 	// CanPortForward returns true if this RoleSet can forward ports.
 	CanPortForward() bool
+
+	// SSHPortForwardMode returns the SSHPortForwardMode that the RoleSet allows.
+	SSHPortForwardMode() SSHPortForwardMode
 
 	// DesktopClipboard returns true if the role set has enabled shared
 	// clipboard for desktop sessions. Clipboard sharing is disabled if
@@ -142,9 +152,17 @@ type AccessChecker interface {
 	// is allowed to use.
 	CheckDatabaseNamesAndUsers(ttl time.Duration, overrideTTL bool) (names []string, users []string, err error)
 
-	// CheckDatabaseRoles returns whether a user should be auto-created in the
-	// database and a list of database roles to assign.
-	CheckDatabaseRoles(types.Database) (create bool, roles []string, err error)
+	// DatabaseAutoUserMode returns whether a user should be auto-created in
+	// the database.
+	DatabaseAutoUserMode(types.Database) (types.CreateDatabaseUserMode, error)
+
+	// CheckDatabaseRoles returns a list of database roles to assign, when
+	// auto-user provisioning is enabled. If no user-requested roles, all
+	// allowed roles are returned.
+	CheckDatabaseRoles(database types.Database, userRequestedRoles []string) (roles []string, err error)
+
+	// GetDatabasePermissions returns a set of database permissions applicable for the user.
+	GetDatabasePermissions(database types.Database) (allow types.DatabasePermissions, deny types.DatabasePermissions, err error)
 
 	// CheckImpersonate checks whether current user is allowed to impersonate
 	// users and roles
@@ -168,7 +186,11 @@ type AccessChecker interface {
 	CertificateExtensions() []*types.CertExtension
 
 	// GetAllowedSearchAsRoles returns all of the allowed SearchAsRoles.
-	GetAllowedSearchAsRoles() []string
+	GetAllowedSearchAsRoles(allowFilters ...SearchAsRolesOption) []string
+
+	// GetAllowedSearchAsRolesForKubeResourceKind returns all of the allowed SearchAsRoles
+	// that allowed requesting to the requested Kubernetes resource kind.
+	GetAllowedSearchAsRolesForKubeResourceKind(requestedKubeResourceKind string) []string
 
 	// GetAllowedPreviewAsRoles returns all of the allowed PreviewAsRoles.
 	GetAllowedPreviewAsRoles() []string
@@ -213,10 +235,10 @@ type AccessChecker interface {
 	// GetAccessState returns the AccessState for the user given their roles, the
 	// cluster auth preference, and whether MFA and the user's device were
 	// verified.
-	GetAccessState(authPref types.AuthPreference) AccessState
+	GetAccessState(authPref readonly.AuthPreference) AccessState
 	// PrivateKeyPolicy returns the enforced private key policy for this role set,
 	// or the provided defaultPolicy - whichever is stricter.
-	PrivateKeyPolicy(defaultPolicy keys.PrivateKeyPolicy) keys.PrivateKeyPolicy
+	PrivateKeyPolicy(defaultPolicy keys.PrivateKeyPolicy) (keys.PrivateKeyPolicy, error)
 
 	// GetKubeResources returns the allowed and denied Kubernetes Resources configured
 	// for a user.
@@ -236,7 +258,7 @@ type AccessChecker interface {
 	EnumerateEntities(resource AccessCheckable, listFn roleEntitiesListFn, newMatcher roleMatcherFactoryFn, extraEntities ...string) EnumerationResult
 
 	// EnumerateDatabaseUsers specializes EnumerateEntities to enumerate db_users.
-	EnumerateDatabaseUsers(database types.Database, extraUsers ...string) EnumerationResult
+	EnumerateDatabaseUsers(database types.Database, extraUsers ...string) (EnumerationResult, error)
 
 	// EnumerateDatabaseNames specializes EnumerateEntities to enumerate db_names.
 	EnumerateDatabaseNames(database types.Database, extraNames ...string) EnumerationResult
@@ -246,9 +268,14 @@ type AccessChecker interface {
 	// Supports the following resource types:
 	//
 	// - types.Server with GetKind() == types.KindNode
-	//
 	// - types.KindWindowsDesktop
+	// - types.KindApp with IsAWSConsole() == true
 	GetAllowedLoginsForResource(resource AccessCheckable) ([]string, error)
+
+	// CheckSPIFFESVID checks if the role set has access to generating the
+	// requested SPIFFE ID. Returns an error if the role set does not have the
+	// ability to generate the requested SVID.
+	CheckSPIFFESVID(spiffeIDPath string, dnsSANs []string, ipSANs []net.IP) error
 }
 
 // AccessInfo hold information about an identity necessary to check whether that
@@ -265,6 +292,8 @@ type AccessInfo struct {
 	// access restrictions should be applied. Used for search-based access
 	// requests.
 	AllowedResourceIDs []types.ResourceID
+	// Username is the Teleport username.
+	Username string
 }
 
 // accessChecker implements the AccessChecker interface.
@@ -340,7 +369,8 @@ func NewAccessCheckerForRemoteCluster(ctx context.Context, localAccessInfo *Acce
 	}
 
 	remoteAccessInfo := &AccessInfo{
-		Traits: remoteUser.GetTraits(),
+		Username: remoteUser.GetName(),
+		Traits:   remoteUser.GetTraits(),
 		// Will fill this in with the names of the remote/mapped roles we got
 		// from GetCurrentUserRoles.
 		Roles: make([]string, 0, len(remoteRoles)),
@@ -377,10 +407,11 @@ func (a *accessChecker) checkAllowedResources(r AccessCheckable) error {
 		return nil
 	}
 
-	// Note: logging in this function only happens in debug mode. This is because
+	// Note: logging in this function only happens in trace mode. This is because
 	// adding logging to this function (which is called on every resource returned
 	// by the backend) can slow down this function by 50x for large clusters!
-	isDebugEnabled, debugf := rbacDebugLogger()
+	ctx := context.Background()
+	isLoggingEnabled := rbacLogger.Enabled(ctx, logutils.TraceLevel)
 
 	for _, resourceID := range a.info.AllowedResourceIDs {
 		if resourceID.ClusterName == a.localCluster &&
@@ -392,23 +423,33 @@ func (a *accessChecker) checkAllowedResources(r AccessCheckable) error {
 			(resourceID.Kind == r.GetKind() || (slices.Contains(types.KubernetesResourcesKinds, resourceID.Kind) && r.GetKind() == types.KindKubernetesCluster)) &&
 			resourceID.Name == r.GetName() {
 			// Allowed to access this resource by resource ID, move on to role checks.
-			if isDebugEnabled {
-				debugf("Matched allowed resource ID %q", types.ResourceIDToString(resourceID))
+
+			if isLoggingEnabled {
+				rbacLogger.LogAttrs(ctx, logutils.TraceLevel, "Matched allowed resource ID",
+					slog.String("resource_id", types.ResourceIDToString(resourceID)),
+				)
 			}
+
 			return nil
 		}
 	}
 
-	if isDebugEnabled {
+	if isLoggingEnabled {
 		allowedResources, err := types.ResourceIDsToString(a.info.AllowedResourceIDs)
 		if err != nil {
 			return trace.Wrap(err)
 		}
-		err = trace.AccessDenied("access to %v denied, %q not in allowed resource IDs %s",
+
+		slog.LogAttrs(ctx, logutils.TraceLevel, "Access to resource denied, not in allowed resource IDs",
+			slog.String("resource_kind", r.GetKind()),
+			slog.String("resource_name", r.GetName()),
+			slog.Any("allowed_resources", allowedResources),
+		)
+
+		return trace.AccessDenied("access to %v denied, %q not in allowed resource IDs %s",
 			r.GetKind(), r.GetName(), allowedResources)
-		debugf("Access denied: %v", err)
-		return err
 	}
+
 	return trace.AccessDenied("access to %v denied, not in allowed resource IDs", r.GetKind())
 }
 
@@ -418,6 +459,18 @@ func (a *accessChecker) CheckAccess(r AccessCheckable, state AccessState, matche
 	if err := a.checkAllowedResources(r); err != nil {
 		return trace.Wrap(err)
 	}
+
+	switch rr := r.(type) {
+	case types.Resource153Unwrapper:
+		switch urr := rr.Unwrap().(type) {
+		case IdentityCenterAccount:
+			matchers = append(matchers, NewIdentityCenterAccountMatcher(urr))
+
+		case IdentityCenterAccountAssignment:
+			matchers = append(matchers, NewIdentityCenterAccountAssignmentMatcher(urr))
+		}
+	}
+
 	return trace.Wrap(a.RoleSet.checkAccess(r, a.info.Traits, state, matchers...))
 }
 
@@ -512,65 +565,161 @@ func (a *accessChecker) Traits() wrappers.Traits {
 	return a.info.Traits
 }
 
+// DatabaseAutoUserMode returns whether a user should be auto-created in
+// the database.
+func (a *accessChecker) DatabaseAutoUserMode(database types.Database) (types.CreateDatabaseUserMode, error) {
+	result, err := a.checkDatabaseRoles(database)
+	return result.createDatabaseUserMode(), trace.Wrap(err)
+}
+
 // CheckDatabaseRoles returns whether a user should be auto-created in the
 // database and a list of database roles to assign.
-func (a *accessChecker) CheckDatabaseRoles(database types.Database) (create bool, roles []string, err error) {
-	// First, collect roles from this roleset that have "create_db_user" option.
+func (a *accessChecker) CheckDatabaseRoles(database types.Database, userRequestedRoles []string) ([]string, error) {
+	result, err := a.checkDatabaseRoles(database)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	switch {
+	case !result.createDatabaseUserMode().IsEnabled():
+		return []string{}, nil
+
+	// If user requested a list of roles, make sure all requested roles are
+	// allowed.
+	case len(userRequestedRoles) > 0:
+		for _, requestedRole := range userRequestedRoles {
+			if !slices.Contains(result.allowedRoles(), requestedRole) {
+				return nil, trace.AccessDenied("access to database role %q denied", requestedRole)
+			}
+		}
+		return userRequestedRoles, nil
+
+	// If user does not provide any roles, use all allowed roles from roleset.
+	default:
+		return result.allowedRoles(), nil
+	}
+}
+
+type checkDatabaseRolesResult struct {
+	allowedRoleSet RoleSet
+	deniedRoleSet  RoleSet
+}
+
+func (result *checkDatabaseRolesResult) createDatabaseUserMode() types.CreateDatabaseUserMode {
+	if result == nil {
+		return types.CreateDatabaseUserMode_DB_USER_MODE_UNSPECIFIED
+	}
+	return result.allowedRoleSet.GetCreateDatabaseUserMode()
+}
+
+func (result *checkDatabaseRolesResult) allowedRoles() []string {
+	if result == nil {
+		return nil
+	}
+
+	rolesMap := make(map[string]struct{})
+	for _, role := range result.allowedRoleSet {
+		for _, dbRole := range role.GetDatabaseRoles(types.Allow) {
+			rolesMap[dbRole] = struct{}{}
+		}
+	}
+	for _, role := range result.deniedRoleSet {
+		for _, dbRole := range role.GetDatabaseRoles(types.Deny) {
+			delete(rolesMap, dbRole)
+		}
+	}
+	return utils.StringsSliceFromSet(rolesMap)
+}
+
+func (a *accessChecker) checkDatabaseRoles(database types.Database) (*checkDatabaseRolesResult, error) {
+	// First, collect roles from this roleset that have create database user mode set.
 	var autoCreateRoles RoleSet
 	for _, role := range a.RoleSet {
-		if role.GetCreateDatabaseUserOption() {
+		if role.GetCreateDatabaseUserMode().IsEnabled() {
 			autoCreateRoles = append(autoCreateRoles, role)
 		}
 	}
 	// If there are no "auto-create user" roles, nothing to do.
 	if len(autoCreateRoles) == 0 {
-		return false, nil, nil
+		return nil, nil
 	}
 	// Otherwise, iterate over auto-create roles matching the database user
 	// is connecting to and compile a list of roles database user should be
 	// assigned.
-	rolesMap := make(map[string]struct{})
-	var matched bool
+	var allowedRoleSet RoleSet
 	for _, role := range autoCreateRoles {
 		match, _, err := checkRoleLabelsMatch(types.Allow, role, a.info.Traits, database, false)
 		if err != nil {
-			return false, nil, trace.Wrap(err)
+			return nil, trace.Wrap(err)
 		}
 		if !match {
 			continue
 		}
-		for _, dbRole := range role.GetDatabaseRoles(types.Allow) {
-			rolesMap[dbRole] = struct{}{}
-		}
-		matched = true
+		allowedRoleSet = append(allowedRoleSet, role)
+
 	}
+	var deniedRoleSet RoleSet
 	for _, role := range autoCreateRoles {
 		match, _, err := checkRoleLabelsMatch(types.Deny, role, a.info.Traits, database, false)
 		if err != nil {
-			return false, nil, trace.Wrap(err)
+			return nil, trace.Wrap(err)
 		}
 		if !match {
 			continue
 		}
-		for _, dbRole := range role.GetDatabaseRoles(types.Deny) {
-			delete(rolesMap, dbRole)
-		}
+		deniedRoleSet = append(deniedRoleSet, role)
+
 	}
 	// The collected role list can be empty and that should be ok, we want to
 	// leave the behavior of what happens when a user is created with default
 	// "no roles" configuration up to the target database.
-	return matched, utils.StringsSliceFromSet(rolesMap), nil
+	result := checkDatabaseRolesResult{
+		allowedRoleSet: allowedRoleSet,
+		deniedRoleSet:  deniedRoleSet,
+	}
+	return &result, nil
+}
+
+// GetDatabasePermissions returns a set of database permissions applicable for the user in the context of particular database.
+func (a *accessChecker) GetDatabasePermissions(database types.Database) (allow types.DatabasePermissions, deny types.DatabasePermissions, err error) {
+	result, err := a.checkDatabaseRoles(database)
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+	if !result.createDatabaseUserMode().IsEnabled() {
+		return nil, nil, nil
+	}
+
+	for _, role := range result.allowedRoleSet {
+		allow = append(allow, role.GetDatabasePermissions(types.Allow)...)
+	}
+	for _, role := range result.deniedRoleSet {
+		deny = append(deny, role.GetDatabasePermissions(types.Deny)...)
+	}
+	return allow, deny, nil
 }
 
 // EnumerateDatabaseUsers specializes EnumerateEntities to enumerate db_users.
-func (a *accessChecker) EnumerateDatabaseUsers(database types.Database, extraUsers ...string) EnumerationResult {
+func (a *accessChecker) EnumerateDatabaseUsers(database types.Database, extraUsers ...string) (EnumerationResult, error) {
+	// When auto-user provisioning is enabled, only Teleport username is allowed.
+	if database.SupportsAutoUsers() && database.GetAdminUser().Name != "" {
+		result := NewEnumerationResult()
+		autoUser, err := a.DatabaseAutoUserMode(database)
+		if err != nil {
+			return result, trace.Wrap(err)
+		} else if autoUser.IsEnabled() {
+			result.allowedDeniedMap[a.info.Username] = true
+			return result, nil
+		}
+	}
+
 	listFn := func(role types.Role, condition types.RoleConditionType) []string {
 		return role.GetDatabaseUsers(condition)
 	}
 	newMatcher := func(user string) RoleMatcher {
 		return NewDatabaseUserMatcher(database, user)
 	}
-	return a.EnumerateEntities(database, listFn, newMatcher, extraUsers...)
+	return a.EnumerateEntities(database, listFn, newMatcher, extraUsers...), nil
 }
 
 // EnumerateDatabaseNames specializes EnumerateEntities to enumerate db_names.
@@ -650,13 +799,15 @@ func (a *accessChecker) EnumerateEntities(resource AccessCheckable, listFn roleE
 // Supports the following resource types:
 //
 // - types.Server with GetKind() == types.KindNode
-//
 // - types.KindWindowsDesktop
+// - types.KindApp with IsAWSConsole() == true
 func (a *accessChecker) GetAllowedLoginsForResource(resource AccessCheckable) ([]string, error) {
 	// Create a map indexed by all logins in the RoleSet,
 	// mapped to false if any role has it in its deny section,
 	// true otherwise.
 	mapped := make(map[string]bool)
+
+	resourceAsApp, resourceIsApp := resource.(interface{ IsAWSConsole() bool })
 
 	for _, role := range a.RoleSet {
 		var loginGetter func(types.RoleConditionType) []string
@@ -666,6 +817,16 @@ func (a *accessChecker) GetAllowedLoginsForResource(resource AccessCheckable) ([
 			loginGetter = role.GetLogins
 		case types.KindWindowsDesktop:
 			loginGetter = role.GetWindowsLogins
+		case types.KindApp:
+			if !resourceIsApp {
+				return nil, trace.BadParameter("received unsupported resource type for Application kind: %T", resource)
+			}
+			// For Apps, only AWS currently supports listing the possible logins.
+			if !resourceAsApp.IsAWSConsole() {
+				return nil, nil
+			}
+
+			loginGetter = role.GetAWSRoleARNs
 		default:
 			return nil, trace.BadParameter("received unsupported resource kind: %s", resource.GetKind())
 		}
@@ -696,6 +857,12 @@ func (a *accessChecker) GetAllowedLoginsForResource(resource AccessCheckable) ([
 		newLoginMatcher = NewLoginMatcher
 	case types.KindWindowsDesktop:
 		newLoginMatcher = NewWindowsLoginMatcher
+	case types.KindApp:
+		if !resourceIsApp || !resourceAsApp.IsAWSConsole() {
+			return nil, trace.BadParameter("received unsupported resource type for Application: %T", resource)
+		}
+
+		newLoginMatcher = NewAppAWSLoginMatcher
 	default:
 		return nil, trace.BadParameter("received unsupported resource kind: %s", resource.GetKind())
 	}
@@ -720,10 +887,11 @@ func (a *accessChecker) CheckAccessToRemoteCluster(rc types.RemoteCluster) error
 		return trace.AccessDenied("access to cluster denied")
 	}
 
-	// Note: logging in this function only happens in debug mode, this is because
+	// Note: logging in this function only happens in trace mode, this is because
 	// adding logging to this function (which is called on every server returned
 	// by GetRemoteClusters) can slow down this function by 50x for large clusters!
-	isDebugEnabled, debugf := rbacDebugLogger()
+	ctx := context.Background()
+	isLoggingEnabled := rbacLogger.Enabled(ctx, logutils.TraceLevel)
 
 	rcLabels := rc.GetMetadata().Labels
 
@@ -743,8 +911,10 @@ func (a *accessChecker) CheckAccessToRemoteCluster(rc types.RemoteCluster) error
 	}
 
 	if !usesLabels && len(rcLabels) == 0 {
-		debugf("Grant access to cluster %v - no role in %v uses cluster labels and the cluster is not labeled.",
-			rc.GetName(), a.RoleNames())
+		rbacLogger.LogAttrs(ctx, logutils.TraceLevel, "Grant access to cluster - no role uses cluster labels and the cluster is not labeled",
+			slog.String("cluster_name", rc.GetName()),
+			slog.Any("roles", a.RoleNames()),
+		)
 		return nil
 	}
 
@@ -752,21 +922,24 @@ func (a *accessChecker) CheckAccessToRemoteCluster(rc types.RemoteCluster) error
 	// the deny role set prohibits access.
 	var errs []error
 	for _, role := range a.RoleSet {
-		matchLabels, labelsMessage, err := checkRoleLabelsMatch(types.Deny, role, a.info.Traits, rc, isDebugEnabled)
+		matchLabels, labelsMessage, err := checkRoleLabelsMatch(types.Deny, role, a.info.Traits, rc, isLoggingEnabled)
 		if err != nil {
 			return trace.Wrap(err)
 		}
 		if matchLabels {
 			// This condition avoids formatting calls on large scale.
-			debugf("Access to cluster %v denied, deny rule in %v matched; match(%s)",
-				rc.GetName(), role.GetName(), labelsMessage)
+			rbacLogger.LogAttrs(ctx, logutils.TraceLevel, "Access to cluster denied, deny rule matched",
+				slog.String("cluster", rc.GetName()),
+				slog.String("role", role.GetName()),
+				slog.String("label_message", labelsMessage),
+			)
 			return trace.AccessDenied("access to cluster denied")
 		}
 	}
 
 	// Check allow rules: label has to match in any role in the role set to be granted access.
 	for _, role := range a.RoleSet {
-		matchLabels, labelsMessage, err := checkRoleLabelsMatch(types.Allow, role, a.info.Traits, rc, isDebugEnabled)
+		matchLabels, labelsMessage, err := checkRoleLabelsMatch(types.Allow, role, a.info.Traits, rc, isLoggingEnabled)
 		if err != nil {
 			return trace.Wrap(err)
 		}
@@ -774,22 +947,32 @@ func (a *accessChecker) CheckAccessToRemoteCluster(rc types.RemoteCluster) error
 		if err != nil {
 			return trace.Wrap(err)
 		}
-		debugf("Check access to role(%v) rc(%v, labels=%v) matchLabels=%v, msg=%v, err=%v allow=%v rcLabels=%v",
-			role.GetName(), rc.GetName(), rcLabels, matchLabels, labelsMessage, err, labelMatchers, rcLabels)
+		rbacLogger.LogAttrs(ctx, logutils.TraceLevel, "Check access to role",
+			slog.String("role", role.GetName()),
+			slog.String("cluster", rc.GetName()),
+			slog.Any("cluster_labels", rcLabels),
+			slog.Any("match_labels", matchLabels),
+			slog.String("labels_message", labelsMessage),
+			slog.Any("error", err),
+			slog.Any("allow", labelMatchers),
+		)
 		if err != nil {
 			return trace.Wrap(err)
 		}
 		if matchLabels {
 			return nil
 		}
-		if isDebugEnabled {
+		if isLoggingEnabled {
 			deniedError := trace.AccessDenied("role=%v, match(%s)",
 				role.GetName(), labelsMessage)
 			errs = append(errs, deniedError)
 		}
 	}
 
-	debugf("Access to cluster %v denied, no allow rule matched; %v", rc.GetName(), errs)
+	rbacLogger.LogAttrs(ctx, logutils.TraceLevel, "Access to cluster denied, no allow rule matched",
+		slog.String("cluster", rc.GetName()),
+		slog.Any("error", errs),
+	)
 	return trace.AccessDenied("access to cluster denied")
 }
 
@@ -831,6 +1014,34 @@ func (a *accessChecker) DesktopGroups(s types.WindowsDesktop) ([]string, error) 
 	return utils.StringsSliceFromSet(groups), nil
 }
 
+// HostUserMode determines how host users should be created.
+type HostUserMode int
+
+const (
+	// HostUserModeUndefined is the default mode, for when the mode couldn't be
+	// determined from a types.CreateHostUserMode.
+	HostUserModeUndefined HostUserMode = iota
+	// HostUserModeKeep creates a home directory and persists after a session ends.
+	HostUserModeKeep
+	// HostUserModeDrop does not create a home directory, and it is removed after
+	// a session ends.
+	HostUserModeDrop
+	// HostUserModeStatic creates a home directory and exists independently of a
+	// session.
+	HostUserModeStatic
+)
+
+func convertHostUserMode(mode types.CreateHostUserMode) HostUserMode {
+	switch mode {
+	case types.CreateHostUserMode_HOST_USER_MODE_KEEP:
+		return HostUserModeKeep
+	case types.CreateHostUserMode_HOST_USER_MODE_INSECURE_DROP:
+		return HostUserModeDrop
+	default:
+		return HostUserModeUndefined
+	}
+}
+
 // HostUsersInfo keeps information about groups and sudoers entries
 // for a particular host user
 type HostUsersInfo struct {
@@ -838,17 +1049,26 @@ type HostUsersInfo struct {
 	Groups []string
 	// Mode determines if a host user should be deleted after a session
 	// ends or not.
-	Mode types.CreateHostUserMode
+	Mode HostUserMode
 	// UID is the UID that the host user will be created with
 	UID string
 	// GID is the GID that the host user will be created with
 	GID string
+	// Shell is the default login shell for a host user
+	Shell string
+	// TakeOwnership determines whether or not an existing user should be
+	// taken over by teleport. This currently only applies to 'static' mode
+	// users, 'keep' mode users still need to assign 'teleport-keep' in the
+	// Groups slice in order to take ownership.
+	TakeOwnership bool
 }
 
 // HostUsers returns host user information matching a server or nil if
 // a role disallows host user creation
 func (a *accessChecker) HostUsers(s types.Server) (*HostUsersInfo, error) {
 	groups := make(map[string]struct{})
+	shellToRoles := make(map[string][]string)
+	var shell string
 	var mode types.CreateHostUserMode
 
 	for _, role := range a.RoleSet {
@@ -862,31 +1082,51 @@ func (a *accessChecker) HostUsers(s types.Server) (*HostUsersInfo, error) {
 		}
 
 		createHostUserMode := role.GetOptions().CreateHostUserMode
+		//nolint:staticcheck // this field is preserved for existing deployments, but shouldn't be used going forward
 		createHostUser := role.GetOptions().CreateHostUser
 		if createHostUserMode == types.CreateHostUserMode_HOST_USER_MODE_UNSPECIFIED {
 			createHostUserMode = types.CreateHostUserMode_HOST_USER_MODE_OFF
 			if createHostUser != nil && createHostUser.Value {
-				createHostUserMode = types.CreateHostUserMode_HOST_USER_MODE_DROP
+				createHostUserMode = types.CreateHostUserMode_HOST_USER_MODE_KEEP
 			}
 		}
 
 		// if any of the matching roles do not enable create host
 		// user, the user should not be allowed on
 		if createHostUserMode == types.CreateHostUserMode_HOST_USER_MODE_OFF {
-			return nil, trace.AccessDenied("user is not allowed to create host users")
+			return nil, trace.AccessDenied("role %q prevents creating host users", role.GetName())
 		}
 
 		if mode == types.CreateHostUserMode_HOST_USER_MODE_UNSPECIFIED {
 			mode = createHostUserMode
 		}
-		// prefer to use HostUserModeKeep over Drop if mode has already been set.
-		if mode == types.CreateHostUserMode_HOST_USER_MODE_DROP && createHostUserMode == types.CreateHostUserMode_HOST_USER_MODE_KEEP {
+		// prefer to use HostUserModeKeep over InsecureDrop if mode has already been set.
+		if mode == types.CreateHostUserMode_HOST_USER_MODE_INSECURE_DROP &&
+			createHostUserMode == types.CreateHostUserMode_HOST_USER_MODE_KEEP {
 			mode = types.CreateHostUserMode_HOST_USER_MODE_KEEP
+		}
+
+		hostUserShell := role.GetOptions().CreateHostUserDefaultShell
+		shell = cmp.Or(shell, hostUserShell)
+		if hostUserShell != "" {
+			shellToRoles[hostUserShell] = append(shellToRoles[hostUserShell], role.GetName())
 		}
 
 		for _, group := range role.GetHostGroups(types.Allow) {
 			groups[group] = struct{}{}
 		}
+	}
+
+	if len(shellToRoles) > 1 {
+		b := &strings.Builder{}
+		for shell, roles := range shellToRoles {
+			fmt.Fprintf(b, "%s=%v ", shell, roles)
+		}
+
+		slog.WarnContext(context.Background(), "Host user shell resolution is ambiguous due to conflicting roles, consider unifying roles around a single shell",
+			"selected_shell", shell,
+			"shell_assignments", b,
+		)
 	}
 
 	for _, role := range a.RoleSet {
@@ -916,9 +1156,10 @@ func (a *accessChecker) HostUsers(s types.Server) (*HostUsersInfo, error) {
 
 	return &HostUsersInfo{
 		Groups: utils.StringsSliceFromSet(groups),
-		Mode:   mode,
+		Mode:   convertHostUserMode(mode),
 		UID:    uid,
 		GID:    gid,
+		Shell:  shell,
 	}, nil
 }
 
@@ -999,6 +1240,7 @@ func AccessInfoFromLocalCertificate(cert *ssh.Certificate) (*AccessInfo, error) 
 	}
 
 	return &AccessInfo{
+		Username:           cert.KeyId,
 		Roles:              roles,
 		Traits:             traits,
 		AllowedResourceIDs: allowedResourceIDs,
@@ -1036,8 +1278,11 @@ func AccessInfoFromRemoteCertificate(cert *ssh.Certificate, roleMap types.RoleMa
 	if len(roles) == 0 {
 		return nil, trace.AccessDenied("no roles mapped for user with remote roles %v", unmappedRoles)
 	}
-	log.Debugf("Mapped remote roles %v to local roles %v and traits %v.",
-		unmappedRoles, roles, traits)
+	slog.DebugContext(context.Background(), "Mapped remote roles to local roles and traits",
+		"remote_roles", unmappedRoles,
+		"local_roles", roles,
+		"traits", traits,
+	)
 
 	allowedResourceIDs, err := ExtractAllowedResourcesFromCert(cert)
 	if err != nil {
@@ -1045,6 +1290,7 @@ func AccessInfoFromRemoteCertificate(cert *ssh.Certificate, roleMap types.RoleMa
 	}
 
 	return &AccessInfo{
+		Username:           cert.KeyId,
 		Roles:              roles,
 		Traits:             traits,
 		AllowedResourceIDs: allowedResourceIDs,
@@ -1064,20 +1310,21 @@ func AccessInfoFromLocalIdentity(identity tlsca.Identity, access UserGetter) (*A
 	// empty traits are a valid use case in standard certs,
 	// so we only check for whether roles are empty.
 	if len(identity.Groups) == 0 {
-		u, err := access.GetUser(identity.Username, false)
+		u, err := access.GetUser(context.TODO(), identity.Username, false)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
 
-		log.Warnf("Failed to find roles in x509 identity for %v. Fetching "+
-			"from backend. If the identity provider allows username changes, this can "+
-			"potentially allow an attacker to change the role of the existing user.",
-			identity.Username)
+		const msg = "Failed to find roles in x509 identity. Fetching " +
+			"from backend. If the identity provider allows username changes, this can " +
+			"potentially allow an attacker to change the role of the existing user."
+		slog.WarnContext(context.Background(), msg, "username", identity.Username)
 		roles = u.GetRoles()
 		traits = u.GetTraits()
 	}
 
 	return &AccessInfo{
+		Username:           identity.Username,
 		Roles:              roles,
 		Traits:             traits,
 		AllowedResourceIDs: allowedResourceIDs,
@@ -1089,14 +1336,15 @@ func AccessInfoFromLocalIdentity(identity tlsca.Identity, access UserGetter) (*A
 // local roles based on the given roleMap.
 func AccessInfoFromRemoteIdentity(identity tlsca.Identity, roleMap types.RoleMap) (*AccessInfo, error) {
 	// Set internal traits for the remote user. This allows Teleport to work by
-	// passing exact logins, Kubernetes users/groups and database users/names
-	// to the remote cluster.
+	// passing exact logins, Kubernetes users/groups, database users/names, and
+	// AWS Role ARNs to the remote cluster.
 	traits := map[string][]string{
-		constants.TraitLogins:     identity.Principals,
-		constants.TraitKubeGroups: identity.KubernetesGroups,
-		constants.TraitKubeUsers:  identity.KubernetesUsers,
-		constants.TraitDBNames:    identity.DatabaseNames,
-		constants.TraitDBUsers:    identity.DatabaseUsers,
+		constants.TraitLogins:      identity.Principals,
+		constants.TraitKubeGroups:  identity.KubernetesGroups,
+		constants.TraitKubeUsers:   identity.KubernetesUsers,
+		constants.TraitDBNames:     identity.DatabaseNames,
+		constants.TraitDBUsers:     identity.DatabaseUsers,
+		constants.TraitAWSRoleARNs: identity.AWSRoleARNs,
 	}
 	// Prior to Teleport 6.2 no user traits were passed to remote clusters
 	// except for the internal ones specified above.
@@ -1121,12 +1369,17 @@ func AccessInfoFromRemoteIdentity(identity tlsca.Identity, roleMap types.RoleMap
 	if len(roles) == 0 {
 		return nil, trace.AccessDenied("no roles mapped for remote user %q from cluster %q with remote roles %v", identity.Username, identity.TeleportCluster, unmappedRoles)
 	}
-	log.Debugf("Mapped roles %v of remote user %q to local roles %v and traits %v.",
-		unmappedRoles, identity.Username, roles, traits)
+	slog.DebugContext(context.Background(), "Mapped roles of remote user to local roles and traits",
+		"remote_roles", unmappedRoles,
+		"user", identity.Username,
+		"local_roles", roles,
+		"traits", traits,
+	)
 
 	allowedResourceIDs := identity.AllowedResourceIDs
 
 	return &AccessInfo{
+		Username:           identity.Username,
 		Roles:              roles,
 		Traits:             traits,
 		AllowedResourceIDs: allowedResourceIDs,
@@ -1150,8 +1403,8 @@ type UserState interface {
 	// IsBot returns true if the user belongs to a bot.
 	IsBot() bool
 
-	// BotGenerationLabel returns the bot generation label for the user.
-	BotGenerationLabel() string
+	// GetGithubIdentities returns a list of connected GitHub identities
+	GetGithubIdentities() []types.ExternalIdentity
 }
 
 // AccessInfoFromUser return a new AccessInfo populated from the roles and
@@ -1171,7 +1424,8 @@ func AccessInfoFromUserState(user UserState) *AccessInfo {
 	roles := user.GetRoles()
 	traits := user.GetTraits()
 	return &AccessInfo{
-		Roles:  roles,
-		Traits: traits,
+		Username: user.GetName(),
+		Roles:    roles,
+		Traits:   traits,
 	}
 }

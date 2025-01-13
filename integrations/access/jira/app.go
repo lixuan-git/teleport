@@ -1,24 +1,27 @@
 /*
-Copyright 2020-2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package jira
 
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"regexp"
 	"strings"
@@ -26,20 +29,19 @@ import (
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	"google.golang.org/grpc"
-	grpcbackoff "google.golang.org/grpc/backoff"
 
-	"github.com/gravitational/teleport/api/client"
 	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/types"
 	apiutils "github.com/gravitational/teleport/api/utils"
+	"github.com/gravitational/teleport/api/utils/retryutils"
 	"github.com/gravitational/teleport/integrations/access/common"
 	"github.com/gravitational/teleport/integrations/access/common/teleport"
 	"github.com/gravitational/teleport/integrations/lib"
 	"github.com/gravitational/teleport/integrations/lib/backoff"
-	"github.com/gravitational/teleport/integrations/lib/credentials"
 	"github.com/gravitational/teleport/integrations/lib/logger"
 	"github.com/gravitational/teleport/integrations/lib/watcherjob"
+	"github.com/gravitational/teleport/lib/utils"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
 const (
@@ -47,8 +49,6 @@ const (
 	minServerVersion = "6.1.0"
 	// pluginName is used to tag PluginData and as a Delegator in Audit log.
 	pluginName = "jira"
-	// grpcBackoffMaxDelay is a maximum time gRPC client waits before reconnection attempt.
-	grpcBackoffMaxDelay = time.Second * 2
 	// initTimeout is used to bound execution time of health check and teleport version check.
 	initTimeout = time.Second * 10
 	// handlerTimeout is used to bound the execution time of watcher event handler.
@@ -57,6 +57,11 @@ const (
 	modifyPluginDataBackoffBase = time.Millisecond
 	// modifyPluginDataBackoffMax is a backoff threshold
 	modifyPluginDataBackoffMax = time.Second
+	// webhookIssueAPIRetryInterval is the time the plugin will wait before grabbing,
+	// the jira issue again if the webhook payload and jira API disagree on the issue status.
+	webhookIssueAPIRetryInterval = 5 * time.Second
+	// webhookIssueAPIRetryTimeout the timeout for retrying check that webhook payload matches issue API response.
+	webhookIssueAPIRetryTimeout = 5 * time.Minute
 )
 
 var resolveReasonInlineRegex = regexp.MustCompile(`(?im)^ *(resolution|reason) *: *(.+)$`)
@@ -66,20 +71,26 @@ var resolveReasonSeparatorRegex = regexp.MustCompile(`(?im)^ *(resolution|reason
 type App struct {
 	conf Config
 
-	teleport   teleport.Client
-	jira       *Jira
-	webhookSrv *WebhookServer
-	mainJob    lib.ServiceJob
-	statusSink common.StatusSink
+	teleport    teleport.Client
+	jira        *Jira
+	webhookSrv  *WebhookServer
+	mainJob     lib.ServiceJob
+	statusSink  common.StatusSink
+	retryConfig retryutils.LinearConfig
 
 	*lib.Process
 }
 
 func NewApp(conf Config) (*App, error) {
+	retryConfig := retryutils.LinearConfig{
+		Step: webhookIssueAPIRetryInterval,
+		Max:  webhookIssueAPIRetryTimeout,
+	}
 	app := &App{
-		conf:       conf,
-		teleport:   conf.Client,
-		statusSink: conf.StatusSink,
+		conf:        conf,
+		teleport:    conf.Client,
+		statusSink:  conf.StatusSink,
+		retryConfig: retryConfig,
 	}
 	app.mainJob = lib.NewServiceJob(app.run)
 	return app, nil
@@ -116,7 +127,6 @@ func (a *App) run(ctx context.Context) error {
 	var err error
 
 	log := logger.Get(ctx)
-	log.Infof("Starting Teleport Jira Plugin")
 
 	if err = a.init(ctx); err != nil {
 		return trace.Wrap(err)
@@ -138,7 +148,7 @@ func (a *App) run(ctx context.Context) error {
 	watcherJob, err := watcherjob.NewJob(
 		a.teleport,
 		watcherjob.Config{
-			Watch:            types.Watch{Kinds: []types.WatchKind{types.WatchKind{Kind: types.KindAccessRequest}}},
+			Watch:            types.Watch{Kinds: []types.WatchKind{{Kind: types.KindAccessRequest}}},
 			EventFuncTimeout: handlerTimeout,
 		},
 		a.onWatcherEvent,
@@ -155,9 +165,9 @@ func (a *App) run(ctx context.Context) error {
 	ok := (a.webhookSrv == nil || httpOk) && watcherOk
 	a.mainJob.SetReady(ok)
 	if ok {
-		log.Info("Plugin is ready")
+		log.InfoContext(ctx, "Plugin is ready")
 	} else {
-		log.Error("Plugin is not ready")
+		log.ErrorContext(ctx, "Plugin is not ready")
 	}
 
 	if httpJob != nil {
@@ -169,43 +179,14 @@ func (a *App) run(ctx context.Context) error {
 	return trace.NewAggregate(httpErr, watcherJob.Err())
 }
 
-func (a *App) createTeleportClient(ctx context.Context) error {
-	log := logger.Get(ctx)
-
-	if validCred, err := credentials.CheckIfExpired(a.conf.Teleport.Credentials()); err != nil {
-		log.Warn(err)
-		if !validCred {
-			return trace.BadParameter(
-				"No valid credentials found, this likely means credentials are expired. In this case, please sign new credentials and increase their TTL if needed.",
-			)
-		}
-		log.Info("At least one non-expired credential has been found, continuing startup")
-	}
-
-	var err error
-	bk := grpcbackoff.DefaultConfig
-	bk.MaxDelay = grpcBackoffMaxDelay
-	if a.teleport, err = client.New(ctx, client.Config{
-		Addrs:       a.conf.Teleport.GetAddrs(),
-		Credentials: a.conf.Teleport.Credentials(),
-		DialOpts: []grpc.DialOption{
-			grpc.WithConnectParams(grpc.ConnectParams{Backoff: bk, MinConnectTimeout: initTimeout}),
-			grpc.WithReturnConnectionError(),
-		},
-	}); err != nil {
-		return trace.Wrap(err)
-	}
-
-	return nil
-}
-
 func (a *App) init(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, initTimeout)
 	defer cancel()
 	log := logger.Get(ctx)
 
+	var err error
 	if a.teleport == nil {
-		if err := a.createTeleportClient(ctx); err != nil {
+		if a.teleport, err = common.GetTeleportClient(ctx, a.conf.Teleport); err != nil {
 			return trace.Wrap(err)
 		}
 	}
@@ -225,11 +206,11 @@ func (a *App) init(ctx context.Context) error {
 		return trace.Wrap(err)
 	}
 
-	log.Debug("Starting Jira API health check...")
+	log.DebugContext(ctx, "Starting Jira API health check")
 	if err = a.jira.HealthCheck(ctx); err != nil {
 		return trace.Wrap(err, "api health check failed")
 	}
-	log.Debug("Jira API health check finished ok")
+	log.DebugContext(ctx, "Jira API health check finished ok")
 
 	if !a.conf.DisableWebhook {
 		webhookSrv, err := NewWebhookServer(a.conf.HTTP, a.onJiraWebhook)
@@ -247,16 +228,16 @@ func (a *App) init(ctx context.Context) error {
 
 func (a *App) checkTeleportVersion(ctx context.Context) (proto.PingResponse, error) {
 	log := logger.Get(ctx)
-	log.Debug("Checking Teleport server version")
+	log.DebugContext(ctx, "Checking Teleport server version")
 	pong, err := a.teleport.Ping(ctx)
 	if err != nil {
 		if trace.IsNotImplemented(err) {
 			return pong, trace.Wrap(err, "server version must be at least %s", minServerVersion)
 		}
-		log.Error("Unable to get Teleport server version")
+		log.ErrorContext(ctx, "Unable to get Teleport server version")
 		return pong, trace.Wrap(err)
 	}
-	err = lib.AssertServerVersion(pong, minServerVersion)
+	err = utils.CheckMinVersion(pong.ServerVersion, minServerVersion)
 	return pong, trace.Wrap(err)
 }
 
@@ -266,42 +247,48 @@ func (a *App) onWatcherEvent(ctx context.Context, event types.Event) error {
 	}
 	op := event.Type
 	reqID := event.Resource.GetName()
-	ctx, _ = logger.WithField(ctx, "request_id", reqID)
+	ctx, _ = logger.With(ctx, "request_id", reqID)
 
 	switch op {
 	case types.OpPut:
-		ctx, _ = logger.WithField(ctx, "request_op", "put")
+		ctx, _ = logger.With(ctx, "request_op", "put")
 		req, ok := event.Resource.(types.AccessRequest)
 		if !ok {
 			return trace.Errorf("unexpected resource type %T", event.Resource)
 		}
-		ctx, log := logger.WithField(ctx, "request_state", req.GetState().String())
-		log.Debug("Processing watcher event")
+		ctx, log := logger.With(ctx, "request_state", req.GetState().String())
+		log.DebugContext(ctx, "Processing watcher event")
 
 		var err error
 		switch {
 		case req.GetState().IsPending():
 			err = a.onPendingRequest(ctx, req)
-		case req.GetState().IsApproved():
-			err = a.onResolvedRequest(ctx, req)
-		case req.GetState().IsDenied():
+		case req.GetState().IsResolved():
 			err = a.onResolvedRequest(ctx, req)
 		default:
-			log.WithField("event", event).Warn("Unknown request state")
+			log.WarnContext(ctx, "Unknown request state",
+				slog.Group("event",
+					slog.Any("type", logutils.StringerAttr(event.Type)),
+					slog.Group("resource",
+						"kind", event.Resource.GetKind(),
+						"name", event.Resource.GetName(),
+					),
+				),
+			)
 			return nil
 		}
 
 		if err != nil {
-			log.WithError(err).Error("Failed to process request")
+			log.ErrorContext(ctx, "Failed to process request", "error", err)
 			return trace.Wrap(err)
 		}
 
 		return nil
 	case types.OpDelete:
-		ctx, log := logger.WithField(ctx, "request_op", "delete")
+		ctx, log := logger.With(ctx, "request_op", "delete")
 
 		if err := a.onDeletedRequest(ctx, reqID); err != nil {
-			log.WithError(err).Errorf("Failed to process deleted request")
+			log.ErrorContext(ctx, "Failed to process deleted request", "error", err)
 			return trace.Wrap(err)
 		}
 		return nil
@@ -311,38 +298,65 @@ func (a *App) onWatcherEvent(ctx context.Context, event types.Event) error {
 }
 
 // onJiraWebhook processes Jira webhook and updates the status of an issue
-func (a *App) onJiraWebhook(ctx context.Context, webhook Webhook) error {
+func (a *App) onJiraWebhook(_ context.Context, webhook Webhook) error {
+	ctx, cancel := context.WithTimeout(context.Background(), webhookIssueAPIRetryTimeout)
+	defer cancel()
+
 	webhookEvent := webhook.WebhookEvent
 	issueEventTypeName := webhook.IssueEventTypeName
 	if webhookEvent != "jira:issue_updated" || issueEventTypeName != "issue_generic" {
 		return nil
 	}
 
-	ctx, log := logger.WithFields(ctx, logger.Fields{
-		"jira_issue_id": webhook.Issue.ID,
-	})
-	log.Debugf("Processing incoming webhook event %q with type %q", webhookEvent, issueEventTypeName)
+	ctx, log := logger.With(ctx, "jira_issue_id", webhook.Issue.ID)
+	log.DebugContext(ctx, "Processing incoming webhook event",
+		"event", webhookEvent,
+		"event_type", issueEventTypeName,
+	)
 
 	if webhook.Issue == nil {
 		return trace.Errorf("got webhook without issue info")
 	}
 
-	issue, err := a.jira.GetIssue(ctx, webhook.Issue.ID)
+	retry, err := retryutils.NewLinear(a.retryConfig)
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	ctx, log = logger.WithFields(ctx, logger.Fields{
-		"jira_issue_id":  issue.ID,
-		"jira_issue_key": issue.Key,
-	})
 
-	statusName := strings.ToLower(issue.Fields.Status.Name)
+	var issue Issue
+	var statusName string
+	webHookStatusName := strings.ToLower(webhook.Issue.Fields.Status.Name)
+	// Retry until API syncs up with webhook payload.
+	err = retry.For(ctx, func() error {
+		issue, err = a.jira.GetIssue(ctx, webhook.Issue.ID)
+		if err != nil {
+			return trace.Wrap(err)
+		}
+		statusName = strings.ToLower(issue.Fields.Status.Name)
+		if webHookStatusName != statusName {
+			return trace.CompareFailed("mismatch of webhook payload and issue API response: %q and %q",
+				webHookStatusName, statusName)
+		}
+		return nil
+	})
+	if err != nil {
+		if statusName == "" {
+			return trace.Errorf("getting Jira issue status: %w", err)
+		}
+		log.WarnContext(ctx, "Using most recent successful getIssue response", "error", err)
+	}
+
+	ctx, log = logger.With(ctx,
+		"jira_issue_id", issue.ID,
+		"jira_issue_key", issue.Key,
+	)
+
 	switch {
 	case statusName == "pending":
-		log.Debug("Issue has pending status, ignoring it")
+		log.DebugContext(ctx, "Issue has pending status, ignoring it")
 		return nil
 	case statusName == "expired":
-		log.Debug("Issue has expired status, ignoring it")
+		log.DebugContext(ctx, "Issue has expired status, ignoring it")
 		return nil
 	case statusName != "approved" && statusName != "denied":
 		return trace.BadParameter("unknown Jira status %s", statusName)
@@ -353,11 +367,11 @@ func (a *App) onJiraWebhook(ctx context.Context, webhook Webhook) error {
 		return trace.Wrap(err)
 	}
 	if reqID == "" {
-		log.Debugf("Missing %q issue property", RequestIDPropertyKey)
+		log.DebugContext(ctx, "Missing teleportAccessRequestId issue property")
 		return nil
 	}
 
-	ctx, log = logger.WithField(ctx, "request_id", reqID)
+	ctx, log = logger.With(ctx, "request_id", reqID)
 
 	reqs, err := a.teleport.GetAccessRequests(ctx, types.AccessRequestFilter{ID: reqID})
 	if err != nil {
@@ -378,8 +392,9 @@ func (a *App) onJiraWebhook(ctx context.Context, webhook Webhook) error {
 		return trace.Errorf("plugin data is blank")
 	}
 	if pluginData.IssueID != issue.ID {
-		log.WithField("plugin_data_issue_id", pluginData.IssueID).
-			Debug("plugin_data.issue_id does not match issue.id")
+		log.DebugContext(ctx, "plugin_data.issue_id does not match issue.id",
+			"plugin_data_issue_id", pluginData.IssueID,
+		)
 		return trace.Errorf("issue_id from request's plugin_data does not match")
 	}
 
@@ -402,17 +417,17 @@ func (a *App) onJiraWebhook(ctx context.Context, webhook Webhook) error {
 
 		author, reason, err := a.loadResolutionInfo(ctx, issue, statusName)
 		if err != nil {
-			log.WithError(err).Error("Failed to load resolution info from the issue history")
+			log.ErrorContext(ctx, "Failed to load resolution info from the issue history", "error", err)
 		}
 		resolution.Reason = reason
 
-		ctx, _ = logger.WithFields(ctx, logger.Fields{
-			"jira_user_email": author.EmailAddress,
-			"jira_user_name":  author.DisplayName,
-			"request_user":    req.GetUser(),
-			"request_roles":   req.GetRoles(),
-			"reason":          reason,
-		})
+		ctx, _ = logger.With(ctx,
+			"jira_user_email", author.EmailAddress,
+			"jira_user_name", author.DisplayName,
+			"request_user", req.GetUser(),
+			"request_roles", req.GetRoles(),
+			"reason", reason,
+		)
 		if err := a.resolveRequest(ctx, reqID, author.EmailAddress, resolution); err != nil {
 			return trace.Wrap(err)
 		}
@@ -420,6 +435,8 @@ func (a *App) onJiraWebhook(ctx context.Context, webhook Webhook) error {
 		resolution.Tag = ResolvedApproved
 	case state.IsDenied():
 		resolution.Tag = ResolvedDenied
+	case state.IsPromoted():
+		resolution.Tag = ResolvedPromoted
 	default:
 		return trace.BadParameter("unknown request state %v (%s)", state, state)
 	}
@@ -474,6 +491,8 @@ func (a *App) onResolvedRequest(ctx context.Context, req types.AccessRequest) er
 		resolution.Tag = ResolvedApproved
 	case types.RequestState_DENIED:
 		resolution.Tag = ResolvedDenied
+	case types.RequestState_PROMOTED:
+		resolution.Tag = ResolvedPromoted
 	}
 	err := trace.Wrap(a.resolveIssue(ctx, req.GetName(), resolution))
 	return trace.NewAggregate(commentErr, err)
@@ -490,11 +509,11 @@ func (a *App) createIssue(ctx context.Context, reqID string, reqData RequestData
 		return trace.Wrap(err)
 	}
 
-	ctx, log := logger.WithFields(ctx, logger.Fields{
-		"jira_issue_id":  data.IssueID,
-		"jira_issue_key": data.IssueKey,
-	})
-	log.Info("Jira Issue created")
+	ctx, log := logger.With(ctx,
+		"jira_issue_id", data.IssueID,
+		"jira_issue_key", data.IssueKey,
+	)
+	log.InfoContext(ctx, "Jira Issue created")
 
 	// Save jira issue info in plugin data.
 	_, err = a.modifyPluginData(ctx, reqID, func(existing *PluginData) (PluginData, bool) {
@@ -543,11 +562,11 @@ func (a *App) addReviewComments(ctx context.Context, reqID string, reqReviews []
 	}
 	if !ok {
 		if issueID == "" {
-			logger.Get(ctx).Debug("Failed to add the comment: plugin data is blank")
+			logger.Get(ctx).DebugContext(ctx, "Failed to add the comment: plugin data is blank")
 		}
 		return nil
 	}
-	ctx, _ = logger.WithField(ctx, "jira_issue_id", issueID)
+	ctx, _ = logger.With(ctx, "jira_issue_id", issueID)
 
 	slice := reqReviews[oldCount:]
 	if len(slice) == 0 {
@@ -613,7 +632,7 @@ func (a *App) resolveRequest(ctx context.Context, reqID string, userEmail string
 		return trace.Wrap(err)
 	}
 
-	logger.Get(ctx).Infof("Jira user %s the request", resolution.Tag)
+	logger.Get(ctx).InfoContext(ctx, "Jira user processed the request", "resolution", resolution.Tag)
 	return nil
 }
 
@@ -650,18 +669,18 @@ func (a *App) resolveIssue(ctx context.Context, reqID string, resolution Resolut
 	}
 	if !ok {
 		if issueID == "" {
-			logger.Get(ctx).Debug("Failed to resolve the issue: plugin data is blank")
+			logger.Get(ctx).DebugContext(ctx, "Failed to resolve the issue: plugin data is blank")
 		}
 
 		// Either plugin data is missing or issue is already resolved by us, just quit.
 		return nil
 	}
 
-	ctx, log := logger.WithField(ctx, "jira_issue_id", issueID)
+	ctx, log := logger.With(ctx, "jira_issue_id", issueID)
 	if err := a.jira.ResolveIssue(ctx, issueID, resolution); err != nil {
 		return trace.Wrap(err)
 	}
-	log.Info("Successfully resolved the issue")
+	log.InfoContext(ctx, "Successfully resolved the issue")
 
 	return nil
 }

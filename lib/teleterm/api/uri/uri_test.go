@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package uri_test
 
@@ -41,6 +43,10 @@ func TestString(t *testing.T) {
 		{
 			uri.NewClusterURI("teleport.sh").AppendDB("dbhost1"),
 			"/clusters/teleport.sh/dbs/dbhost1",
+		},
+		{
+			uri.NewClusterURI("teleport.sh").AppendKube("kube-cluster-name").AppendKubeResourceNamespace("namespace-name"),
+			"/clusters/teleport.sh/kubes/kube-cluster-name/namespaces/namespace-name",
 		},
 	}
 
@@ -169,6 +175,52 @@ func TestGetKubeName(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			out := tt.in.GetKubeName()
+			require.Equal(t, tt.out, out)
+		})
+	}
+}
+
+func TestGetKubeResourceNamespace(t *testing.T) {
+	tests := []struct {
+		name string
+		in   uri.ResourceURI
+		out  string
+	}{
+		{
+			name: "returns root cluster namespace name",
+			in:   uri.NewClusterURI("foo").AppendKube("k8s").AppendKubeResourceNamespace("default"),
+			out:  "default",
+		},
+		{
+			name: "returns leaf cluster namespace name",
+			in:   uri.NewClusterURI("foo").AppendLeafCluster("bar").AppendKube("k8s").AppendKubeResourceNamespace("default"),
+			out:  "default",
+		},
+		{
+			name: "returns empty string when given root cluster URI",
+			in:   uri.NewClusterURI("foo"),
+			out:  "",
+		},
+		{
+			name: "returns empty string when given leaf cluster URI",
+			in:   uri.NewClusterURI("foo").AppendLeafCluster("bar"),
+			out:  "",
+		},
+		{
+			name: "returns empty string when given root cluster non-kube resource namespace URI",
+			in:   uri.NewClusterURI("foo").AppendDB("postgres"),
+			out:  "",
+		},
+		{
+			name: "returns empty string when given leaf cluster non-kube resource namespace URI",
+			in:   uri.NewClusterURI("foo").AppendLeafCluster("bar").AppendDB("postgres"),
+			out:  "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out := tt.in.GetKubeResourceNamespace()
 			require.Equal(t, tt.out, out)
 		})
 	}
@@ -401,6 +453,32 @@ func TestIsLeaf(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tt.expect(t, tt.in.IsLeaf())
+		})
+	}
+}
+
+func TestAppendLeafCluster(t *testing.T) {
+	tests := []struct {
+		profileName string
+		leafName    string
+		out         string
+	}{
+		{
+			profileName: "foo",
+			leafName:    "bar",
+			out:         "/clusters/foo/leaves/bar",
+		},
+		{
+			profileName: "foo",
+			leafName:    "",
+			out:         "/clusters/foo",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.out, func(t *testing.T) {
+			actualOut := uri.NewClusterURI(tt.profileName).AppendLeafCluster(tt.leafName).String()
+			require.Equal(t, tt.out, actualOut)
 		})
 	}
 }

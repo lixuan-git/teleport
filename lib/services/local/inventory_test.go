@@ -1,24 +1,27 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package local
 
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jonboulle/clockwork"
@@ -29,6 +32,74 @@ import (
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/backend/memory"
 )
+
+// TestInstanceEvents verifies that instance creation/deletion events are produced as expected.
+func TestInstanceEvents(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	backend, err := memory.New(memory.Config{
+		Context: ctx,
+	})
+	require.NoError(t, err)
+
+	defer backend.Close()
+
+	presence := NewPresenceService(backend)
+
+	events := NewEventsService(backend)
+
+	watcher, err := events.NewWatcher(ctx, types.Watch{
+		Kinds: []types.WatchKind{{
+			Kind: types.KindInstance,
+		}},
+	})
+	require.NoError(t, err)
+
+	names := []string{
+		"server1",
+		"server2",
+		"server3",
+		"server4",
+	}
+
+	for _, name := range names {
+		instance, err := types.NewInstance(uuid.NewString(), types.InstanceSpecV1{
+			Hostname: name,
+		})
+		require.NoError(t, err)
+
+		err = presence.UpsertInstance(ctx, instance)
+		require.NoError(t, err)
+	}
+
+	timeout := time.After(time.Second * 30)
+
+	select {
+	case event := <-watcher.Events():
+		require.Equal(t, types.OpInit, event.Type)
+	case <-watcher.Done():
+		t.Fatalf("watcher closed unexpectedly")
+	case <-timeout:
+		t.Fatalf("timeout waiting for init event")
+	}
+
+	for _, name := range names {
+		select {
+		case event := <-watcher.Events():
+			require.Equal(t, types.OpPut, event.Type)
+			instance, ok := event.Resource.(*types.InstanceV1)
+			require.True(t, ok, "unexpected resource type: %T", event.Resource)
+			require.Equal(t, name, instance.GetHostname())
+		case <-watcher.Done():
+			t.Fatalf("watcher closed unexpectedly")
+		case <-timeout:
+			t.Fatalf("timeout waiting for instance %q creation event", name)
+		}
+	}
+}
 
 // TestInstanceUpsert verifies basic expected behavior of instance creation/update.
 func TestInstanceUpsert(t *testing.T) {

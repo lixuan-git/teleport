@@ -1,58 +1,60 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React from 'react';
+import { JSX } from 'react';
 import styled from 'styled-components';
-import { Box, Flex, Text, Label } from 'design';
 
-import { KeyboardArrowsNavigation } from 'teleterm/ui/components/KeyboardArrowsNavigation';
+import { Box, Flex, Label, P3, Text } from 'design';
+import { ShieldCheck, ShieldWarning } from 'design/Icon';
+import Link from 'design/Link';
+
 import { LoggedInUser } from 'teleterm/services/tshd/types';
+import { KeyboardArrowsNavigation } from 'teleterm/ui/components/KeyboardArrowsNavigation';
+import { DeviceTrustStatus } from 'teleterm/ui/TopBar/Identity/Identity';
 
 import { IdentityRootCluster } from '../useIdentity';
-
-import { IdentityListItem } from './IdentityListItem';
 import { AddNewClusterItem } from './AddNewClusterItem';
+import { IdentityListItem } from './IdentityListItem';
 
-interface IdentityListProps {
+export function IdentityList(props: {
   loggedInUser: LoggedInUser;
   clusters: IdentityRootCluster[];
-
   onSelectCluster(clusterUri: string): void;
-
   onAddCluster(): void;
-
   onLogout(clusterUri: string): void;
-}
-
-export function IdentityList(props: IdentityListProps) {
+  deviceTrustStatus: DeviceTrustStatus;
+}) {
   return (
     <Box minWidth="200px">
       {props.loggedInUser && (
         <>
           <Flex px={3} pt={2} pb={2} justifyContent="space-between">
-            <Box>
+            <Flex flexDirection="column" gap={2}>
               <Text bold>{props.loggedInUser.name}</Text>
               <Flex flexWrap="wrap" gap={1}>
-                {props.loggedInUser.rolesList.map(role => (
+                {props.loggedInUser.roles.map(role => (
                   <Label key={role} kind="secondary">
                     {role}
                   </Label>
                 ))}
               </Flex>
-            </Box>
+              <DeviceTrustMessage status={props.deviceTrustStatus} />
+            </Flex>
           </Flex>
           <Separator />
         </>
@@ -60,15 +62,13 @@ export function IdentityList(props: IdentityListProps) {
       <KeyboardArrowsNavigation>
         {focusGrabber}
         <Box>
-          {props.clusters.map((i, index) => (
+          {props.clusters.map((cluster, index) => (
             <IdentityListItem
-              key={i.uri}
+              key={cluster.uri}
               index={index}
-              isSelected={i.active}
-              userName={i.userName}
-              clusterName={i.clusterName}
-              onSelect={() => props.onSelectCluster(i.uri)}
-              onLogout={() => props.onLogout(i.uri)}
+              cluster={cluster}
+              onSelect={() => props.onSelectCluster(cluster.uri)}
+              onLogout={() => props.onLogout(cluster.uri)}
             />
           ))}
         </Box>
@@ -82,6 +82,48 @@ export function IdentityList(props: IdentityListProps) {
       </KeyboardArrowsNavigation>
     </Box>
   );
+}
+
+function DeviceTrustMessage(props: { status: DeviceTrustStatus }) {
+  let message: JSX.Element | undefined;
+  switch (props.status) {
+    case 'enrolled':
+      message = (
+        <>
+          <ShieldCheck color="success.main" size="small" mb="2px" />
+          <P3>Access secured with device trust.</P3>
+        </>
+      );
+      break;
+    case 'requires-enrollment':
+      message = (
+        <>
+          <ShieldWarning color="warning.main" size="small" mb="2px" />
+          <P3>
+            Full access requires a trusted device.{' '}
+            <Link
+              href="https://goteleport.com/docs/admin-guides/access-controls/device-trust/guide/#step-22-enroll-device"
+              target="_blank"
+            >
+              Learn how to enroll your device.
+            </Link>
+          </P3>
+        </>
+      );
+      break;
+    case 'none':
+      break;
+    default:
+      props.status satisfies never;
+  }
+
+  if (message) {
+    return (
+      <Flex gap={1} color="text.slightlyMuted">
+        {message}
+      </Flex>
+    );
+  }
 }
 
 // Hack - for some reason xterm.js doesn't allow moving a focus to the Identity popover

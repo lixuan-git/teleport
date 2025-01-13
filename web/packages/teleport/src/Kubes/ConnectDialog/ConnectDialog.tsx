@@ -1,31 +1,33 @@
-/*
-Copyright 2021 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React from 'react';
+import { Box, ButtonPrimary, ButtonSecondary, Flex, H3, Text } from 'design';
 import Dialog, {
+  DialogContent,
   DialogFooter,
   DialogHeader,
   DialogTitle,
-  DialogContent,
 } from 'design/Dialog';
-import { Text, Box, ButtonSecondary } from 'design';
 
 import TextSelectCopy from 'teleport/components/TextSelectCopy';
+import cfg from 'teleport/config';
+import { generateTshLoginCommand, openNewTab } from 'teleport/lib/util';
 import { AuthType } from 'teleport/services/user';
-import { generateTshLoginCommand } from 'teleport/lib/util';
 
 function ConnectDialog(props: Props) {
   const {
@@ -37,6 +39,15 @@ function ConnectDialog(props: Props) {
     accessRequestId,
   } = props;
 
+  const startKubeExecSession = () => {
+    const url = cfg.getKubeExecConnectRoute({
+      clusterId,
+      kubeId: kubeConnectName,
+    });
+
+    openNewTab(url);
+  };
+
   return (
     <Dialog
       dialogCss={dialogCss}
@@ -45,10 +56,13 @@ function ConnectDialog(props: Props) {
       open={true}
     >
       <DialogHeader>
-        <DialogTitle>connect to kubernetes cluster</DialogTitle>
+        <DialogTitle>Connect to Kubernetes Cluster</DialogTitle>
       </DialogHeader>
       <DialogContent>
         <Box mb={4}>
+          <H3 mt={1} mb={2}>
+            Connect in the CLI using tsh and kubectl
+          </H3>
           <Text bold as="span">
             Step 1
           </Text>
@@ -97,6 +111,14 @@ function ConnectDialog(props: Props) {
             <TextSelectCopy mt="2" text={`tsh request drop`} />
           </Box>
         )}
+        <Box borderTop={1} mb={4} mt={4}>
+          <Flex mt={4} flex-direction="row" justifyContent="space-between">
+            <Text mt={1} bold>
+              Or exec into a pod on this Kubernetes cluster in Web UI
+            </Text>
+            <ButtonPrimary onClick={startKubeExecSession}>Exec</ButtonPrimary>
+          </Flex>
+        </Box>
       </DialogContent>
       <DialogFooter>
         <ButtonSecondary onClick={onClose}>Close</ButtonSecondary>

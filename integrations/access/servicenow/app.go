@@ -1,45 +1,48 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package servicenow
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	"golang.org/x/exp/slices"
-	"google.golang.org/grpc"
-	grpcbackoff "google.golang.org/grpc/backoff"
 
 	tp "github.com/gravitational/teleport"
-	"github.com/gravitational/teleport/api/client"
+	"github.com/gravitational/teleport/api/accessrequest"
 	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/integrations/access/accessmonitoring"
+	"github.com/gravitational/teleport/integrations/access/common"
 	"github.com/gravitational/teleport/integrations/access/common/teleport"
 	"github.com/gravitational/teleport/integrations/lib"
 	"github.com/gravitational/teleport/integrations/lib/backoff"
-	"github.com/gravitational/teleport/integrations/lib/credentials"
 	"github.com/gravitational/teleport/integrations/lib/logger"
 	"github.com/gravitational/teleport/integrations/lib/watcherjob"
+	"github.com/gravitational/teleport/lib/utils"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
 const (
@@ -47,43 +50,49 @@ const (
 	pluginName = "servicenow"
 	// minServerVersion is the minimal teleport version the plugin supports.
 	minServerVersion = "13.0.0"
-	// grpcBackoffMaxDelay is a maximum time GRPC client waits before reconnection attempt.
-	grpcBackoffMaxDelay = time.Second * 2
 	// initTimeout is used to bound execution time of health check and teleport version check.
 	initTimeout = time.Second * 10
-	// handlerTimeout is used to bound the execution time of watcher event handler.
-	handlerTimeout = time.Second * 5
 	// modifyPluginDataBackoffBase is an initial (minimum) backoff value.
 	modifyPluginDataBackoffBase = time.Millisecond
 	// modifyPluginDataBackoffMax is a backoff threshold
 	modifyPluginDataBackoffMax = time.Second
 )
 
-// errMissingAnnotation is used for cases where request annotations are not set
-var errMissingAnnotation = errors.New("access request is missing annotations")
-
 // App is a wrapper around the base app to allow for extra functionality.
 type App struct {
 	*lib.Process
+	common.BaseApp
 
-	PluginName string
-	teleport   teleport.Client
-	serviceNow *Client
-	mainJob    lib.ServiceJob
-	conf       Config
+	PluginName            string
+	teleport              teleport.Client
+	serviceNow            ServiceNowClient
+	mainJob               lib.ServiceJob
+	conf                  Config
+	accessMonitoringRules *accessmonitoring.RuleHandler
 }
 
 // NewServicenowApp initializes a new teleport-servicenow app and returns it.
 func NewServiceNowApp(ctx context.Context, conf *Config) (*App, error) {
-	teleportClient, err := conf.GetTeleportClient(ctx)
+	serviceNowApp := &App{
+		PluginName: pluginName,
+		conf:       *conf,
+	}
+	teleClient, err := conf.GetTeleportClient(ctx)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	serviceNowApp := &App{
+	serviceNowApp.accessMonitoringRules = accessmonitoring.NewRuleHandler(accessmonitoring.RuleHandlerConfig{
+		Client:     teleClient,
+		PluginType: string(conf.PluginType),
 		PluginName: pluginName,
-		teleport:   teleportClient,
-		conf:       *conf,
-	}
+		FetchRecipientCallback: func(_ context.Context, name string) (*common.Recipient, error) {
+			return &common.Recipient{
+				Name: name,
+				ID:   name,
+				Kind: common.RecipientKindSchedule,
+			}, nil
+		},
+	})
 	serviceNowApp.mainJob = lib.NewServiceJob(serviceNowApp.run)
 	return serviceNowApp, nil
 }
@@ -109,34 +118,46 @@ func (a *App) WaitReady(ctx context.Context) (bool, error) {
 
 func (a *App) run(ctx context.Context) error {
 	log := logger.Get(ctx)
-	log.Infof("Starting Teleport Access Servicenow Plugin")
+	log.InfoContext(ctx, "Starting Teleport Access Servicenow Plugin")
 
 	if err := a.init(ctx); err != nil {
 		return trace.Wrap(err)
 	}
+	watchKinds := []types.WatchKind{
+		{Kind: types.KindAccessRequest},
+		{Kind: types.KindAccessMonitoringRule},
+	}
 
-	watcherJob, err := watcherjob.NewJob(
+	acceptedWatchKinds := make([]string, 0, len(watchKinds))
+	watcherJob, err := watcherjob.NewJobWithConfirmedWatchKinds(
 		a.teleport,
 		watcherjob.Config{
-			Watch:            types.Watch{Kinds: []types.WatchKind{{Kind: types.KindAccessRequest}}},
-			EventFuncTimeout: handlerTimeout,
+			Watch: types.Watch{Kinds: watchKinds, AllowPartialSuccess: true},
 		},
 		a.onWatcherEvent,
+		func(ws types.WatchStatus) {
+			for _, watchKind := range ws.GetKinds() {
+				acceptedWatchKinds = append(acceptedWatchKinds, watchKind.Kind)
+			}
+		},
 	)
 	if err != nil {
 		return trace.Wrap(err)
 	}
+
 	a.SpawnCriticalJob(watcherJob)
 	ok, err := watcherJob.WaitReady(ctx)
 	if err != nil {
 		return trace.Wrap(err)
 	}
-
+	if err := a.accessMonitoringRules.InitAccessMonitoringRulesCache(ctx); err != nil {
+		return trace.Wrap(err)
+	}
 	a.mainJob.SetReady(ok)
 	if ok {
-		log.Info("ServiceNow plugin is ready")
+		log.InfoContext(ctx, "ServiceNow plugin is ready")
 	} else {
-		log.Error("ServiceNow plugin is not ready")
+		log.ErrorContext(ctx, "ServiceNow plugin is not ready")
 	}
 
 	<-watcherJob.Done()
@@ -149,31 +170,10 @@ func (a *App) init(ctx context.Context) error {
 	defer cancel()
 	log := logger.Get(ctx)
 
-	if validCred, err := credentials.CheckIfExpired(a.conf.Teleport.Credentials()); err != nil {
-		log.Warnf("Invalid Teleport credentials: %v", err)
-		if !validCred {
-			return trace.BadParameter(
-				"No valid credentials found, this likely means credentials are expired. In this case, please sign new credentials and increase their TTL if needed.",
-			)
-		}
-		log.Info("At least one non-expired credential has been found, continuing startup")
-	}
-
 	var err error
-
-	if a.teleport == nil {
-		bk := grpcbackoff.DefaultConfig
-		bk.MaxDelay = grpcBackoffMaxDelay
-		if a.teleport, err = client.New(ctx, client.Config{
-			Addrs:       a.conf.Teleport.GetAddrs(),
-			Credentials: a.conf.Teleport.Credentials(),
-			DialOpts: []grpc.DialOption{
-				grpc.WithConnectParams(grpc.ConnectParams{Backoff: bk, MinConnectTimeout: initTimeout}),
-				grpc.WithReturnConnectionError(),
-			},
-		}); err != nil {
-			return trace.Wrap(err)
-		}
+	a.teleport, err = a.conf.GetTeleportClient(ctx)
+	if err != nil {
+		return trace.Wrap(err, "getting teleport client")
 	}
 
 	pong, err := a.checkTeleportVersion(ctx)
@@ -191,41 +191,60 @@ func (a *App) init(ctx context.Context) error {
 	if err != nil {
 		return trace.Wrap(err)
 	}
+
+	log.DebugContext(ctx, "Starting API health check")
+	if err = a.serviceNow.CheckHealth(ctx); err != nil {
+		return trace.Wrap(err, "API health check failed")
+	}
+	log.DebugContext(ctx, "API health check finished ok")
+
 	return nil
 }
 
 func (a *App) checkTeleportVersion(ctx context.Context) (proto.PingResponse, error) {
 	log := logger.Get(ctx)
-	log.Debug("Checking Teleport server version")
+	log.DebugContext(ctx, "Checking Teleport server version")
 
 	pong, err := a.teleport.Ping(ctx)
 	if err != nil {
 		if trace.IsNotImplemented(err) {
 			return pong, trace.Wrap(err, "server version must be at least %s", minServerVersion)
 		}
-		log.Error("Unable to get Teleport server version")
+		log.ErrorContext(ctx, "Unable to get Teleport server version")
 		return pong, trace.Wrap(err)
 	}
-	err = lib.AssertServerVersion(pong, minServerVersion)
+	err = utils.CheckMinVersion(pong.ServerVersion, minServerVersion)
 	return pong, trace.Wrap(err)
 }
 
+// onWatcherEvent is called for every cluster Event. It will filter out non-access-request events and
+// call onPendingRequest, onResolvedRequest and on DeletedRequest depending on the event.
 func (a *App) onWatcherEvent(ctx context.Context, event types.Event) error {
+	switch event.Resource.GetKind() {
+	case types.KindAccessMonitoringRule:
+		return trace.Wrap(a.accessMonitoringRules.HandleAccessMonitoringRule(ctx, event))
+	case types.KindAccessRequest:
+		return trace.Wrap(a.handleAccessRequest(ctx, event))
+	}
+	return trace.BadParameter("unexpected kind %s", event.Resource.GetKind())
+}
+
+func (a *App) handleAccessRequest(ctx context.Context, event types.Event) error {
 	if kind := event.Resource.GetKind(); kind != types.KindAccessRequest {
 		return trace.Errorf("unexpected kind %s", kind)
 	}
 	op := event.Type
 	reqID := event.Resource.GetName()
-	ctx, _ = logger.WithField(ctx, "request_id", reqID)
+	ctx, _ = logger.With(ctx, "request_id", reqID)
 
 	switch op {
 	case types.OpPut:
-		ctx, _ = logger.WithField(ctx, "request_op", "put")
+		ctx, _ = logger.With(ctx, "request_op", "put")
 		req, ok := event.Resource.(types.AccessRequest)
 		if !ok {
 			return trace.Errorf("unexpected resource type %T", event.Resource)
 		}
-		ctx, log := logger.WithField(ctx, "request_state", req.GetState().String())
+		ctx, log := logger.With(ctx, "request_state", req.GetState().String())
 
 		var err error
 		switch {
@@ -234,21 +253,29 @@ func (a *App) onWatcherEvent(ctx context.Context, event types.Event) error {
 		case req.GetState().IsResolved():
 			err = a.onResolvedRequest(ctx, req)
 		default:
-			log.WithField("event", event).Warnf("Unknown request state: %q", req.GetState())
+			log.WarnContext(ctx, "Unknown request state",
+				slog.Group("event",
+					slog.Any("type", logutils.StringerAttr(event.Type)),
+					slog.Group("resource",
+						"kind", event.Resource.GetKind(),
+						"name", event.Resource.GetName(),
+					),
+				),
+			)
 			return nil
 		}
 
 		if err != nil {
-			log.WithError(err).Error("Failed to process request")
+			log.ErrorContext(ctx, "Failed to process request", "error", err)
 			return trace.Wrap(err)
 		}
 
 		return nil
 	case types.OpDelete:
-		ctx, log := logger.WithField(ctx, "request_op", "delete")
+		ctx, log := logger.With(ctx, "request_op", "delete")
 
 		if err := a.onDeletedRequest(ctx, reqID); err != nil {
-			log.WithError(err).Error("Failed to process deleted request")
+			log.ErrorContext(ctx, "Failed to process deleted request", "error", err)
 			return trace.Wrap(err)
 		}
 		return nil
@@ -258,27 +285,65 @@ func (a *App) onWatcherEvent(ctx context.Context, event types.Event) error {
 }
 
 func (a *App) onPendingRequest(ctx context.Context, req types.AccessRequest) error {
-	if len(req.GetSystemAnnotations()) == 0 {
-		logger.Get(ctx).Debug("Cannot proceed further. Request is missing any annotations")
-		return nil
+	reqID := req.GetName()
+	log := logger.Get(ctx).With("req_id", reqID)
+
+	resourceNames, err := a.getResourceNames(ctx, req)
+	if err != nil {
+		return trace.Wrap(err)
 	}
 
-	// First, try to create a notification incident.
-	isNew, notifyErr := a.tryNotifyService(ctx, req)
+	reqData := RequestData{
+		User:              req.GetUser(),
+		Roles:             req.GetRoles(),
+		RequestReason:     req.GetRequestReason(),
+		SystemAnnotations: req.GetSystemAnnotations(),
+		Resources:         resourceNames,
+	}
 
+	// Create plugin data if it didn't exist before.
+	isNew, err := a.modifyPluginData(ctx, reqID, func(existing *PluginData) (PluginData, bool) {
+		if existing != nil {
+			return PluginData{}, false
+		}
+		return PluginData{RequestData: reqData}, true
+	})
+	if err != nil {
+		return trace.Wrap(err, "updating plugin data")
+	}
+
+	if isNew {
+		log.InfoContext(ctx, "Creating servicenow incident")
+		recipientAssignee := a.accessMonitoringRules.RecipientsFromAccessMonitoringRules(ctx, req)
+		assignees := []string{}
+		recipientAssignee.ForEach(func(r common.Recipient) {
+			assignees = append(assignees, r.Name)
+		})
+		if len(assignees) > 0 {
+			reqData.SuggestedReviewers = assignees
+		}
+		if err = a.createIncident(ctx, reqID, reqData); err != nil {
+			// Even if we failed to create the incident we try to auto-approve
+			return trace.NewAggregate(
+				trace.WrapWithMessage(err, "creating ServiceNow incident"),
+				trace.Wrap(a.tryApproveRequest(ctx, req)),
+			)
+		}
+	}
+	if reqReviews := req.GetReviews(); len(reqReviews) > 0 {
+		if err = a.postReviewNotes(ctx, reqID, reqReviews); err != nil {
+			return trace.NewAggregate(
+				trace.WrapWithMessage(err, "posting review notes"),
+				trace.Wrap(a.tryApproveRequest(ctx, req)),
+			)
+		}
+	}
 	// To minimize the count of auto-approval tries, let's only attempt it only when we have just created an incident.
-	// But if there's an error, we can't really know if the incident is new or not so lets just try.
-	if !isNew && notifyErr == nil {
+	if !isNew {
 		return nil
 	}
-	// Don't show the error if the annotation is just missing.
-	if errors.Is(notifyErr, errMissingAnnotation) {
-		notifyErr = nil
-	}
-
-	// Then, try to approve the request if user is currently on-call.
-	approveErr := trace.Wrap(a.tryApproveRequest(ctx, req))
-	return trace.NewAggregate(notifyErr, approveErr)
+	// Try to approve the request if user is currently on-call.
+	return trace.Wrap(a.tryApproveRequest(ctx, req))
 }
 
 func (a *App) onResolvedRequest(ctx context.Context, req types.AccessRequest) error {
@@ -309,76 +374,19 @@ func (a *App) onDeletedRequest(ctx context.Context, reqID string) error {
 	return a.resolveIncident(ctx, reqID, Resolution{State: ResolutionStateResolved})
 }
 
-func (a *App) getNotifyServiceNames(req types.AccessRequest) ([]string, error) {
-	services, ok := req.GetSystemAnnotations()[types.TeleportNamespace+types.ReqAnnotationNotifyServicesLabel]
-	if !ok {
-		return nil, trace.NotFound("notify services not specified")
-	}
-	return services, nil
-}
-
 func (a *App) getOnCallServiceNames(req types.AccessRequest) ([]string, error) {
-	services, ok := req.GetSystemAnnotations()[types.TeleportNamespace+types.ReqAnnotationSchedulesLabel]
-	if !ok {
-		return nil, trace.NotFound("on-call schedules not specified")
-	}
-	return services, nil
-}
-
-func (a *App) tryNotifyService(ctx context.Context, req types.AccessRequest) (bool, error) {
-	log := logger.Get(ctx)
-
-	serviceNames, err := a.getNotifyServiceNames(req)
-	if err != nil {
-		log.Debugf("Skipping the notification: %s", err)
-		return false, trace.Wrap(errMissingAnnotation)
-	}
-
-	reqID := req.GetName()
-	reqData := RequestData{
-		User:          req.GetUser(),
-		Roles:         req.GetRoles(),
-		Created:       req.GetCreationTime(),
-		RequestReason: req.GetRequestReason(),
-	}
-
-	// Create plugin data if it didn't exist before.
-	isNew, err := a.modifyPluginData(ctx, reqID, func(existing *PluginData) (PluginData, bool) {
-		if existing != nil {
-			return PluginData{}, false
-		}
-		return PluginData{RequestData: reqData}, true
-	})
-	if err != nil {
-		return isNew, trace.Wrap(err, "updating plugin data")
-	}
-
-	if isNew {
-		for _, serviceName := range serviceNames {
-			incidentCtx, _ := logger.WithField(ctx, "servicenow_service_name", serviceName)
-
-			if err = a.createIncident(incidentCtx, serviceName, reqID, reqData); err != nil {
-				return isNew, trace.Wrap(err, "creating ServiceNow incident")
-			}
-		}
-
-		if reqReviews := req.GetReviews(); len(reqReviews) > 0 {
-			if err = a.postReviewNotes(ctx, reqID, reqReviews); err != nil {
-				return isNew, trace.Wrap(err)
-			}
-		}
-	}
-	return isNew, nil
+	annotationKey := types.TeleportNamespace + types.ReqAnnotationApproveSchedulesLabel
+	return common.GetNamesFromAnnotations(req, annotationKey)
 }
 
 // createIncident posts an incident with request information.
-func (a *App) createIncident(ctx context.Context, serviceID, reqID string, reqData RequestData) error {
+func (a *App) createIncident(ctx context.Context, reqID string, reqData RequestData) error {
 	data, err := a.serviceNow.CreateIncident(ctx, reqID, reqData)
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	ctx, log := logger.WithField(ctx, "servicenow_incident_id", data.IncidentID)
-	log.Info("Successfully created Servicenow incident")
+	ctx, log := logger.With(ctx, "servicenow_incident_id", data.IncidentID)
+	log.InfoContext(ctx, "Successfully created Servicenow incident")
 
 	// Save servicenow incident info in plugin data.
 	_, err = a.modifyPluginData(ctx, reqID, func(existing *PluginData) (PluginData, bool) {
@@ -422,10 +430,10 @@ func (a *App) postReviewNotes(ctx context.Context, reqID string, reqReviews []ty
 		return trace.Wrap(err)
 	}
 	if !ok {
-		logger.Get(ctx).Debug("Failed to post the note: plugin data is missing")
+		logger.Get(ctx).DebugContext(ctx, "Failed to post the note: plugin data is missing")
 		return nil
 	}
-	ctx, _ = logger.WithField(ctx, "servicenow_incident_id", data.IncidentID)
+	ctx, _ = logger.With(ctx, "servicenow_incident_id", data.IncidentID)
 
 	slice := reqReviews[oldCount:]
 	if len(slice) == 0 {
@@ -447,22 +455,32 @@ func (a *App) tryApproveRequest(ctx context.Context, req types.AccessRequest) er
 
 	serviceNames, err := a.getOnCallServiceNames(req)
 	if err != nil {
-		logger.Get(ctx).Debugf("Skipping the approval: %s", err)
+		logger.Get(ctx).DebugContext(ctx, "Skipping the approval", "error", err)
 		return nil
 	}
+	log.DebugContext(ctx, "Checking the shifts to see if the requester is on-call", "shifts", serviceNames)
 
 	onCallUsers, err := a.getOnCallUsers(ctx, serviceNames)
 	if err != nil {
 		return trace.Wrap(err)
 	}
+	log.DebugContext(ctx, "Users on-call are", "on_call_users", onCallUsers)
 
 	if userIsOnCall := slices.Contains(onCallUsers, req.GetUser()); !userIsOnCall {
+		log.DebugContext(ctx, "User is not on-call, not approving the request",
+			"user", req.GetUser(),
+			"request", req.GetName(),
+		)
 		return nil
 	}
+	log.DebugContext(ctx, "User is on-call, auto-approving the request",
+		"user", req.GetUser(),
+		"request", req.GetName(),
+	)
 	if _, err := a.teleport.SubmitAccessReview(ctx, types.AccessReviewSubmission{
 		RequestID: req.GetName(),
 		Review: types.AccessReview{
-			Author:        tp.SystemAccessApproverUserName,
+			Author:        a.conf.TeleportUser,
 			ProposedState: types.RequestState_APPROVED,
 			Reason: fmt.Sprintf("Access requested by user %s who is on call on service(s) %s",
 				tp.SystemAccessApproverUserName,
@@ -472,20 +490,25 @@ func (a *App) tryApproveRequest(ctx context.Context, req types.AccessRequest) er
 		},
 	}); err != nil {
 		if strings.HasSuffix(err.Error(), "has already reviewed this request") {
-			log.Debug("Already reviewed the request")
+			log.DebugContext(ctx, "Already reviewed the request")
 			return nil
 		}
 		return trace.Wrap(err, "submitting access request")
 	}
-	log.Info("Successfully submitted a request approval")
+	log.InfoContext(ctx, "Successfully submitted a request approval")
 	return nil
 }
 
 func (a *App) getOnCallUsers(ctx context.Context, serviceNames []string) ([]string, error) {
+	log := logger.Get(ctx)
 	onCallUsers := []string{}
 	for _, scheduleName := range serviceNames {
 		respondersResult, err := a.serviceNow.GetOnCall(ctx, scheduleName)
 		if err != nil {
+			if trace.IsNotFound(err) {
+				log.ErrorContext(ctx, "Failed to retrieve responder from schedule", "error", err)
+				continue
+			}
 			return nil, trace.Wrap(err)
 		}
 		onCallUsers = append(onCallUsers, respondersResult...)
@@ -521,15 +544,15 @@ func (a *App) resolveIncident(ctx context.Context, reqID string, resolution Reso
 		return trace.Wrap(err)
 	}
 	if !ok {
-		logger.Get(ctx).Debug("Failed to resolve the incident: plugin data is missing")
+		logger.Get(ctx).DebugContext(ctx, "Failed to resolve the incident: plugin data is missing")
 		return nil
 	}
 
-	ctx, log := logger.WithField(ctx, "servicenow_incident_id", incidentID)
+	ctx, log := logger.With(ctx, "servicenow_incident_id", incidentID)
 	if err := a.serviceNow.ResolveIncident(ctx, incidentID, resolution); err != nil {
 		return trace.Wrap(err)
 	}
-	log.Info("Successfully resolved the incident")
+	log.InfoContext(ctx, "Successfully resolved the incident")
 
 	return nil
 }
@@ -604,4 +627,26 @@ func (a *App) updatePluginData(ctx context.Context, reqID string, data PluginDat
 		Set:      EncodePluginData(data),
 		Expect:   EncodePluginData(expectData),
 	})
+}
+
+// getResourceNames returns the names of the requested resources.
+func (a *App) getResourceNames(ctx context.Context, req types.AccessRequest) ([]string, error) {
+	resourceNames := make([]string, 0, len(req.GetRequestedResourceIDs()))
+	resourcesByCluster := accessrequest.GetResourceIDsByCluster(req)
+
+	for cluster, resources := range resourcesByCluster {
+		resourceDetails, err := accessrequest.GetResourceDetails(ctx, cluster, a.teleport, resources)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+
+		for _, resource := range resources {
+			resourceName := types.ResourceIDToString(resource)
+			if details, ok := resourceDetails[resourceName]; ok && details.FriendlyName != "" {
+				resourceName = fmt.Sprintf("%s/%s", resource.Kind, details.FriendlyName)
+			}
+			resourceNames = append(resourceNames, resourceName)
+		}
+	}
+	return resourceNames, nil
 }

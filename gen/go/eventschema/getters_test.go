@@ -1,20 +1,26 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package eventschema
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -30,16 +36,9 @@ func TestQueryableEventList(t *testing.T) {
 // Large smoke test that checks if there are no errors when dumping schemas for
 // all events.
 func TestAllAthenaSchemas(t *testing.T) {
-	for _, eventType := range eventTypes {
-		schema, err := GetEventSchemaFromType(eventType)
-		require.NoError(t, err)
-		viewSchema, err := schema.ViewSchema()
-		require.NoError(t, err)
-		require.NotEmpty(t, viewSchema)
-		tableSchema, err := schema.TableSchema()
-		require.NoError(t, err)
-		require.NotEmpty(t, tableSchema)
-	}
+	details, err := GetViewsDetails()
+	require.NoError(t, err)
+	require.Len(t, details, len(eventTypes))
 }
 
 // Checks that different kinds of event fields are rendered properly.
@@ -168,15 +167,59 @@ func TestEventField_Schemas(t *testing.T) {
 			expectedViewSchema:  "  , CAST(json_extract(event_data, '$[\"foo\"]') AS array(row(bar varchar))) as foo\n",
 			expectedTableSchema: "foo, array(row(bar varchar)), description\n",
 		},
+		{
+			name: "2-level object 2-elements",
+			field: EventField{
+				Type:        "object",
+				Description: testDescription,
+				Fields: []*EventField{
+					{
+						Name:        "bar",
+						Type:        "object",
+						Description: testDescription,
+						Fields: []*EventField{
+							{
+								Name:        "baz",
+								Type:        "string",
+								Description: testDescription,
+							},
+							{
+								Name:        "bar",
+								Type:        "string",
+								Description: testDescription,
+							},
+						},
+					},
+				},
+			},
+			fieldName: "foo",
+			expectedViewSchema: strings.Join([]string{
+				"  , CAST(json_extract(event_data, '$[\"foo\"][\"bar\"][\"baz\"]') AS varchar) as foo_bar_baz\n",
+				"  , CAST(json_extract(event_data, '$[\"foo\"][\"bar\"][\"bar\"]') AS varchar) as foo_bar_bar\n",
+			}, ""),
+			expectedTableSchema: strings.Join([]string{
+				"foo_bar_baz, varchar, description\n",
+				"foo_bar_bar, varchar, description\n",
+			}, ""),
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			path := []string{tt.fieldName}
-			viewSchema, err := tt.field.ViewSchema(path)
+			fields, err := tt.field.TableSchemaDetails(path)
+			var sb strings.Builder
+			for _, v := range fields {
+				sb.WriteString(v.viewSchema())
+			}
+
 			require.NoError(t, err)
-			require.Equal(t, tt.expectedViewSchema, viewSchema)
-			tableSchema, err := tt.field.TableSchema(path)
-			require.Equal(t, tt.expectedTableSchema, tableSchema)
+			require.Equal(t, tt.expectedViewSchema, sb.String())
+			sb.Reset()
+			for _, v := range fields {
+				tableSchema := fmt.Sprintf("%v, %v, %v\n", v.NameSQL(), v.Type, v.Description)
+				sb.WriteString(tableSchema)
+			}
+			require.Equal(t, tt.expectedTableSchema, sb.String())
 		})
 	}
 }

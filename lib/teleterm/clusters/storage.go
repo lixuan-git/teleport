@@ -1,29 +1,34 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package clusters
 
 import (
 	"context"
+	"encoding/json"
 	"net"
 
 	"github.com/gravitational/trace"
 
 	"github.com/gravitational/teleport/api/profile"
 	"github.com/gravitational/teleport/lib/client"
+	dtauthn "github.com/gravitational/teleport/lib/devicetrust/authn"
+	dtenroll "github.com/gravitational/teleport/lib/devicetrust/enroll"
 	"github.com/gravitational/teleport/lib/teleterm/api/uri"
 )
 
@@ -36,9 +41,15 @@ func NewStorage(cfg Config) (*Storage, error) {
 	return &Storage{Config: cfg}, nil
 }
 
-// ReadAll reads clusters from profiles
-func (s *Storage) ReadAll() ([]*Cluster, error) {
+// ListProfileNames returns just the names of profiles in s.Dir.
+func (s *Storage) ListProfileNames() ([]string, error) {
 	pfNames, err := profile.ListProfileNames(s.Dir)
+	return pfNames, trace.Wrap(err)
+}
+
+// ListRootClusters reads root clusters from profiles.
+func (s *Storage) ListRootClusters() ([]*Cluster, error) {
+	pfNames, err := s.ListProfileNames()
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -46,7 +57,7 @@ func (s *Storage) ReadAll() ([]*Cluster, error) {
 	clusters := make([]*Cluster, 0, len(pfNames))
 	for _, name := range pfNames {
 		cluster, _, err := s.fromProfile(name, "")
-		if err != nil {
+		if cluster == nil {
 			return nil, trace.Wrap(err)
 		}
 
@@ -150,14 +161,12 @@ func (s *Storage) addCluster(ctx context.Context, dir, webProxyAddress string) (
 		return nil, nil, trace.BadParameter("cluster directory is missing")
 	}
 
-	cfg := client.MakeDefaultConfig()
-	cfg.WebProxyAddr = webProxyAddress
-	cfg.HomePath = s.Dir
-	cfg.KeysDir = s.Dir
-	cfg.InsecureSkipVerify = s.InsecureSkipVerify
-
 	profileName := parseName(webProxyAddress)
 	clusterURI := uri.NewClusterURI(profileName)
+
+	cfg := s.makeDefaultClientConfig(clusterURI)
+	cfg.WebProxyAddr = webProxyAddress
+
 	clusterClient, err := client.NewClient(cfg)
 	if err != nil {
 		return nil, nil, trace.Wrap(err)
@@ -168,6 +177,15 @@ func (s *Storage) addCluster(ctx context.Context, dir, webProxyAddress string) (
 	pingResponse, err := clusterClient.Ping(ctx)
 	if err != nil {
 		return nil, nil, trace.Wrap(err)
+	}
+
+	clusterLog := s.Logger.With("cluster", clusterURI)
+
+	pingResponseJSON, err := json.Marshal(pingResponse)
+	if err != nil {
+		clusterLog.DebugContext(ctx, "Could not marshal ping response to JSON", "error", err)
+	} else {
+		clusterLog.DebugContext(ctx, "Got ping response", "response", string(pingResponseJSON))
 	}
 
 	if err := clusterClient.SaveProfile(false); err != nil {
@@ -183,7 +201,7 @@ func (s *Storage) addCluster(ctx context.Context, dir, webProxyAddress string) (
 		clusterClient: clusterClient,
 		dir:           s.Dir,
 		clock:         s.Clock,
-		Log:           s.Log.WithField("cluster", clusterURI),
+		Logger:        clusterLog,
 	}, clusterClient, nil
 }
 
@@ -198,13 +216,10 @@ func (s *Storage) fromProfile(profileName, leafClusterName string) (*Cluster, *c
 
 	profileStore := client.NewFSProfileStore(s.Dir)
 
-	cfg := client.MakeDefaultConfig()
+	cfg := s.makeDefaultClientConfig(clusterURI)
 	if err := cfg.LoadProfile(profileStore, profileName); err != nil {
 		return nil, nil, trace.Wrap(err)
 	}
-	cfg.KeysDir = s.Dir
-	cfg.HomePath = s.Dir
-	cfg.InsecureSkipVerify = s.InsecureSkipVerify
 
 	if leafClusterName != "" {
 		clusterNameForKey = leafClusterName
@@ -218,30 +233,32 @@ func (s *Storage) fromProfile(profileName, leafClusterName string) (*Cluster, *c
 	}
 
 	status, err := s.loadProfileStatusAndClusterKey(clusterClient, clusterNameForKey)
-	if err != nil {
-		return nil, nil, trace.Wrap(err)
-	}
-
-	return &Cluster{
+	cluster := &Cluster{
 		URI:           clusterURI,
 		Name:          clusterClient.SiteName,
 		ProfileName:   profileName,
 		clusterClient: clusterClient,
 		dir:           s.Dir,
 		clock:         s.Clock,
-		status:        *status,
-		Log:           s.Log.WithField("cluster", clusterURI),
-	}, clusterClient, nil
+		statusError:   err,
+		Logger:        s.Logger.With("cluster", clusterURI),
+	}
+	if status != nil {
+		cluster.status = *status
+		cluster.SSOHost = status.SSOHost
+	}
+
+	return cluster, clusterClient, trace.Wrap(err)
 }
 
 func (s *Storage) loadProfileStatusAndClusterKey(clusterClient *client.TeleportClient, clusterNameForKey string) (*client.ProfileStatus, error) {
 	status := &client.ProfileStatus{}
 
 	// load profile status if key exists
-	_, err := clusterClient.LocalAgent().GetKey(clusterNameForKey)
+	_, err := clusterClient.LocalAgent().GetKeyRing(clusterNameForKey)
 	if err != nil {
 		if trace.IsNotFound(err) {
-			s.Log.Infof("No keys found for cluster %v.", clusterNameForKey)
+			s.Logger.InfoContext(context.Background(), "No keys found for cluster", "cluster", clusterNameForKey)
 		} else {
 			return nil, trace.Wrap(err)
 		}
@@ -259,6 +276,20 @@ func (s *Storage) loadProfileStatusAndClusterKey(clusterClient *client.TeleportC
 	}
 
 	return status, nil
+}
+
+func (s *Storage) makeDefaultClientConfig(rootClusterURI uri.ResourceURI) *client.Config {
+	cfg := client.MakeDefaultConfig()
+
+	cfg.HomePath = s.Dir
+	cfg.KeysDir = s.Dir
+	cfg.InsecureSkipVerify = s.InsecureSkipVerify
+	cfg.AddKeysToAgent = s.AddKeysToAgent
+	cfg.WebauthnLogin = s.WebauthnLogin
+	cfg.CustomHardwareKeyPrompt = s.HardwareKeyPromptConstructor(rootClusterURI)
+	cfg.DTAuthnRunCeremony = dtauthn.NewCeremony().Run
+	cfg.DTAutoEnroll = dtenroll.AutoEnroll
+	return cfg
 }
 
 // parseName gets cluster name from cluster web proxy address

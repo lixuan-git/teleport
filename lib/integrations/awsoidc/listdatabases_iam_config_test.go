@@ -1,30 +1,35 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package awsoidc
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/service/iam"
-	iamTypes "github.com/aws/aws-sdk-go-v2/service/iam/types"
+	iamtypes "github.com/aws/aws-sdk-go-v2/service/iam/types"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/slices"
+
+	"github.com/gravitational/teleport/lib/utils/testutils/golden"
 )
 
 func TestListDatabasesIAMConfigReqDefaults(t *testing.T) {
@@ -38,15 +43,29 @@ func TestListDatabasesIAMConfigReqDefaults(t *testing.T) {
 			name: "missing region",
 			req: ConfigureIAMListDatabasesRequest{
 				IntegrationRole: "integrationrole",
+				AccountID:       "123456789012",
 			},
 			errCheck: badParameterCheck,
 		},
 		{
 			name: "missing integration role",
 			req: ConfigureIAMListDatabasesRequest{
-				IntegrationRole: "integrationrole",
+				Region:    "us-east-1",
+				AccountID: "123456789012",
 			},
 			errCheck: badParameterCheck,
+		},
+		{
+			name: "missing account id is ok",
+			req: ConfigureIAMListDatabasesRequest{
+				Region:          "us-east-1",
+				IntegrationRole: "integrationrole",
+			},
+			errCheck: require.NoError,
+			expected: ConfigureIAMListDatabasesRequest{
+				Region:          "us-east-1",
+				IntegrationRole: "integrationrole",
+			},
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -66,11 +85,14 @@ func TestListDatabasesIAMConfig(t *testing.T) {
 	baseReq := ConfigureIAMListDatabasesRequest{
 		Region:          "us-east-1",
 		IntegrationRole: "integrationrole",
+		AccountID:       "123456789012",
+		AutoConfirm:     true,
 	}
 
 	for _, tt := range []struct {
 		name              string
 		mockExistingRoles []string
+		mockAccountID     string
 		req               ConfigureIAMListDatabasesRequest
 		errCheck          require.ErrorAssertionFunc
 	}{
@@ -78,18 +100,28 @@ func TestListDatabasesIAMConfig(t *testing.T) {
 			name:              "valid",
 			req:               baseReq,
 			mockExistingRoles: []string{"integrationrole"},
+			mockAccountID:     "123456789012",
 			errCheck:          require.NoError,
+		},
+		{
+			name:              "account does not match expected account",
+			req:               baseReq,
+			mockExistingRoles: []string{"integrationrole"},
+			mockAccountID:     "222222222222",
+			errCheck:          badParameterCheck,
 		},
 		{
 			name:              "integration role does not exist",
 			mockExistingRoles: []string{},
+			mockAccountID:     "123456789012",
 			req:               baseReq,
-			errCheck:          notFounCheck,
+			errCheck:          notFoundCheck,
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			clt := mockListDatabasesIAMConfigClient{
-				existingRoles: tt.mockExistingRoles,
+				CallerIdentityGetter: mockSTSClient{accountID: tt.mockAccountID},
+				existingRoles:        tt.mockExistingRoles,
 			}
 
 			err := ConfigureListDatabasesIAM(ctx, &clt, tt.req)
@@ -98,7 +130,30 @@ func TestListDatabasesIAMConfig(t *testing.T) {
 	}
 }
 
+func TestListDatabasesIAMConfigOutput(t *testing.T) {
+	var buf bytes.Buffer
+	req := ConfigureIAMListDatabasesRequest{
+		Region:          "us-east-1",
+		IntegrationRole: "integrationrole",
+		AccountID:       "123456789012",
+		AutoConfirm:     true,
+		stdout:          &buf,
+	}
+	clt := &mockListDatabasesIAMConfigClient{
+		CallerIdentityGetter: mockSTSClient{accountID: req.AccountID},
+		existingRoles:        []string{req.IntegrationRole},
+	}
+
+	ctx := context.Background()
+	require.NoError(t, ConfigureListDatabasesIAM(ctx, clt, req))
+	if golden.ShouldSet() {
+		golden.Set(t, buf.Bytes())
+	}
+	require.Equal(t, string(golden.Get(t)), buf.String())
+}
+
 type mockListDatabasesIAMConfigClient struct {
+	CallerIdentityGetter
 	existingRoles []string
 }
 
@@ -106,7 +161,7 @@ type mockListDatabasesIAMConfigClient struct {
 func (m *mockListDatabasesIAMConfigClient) PutRolePolicy(ctx context.Context, params *iam.PutRolePolicyInput, optFns ...func(*iam.Options)) (*iam.PutRolePolicyOutput, error) {
 	if !slices.Contains(m.existingRoles, *params.RoleName) {
 		noSuchEntityMessage := fmt.Sprintf("role %q does not exist.", *params.RoleName)
-		return nil, &iamTypes.NoSuchEntityException{
+		return nil, &iamtypes.NoSuchEntityException{
 			Message: &noSuchEntityMessage,
 		}
 	}

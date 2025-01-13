@@ -1,18 +1,20 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package events
 
@@ -20,14 +22,15 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"time"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	log "github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport"
 	apievents "github.com/gravitational/teleport/api/types/events"
+	"github.com/gravitational/teleport/lib/modules"
 	"github.com/gravitational/teleport/lib/session"
 	"github.com/gravitational/teleport/lib/utils"
 )
@@ -95,7 +98,10 @@ func (a *AsyncEmitter) forward() {
 		case event := <-a.eventsCh:
 			err := a.cfg.Inner.EmitAuditEvent(a.ctx, event)
 			if err != nil {
-				log.WithError(err).Errorf("Failed to emit audit event.")
+				if a.ctx.Err() != nil {
+					return
+				}
+				slog.ErrorContext(a.ctx, "Failed to emit audit event.", "error", err)
 			}
 		}
 	}
@@ -110,7 +116,7 @@ func (a *AsyncEmitter) EmitAuditEvent(ctx context.Context, event apievents.Audit
 	case <-ctx.Done():
 		return trace.ConnectionProblem(ctx.Err(), "context canceled or closed")
 	default:
-		log.Errorf("Failed to emit audit event %v(%v). This server's connection to the auth service appears to be slow.", event.GetType(), event.GetCode())
+		slog.ErrorContext(ctx, "Failed to emit audit event. This server's connection to the auth service appears to be slow.", "event_type", event.GetType(), "event_code", event.GetCode())
 		return nil
 	}
 }
@@ -161,15 +167,17 @@ func (w *CheckingEmitterConfig) CheckAndSetDefaults() error {
 
 // EmitAuditEvent emits audit event
 func (r *CheckingEmitter) EmitAuditEvent(ctx context.Context, event apievents.AuditEvent) error {
+	ctx = context.WithoutCancel(ctx)
 	auditEmitEvent.Inc()
+	auditEmitEventSizes.Observe(float64(event.Size()))
 	if err := checkAndSetEventFields(event, r.Clock, r.UIDGenerator, r.ClusterName); err != nil {
-		log.WithError(err).Errorf("Failed to emit audit event.")
+		slog.ErrorContext(ctx, "Failed to emit audit event.", "error", err)
 		AuditFailedEmit.Inc()
 		return trace.Wrap(err)
 	}
 	if err := r.Inner.EmitAuditEvent(ctx, event); err != nil {
 		AuditFailedEmit.Inc()
-		log.WithError(err).Errorf("Failed to emit audit event of type: %s.", event.GetType())
+		slog.ErrorContext(ctx, "Failed to emit audit event of type", "event_type", event.GetType(), "error", err)
 		return trace.Wrap(err)
 	}
 	return nil
@@ -240,17 +248,26 @@ func (w *WriterEmitter) EmitAuditEvent(ctx context.Context, event apievents.Audi
 }
 
 // NewLoggingEmitter returns an emitter that logs all events to the console
-// with the info level
-func NewLoggingEmitter() *LoggingEmitter {
-	return &LoggingEmitter{}
+// with the info level. Events are only logged for self-hosted installations,
+// Teleport Cloud treats this as a no-op.
+func NewLoggingEmitter(cloud bool) *LoggingEmitter {
+	return &LoggingEmitter{
+		emit: !(modules.GetModules().Features().Cloud || cloud),
+	}
 }
 
 // LoggingEmitter logs all events with info level
-type LoggingEmitter struct{}
+type LoggingEmitter struct {
+	emit bool
+}
 
 // EmitAuditEvent logs audit event, skips session print events, session
 // disk events and app session request events, because they are very verbose.
-func (*LoggingEmitter) EmitAuditEvent(ctx context.Context, event apievents.AuditEvent) error {
+func (l *LoggingEmitter) EmitAuditEvent(ctx context.Context, event apievents.AuditEvent) error {
+	if !l.emit {
+		return nil
+	}
+
 	switch event.GetType() {
 	case ResizeEvent, SessionDiskEvent, SessionPrintEvent, AppSessionRequestEvent, "":
 		return nil
@@ -261,14 +278,13 @@ func (*LoggingEmitter) EmitAuditEvent(ctx context.Context, event apievents.Audit
 		return trace.Wrap(err)
 	}
 
-	var fields log.Fields
-	err = utils.FastUnmarshal(data, &fields)
-	if err != nil {
+	var fields map[string]any
+	if err := utils.FastUnmarshal(data, &fields); err != nil {
 		return trace.Wrap(err)
 	}
-	fields[trace.Component] = teleport.Component(teleport.ComponentAuditLog)
+	fields[teleport.ComponentKey] = teleport.ComponentAuditLog
 
-	log.WithFields(fields).Infof(event.GetType())
+	slog.InfoContext(ctx, "emitting audit event", "event_type", event.GetType(), "fields", fields)
 	return nil
 }
 
@@ -287,6 +303,7 @@ type MultiEmitter struct {
 
 // EmitAuditEvent emits audit event to all emitters
 func (m *MultiEmitter) EmitAuditEvent(ctx context.Context, event apievents.AuditEvent) error {
+	ctx = context.WithoutCancel(ctx)
 	var errors []error
 	for i := range m.emitters {
 		err := m.emitters[i].EmitAuditEvent(ctx, event)
@@ -334,6 +351,7 @@ type CallbackEmitter struct {
 }
 
 func (c *CallbackEmitter) EmitAuditEvent(ctx context.Context, event apievents.AuditEvent) error {
+	ctx = context.WithoutCancel(ctx)
 	return c.OnEmitAuditEvent(ctx, event)
 }
 
@@ -512,7 +530,7 @@ func (s *ReportingStream) Complete(ctx context.Context) error {
 		Error:     err,
 	}:
 	default:
-		log.Warningf("Skip send event on a blocked channel.")
+		slog.WarnContext(ctx, "Skip send event on a blocked channel.")
 	}
 	return trace.Wrap(err)
 }

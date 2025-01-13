@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package integration
 
@@ -20,7 +22,7 @@ import (
 	"context"
 	"os"
 	"os/user"
-	"path"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -36,11 +38,13 @@ import (
 	"github.com/gravitational/teleport/api/constants"
 	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/api/utils/keys"
 	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/auth/testauthority"
 	"github.com/gravitational/teleport/lib/authz"
 	"github.com/gravitational/teleport/lib/bpf"
-	restricted "github.com/gravitational/teleport/lib/restrictedsession"
+	"github.com/gravitational/teleport/lib/cryptosuites"
 	"github.com/gravitational/teleport/lib/service/servicecfg"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/srv"
@@ -63,7 +67,7 @@ type SrvCtx struct {
 	signer     ssh.Signer
 	server     *auth.TestServer
 	clock      clockwork.FakeClock
-	nodeClient *auth.Client
+	nodeClient *authclient.Client
 	nodeID     string
 	utmpPath   string
 	wtmpPath   string
@@ -114,10 +118,10 @@ func TestRootUTMPEntryExists(t *testing.T) {
 		require.NoError(t, err)
 
 		require.EventuallyWithTf(t, func(collect *assert.CollectT) {
-			require.NoError(collect, uacc.UserWithPtyInDatabase(s.utmpPath, teleportTestUser))
-			require.NoError(collect, uacc.UserWithPtyInDatabase(s.wtmpPath, teleportTestUser))
+			assert.NoError(collect, uacc.UserWithPtyInDatabase(s.utmpPath, teleportTestUser))
+			assert.NoError(collect, uacc.UserWithPtyInDatabase(s.wtmpPath, teleportTestUser))
 			// Ensure than an entry was not written to btmp.
-			require.True(collect, trace.IsNotFound(uacc.UserWithPtyInDatabase(s.btmpPath, teleportTestUser)), "unexpected error: %v", err)
+			assert.True(collect, trace.IsNotFound(uacc.UserWithPtyInDatabase(s.btmpPath, teleportTestUser)), "unexpected error: %v", err)
 		}, 5*time.Minute, time.Second, "did not detect utmp entry within 5 minutes")
 	})
 
@@ -150,10 +154,10 @@ func TestRootUTMPEntryExists(t *testing.T) {
 		require.NoError(t, err)
 
 		require.EventuallyWithT(t, func(collect *assert.CollectT) {
-			require.NoError(collect, uacc.UserWithPtyInDatabase(s.btmpPath, teleportFakeUser))
+			assert.NoError(collect, uacc.UserWithPtyInDatabase(s.btmpPath, teleportFakeUser))
 			// Ensure that entries were not written to utmp and wtmp
-			require.True(collect, trace.IsNotFound(uacc.UserWithPtyInDatabase(s.utmpPath, teleportFakeUser)), "unexpected error: %v", err)
-			require.True(collect, trace.IsNotFound(uacc.UserWithPtyInDatabase(s.wtmpPath, teleportFakeUser)), "unexpected error: %v", err)
+			assert.True(collect, trace.IsNotFound(uacc.UserWithPtyInDatabase(s.utmpPath, teleportFakeUser)), "unexpected error: %v", err)
+			assert.True(collect, trace.IsNotFound(uacc.UserWithPtyInDatabase(s.wtmpPath, teleportFakeUser)), "unexpected error: %v", err)
 		}, 5*time.Minute, time.Second, "did not detect btmp entry within 5 minutes")
 	})
 
@@ -166,8 +170,8 @@ func TestRootUsernameLimit(t *testing.T) {
 	}
 
 	dir := t.TempDir()
-	utmpPath := path.Join(dir, "utmp")
-	wtmpPath := path.Join(dir, "wtmp")
+	utmpPath := filepath.Join(dir, "utmp")
+	wtmpPath := filepath.Join(dir, "wtmp")
 
 	err := TouchFile(utmpPath)
 	require.NoError(t, err)
@@ -249,24 +253,28 @@ func newSrvCtx(ctx context.Context, t *testing.T) *SrvCtx {
 	require.NoError(t, err)
 
 	// set up host private key and certificate
-	priv, pub, err := testauthority.New().GenerateKeyPair()
+	key, err := cryptosuites.GenerateKeyWithAlgorithm(cryptosuites.ECDSAP256)
 	require.NoError(t, err)
-
-	tlsPub, err := auth.PrivateKeyToPublicKeyTLS(priv)
+	privateKeyPEM, err := keys.MarshalPrivateKey(key)
 	require.NoError(t, err)
+	tlsPublicKey, err := keys.MarshalPublicKey(key.Public())
+	require.NoError(t, err)
+	sshPub, err := ssh.NewPublicKey(key.Public())
+	require.NoError(t, err)
+	sshPublicKey := ssh.MarshalAuthorizedKey(sshPub)
 
 	certs, err := s.server.Auth().GenerateHostCerts(ctx,
 		&proto.HostCertsRequest{
 			HostID:       hostID,
 			NodeName:     s.server.ClusterName(),
 			Role:         types.RoleNode,
-			PublicSSHKey: pub,
-			PublicTLSKey: tlsPub,
+			PublicSSHKey: sshPublicKey,
+			PublicTLSKey: tlsPublicKey,
 		})
 	require.NoError(t, err)
 
 	// set up user CA and set up a user that has access to the server
-	s.signer, err = sshutils.NewSigner(priv, certs.SSH)
+	s.signer, err = sshutils.NewSigner(privateKeyPEM, certs.SSH)
 	require.NoError(t, err)
 
 	s.nodeID = uuid.New().String()
@@ -279,9 +287,9 @@ func newSrvCtx(ctx context.Context, t *testing.T) *SrvCtx {
 	require.NoError(t, err)
 
 	uaccDir := t.TempDir()
-	utmpPath := path.Join(uaccDir, "utmp")
-	wtmpPath := path.Join(uaccDir, "wtmp")
-	btmpPath := path.Join(uaccDir, "btmp")
+	utmpPath := filepath.Join(uaccDir, "utmp")
+	wtmpPath := filepath.Join(uaccDir, "wtmp")
+	btmpPath := filepath.Join(uaccDir, "btmp")
 	require.NoError(t, TouchFile(utmpPath))
 	require.NoError(t, TouchFile(wtmpPath))
 	require.NoError(t, TouchFile(btmpPath))
@@ -313,7 +321,7 @@ func newSrvCtx(ctx context.Context, t *testing.T) *SrvCtx {
 		ctx,
 		utils.NetAddr{AddrNetwork: "tcp", Addr: "127.0.0.1:0"},
 		s.server.ClusterName(),
-		[]ssh.Signer{s.signer},
+		sshutils.StaticHostSigners(s.signer),
 		s.nodeClient,
 		nodeDir,
 		"",
@@ -322,7 +330,6 @@ func newSrvCtx(ctx context.Context, t *testing.T) *SrvCtx {
 		regular.SetUUID(s.nodeID),
 		regular.SetNamespace(apidefaults.Namespace),
 		regular.SetEmitter(s.nodeClient),
-		regular.SetShell("/bin/sh"),
 		regular.SetPAMConfig(&servicecfg.PAMConfig{Enabled: false}),
 		regular.SetLabels(
 			map[string]string{"foo": "bar"},
@@ -334,7 +341,6 @@ func newSrvCtx(ctx context.Context, t *testing.T) *SrvCtx {
 			}, nil,
 		),
 		regular.SetBPF(&bpf.NOP{}),
-		regular.SetRestrictedSessionManager(&restricted.NOP{}),
 		regular.SetClock(s.clock),
 		regular.SetUserAccountingPaths(utmpPath, wtmpPath, btmpPath),
 		regular.SetLockWatcher(lockWatcher),
@@ -365,12 +371,12 @@ func newUpack(ctx context.Context, s *SrvCtx, username string, allowedLogins []s
 	role.SetOptions(opts)
 	role.SetLogins(types.Allow, allowedLogins)
 	role.SetNodeLabels(types.Allow, allowedLabels)
-	err = auth.UpsertRole(ctx, role)
+	role, err = auth.UpsertRole(ctx, role)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 	user.AddRole(role.GetName())
-	err = auth.UpsertUser(user)
+	user, err = auth.UpsertUser(ctx, user)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}

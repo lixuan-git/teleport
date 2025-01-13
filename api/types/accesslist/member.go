@@ -22,9 +22,13 @@ import (
 	"github.com/gravitational/trace"
 
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/api/types/compare"
 	"github.com/gravitational/teleport/api/types/header"
 	"github.com/gravitational/teleport/api/types/header/convert/legacy"
+	"github.com/gravitational/teleport/api/utils"
 )
+
+var _ compare.IsEqual[*AccessListMember] = (*AccessListMember)(nil)
 
 // AccessListMember is an access list member resource.
 type AccessListMember struct {
@@ -57,6 +61,10 @@ type AccessListMemberSpec struct {
 
 	// IneligibleStatus describes the reason why this member is not eligible.
 	IneligibleStatus string `json:"ineligible_status" yaml:"ineligible_status"`
+
+	// MembershipKind describes the kind of membership,
+	// either "MEMBERSHIP_KIND_USER" or "MEMBERSHIP_KIND_LIST".
+	MembershipKind string `json:"membership_kind" yaml:"membership_kind"`
 }
 
 // NewAccessListMember will create a new access listm member.
@@ -82,6 +90,10 @@ func (a *AccessListMember) CheckAndSetDefaults() error {
 		return trace.Wrap(err)
 	}
 
+	if a.Spec.MembershipKind == "" {
+		a.Spec.MembershipKind = MembershipKindUser
+	}
+
 	if a.Spec.AccessList == "" {
 		return trace.BadParameter("access list is missing")
 	}
@@ -91,11 +103,11 @@ func (a *AccessListMember) CheckAndSetDefaults() error {
 	}
 
 	if a.Spec.Joined.IsZero() || a.Spec.Joined.Unix() == 0 {
-		return trace.BadParameter("member %s joined is missing", a.Spec.Name)
+		return trace.BadParameter("member %s: joined field empty or missing", a.Spec.Name)
 	}
 
 	if a.Spec.AddedBy == "" {
-		return trace.BadParameter("member %s added by is missing", a.Spec.Name)
+		return trace.BadParameter("member %s: added_by field is empty", a.Spec.Name)
 	}
 
 	return nil
@@ -105,4 +117,21 @@ func (a *AccessListMember) CheckAndSetDefaults() error {
 // and should be removed when possible.
 func (a *AccessListMember) GetMetadata() types.Metadata {
 	return legacy.FromHeaderMetadata(a.Metadata)
+}
+
+// IsEqual defines AccessListMember equality for use with
+// `services.CompareResources()` (and hence the services.Reconciler).
+//
+// For the purposes of reconciliation, we only care that the user and target
+// AccessList match.
+func (a *AccessListMember) IsEqual(other *AccessListMember) bool {
+	return a.Spec.Name == other.Spec.Name &&
+		a.Spec.AccessList == other.Spec.AccessList
+}
+
+// MatchSearch goes through select field values of a resource
+// and tries to match against the list of search values.
+func (a *AccessListMember) MatchSearch(values []string) bool {
+	fieldVals := append(utils.MapToStrings(a.GetAllLabels()), a.GetName())
+	return types.MatchSearch(fieldVals, values, nil)
 }

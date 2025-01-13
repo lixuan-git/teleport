@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package helpers
 
@@ -27,12 +31,9 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/gravitational/roundtrip"
-	"github.com/gravitational/trace"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport/lib/client"
-	"github.com/gravitational/teleport/lib/httplib/csrf"
-	"github.com/gravitational/teleport/lib/utils"
 	"github.com/gravitational/teleport/lib/web"
 	websession "github.com/gravitational/teleport/lib/web/session"
 	"github.com/gravitational/teleport/lib/web/ui"
@@ -65,15 +66,7 @@ func LoginWebClient(t *testing.T, host, username, password string) *WebClientPac
 	req, err := http.NewRequest(http.MethodPost, u.String(), bytes.NewBuffer(csReq))
 	require.NoError(t, err)
 
-	// Attach CSRF token in cookie and header.
-	csrfToken, err := utils.CryptoRandomHex(32)
-	require.NoError(t, err)
-	req.AddCookie(&http.Cookie{
-		Name:  csrf.CookieName,
-		Value: csrfToken,
-	})
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
-	req.Header.Set(csrf.HeaderName, csrfToken)
 
 	// Issue request.
 	client := &http.Client{
@@ -96,7 +89,7 @@ func LoginWebClient(t *testing.T, host, username, password string) *WebClientPac
 	// Extract session cookie and bearer token.
 	require.Len(t, resp.Cookies(), 1)
 	cookie := resp.Cookies()[0]
-	require.Equal(t, cookie.Name, websession.CookieName)
+	require.Equal(t, websession.CookieName, cookie.Name)
 
 	webClient := &WebClientPack{
 		clt:         client,
@@ -171,7 +164,7 @@ func (w *WebClientPack) OpenWebsocket(t *testing.T, endpoint string, params any)
 
 	q := u.Query()
 	q.Set("params", string(data))
-	q.Set(roundtrip.AccessTokenQueryParam, w.bearerToken)
+	q.Set(roundtrip.AuthBearer, w.bearerToken)
 	u.RawQuery = q.Encode()
 
 	dialer := websocket.Dialer{}
@@ -189,5 +182,16 @@ func (w *WebClientPack) OpenWebsocket(t *testing.T, endpoint string, params any)
 	header.Add("Cookie", cookie.String())
 
 	ws, resp, err := dialer.Dial(u.String(), header)
-	return ws, resp, trace.Wrap(err)
+	require.NoError(t, err)
+
+	authReq, err := json.Marshal(struct {
+		Token string `json:"token"`
+	}{Token: w.bearerToken})
+	require.NoError(t, err)
+
+	if err := ws.WriteMessage(websocket.TextMessage, authReq); err != nil {
+		return nil, nil, err
+	}
+
+	return ws, resp, nil
 }

@@ -1,16 +1,20 @@
-// Copyright 2021 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package kubeconfig
 
@@ -29,9 +33,10 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
-	"github.com/gravitational/teleport/lib/auth"
-	"github.com/gravitational/teleport/lib/auth/testauthority"
+	"github.com/gravitational/teleport/api/utils/keys"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/client"
+	"github.com/gravitational/teleport/lib/cryptosuites"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/tlsca"
 )
@@ -172,7 +177,7 @@ func TestUpdate(t *testing.T) {
 		clusterAddr = "https://1.2.3.6:3080"
 	)
 	kubeconfigPath, initialConfig := setup(t)
-	creds, caCertPEM, err := genUserKey("localhost")
+	creds, caCertPEM, err := genUserKeyRing("localhost")
 	require.NoError(t, err)
 	err = Update(kubeconfigPath, Values{
 		TeleportClusterName: clusterName,
@@ -193,7 +198,7 @@ func TestUpdate(t *testing.T) {
 	}
 	wantConfig.AuthInfos[clusterName] = &clientcmdapi.AuthInfo{
 		ClientCertificateData: creds.TLSCert,
-		ClientKeyData:         creds.PrivateKeyPEM(),
+		ClientKeyData:         creds.TLSPrivateKey.PrivateKeyPEM(),
 		LocationOfOrigin:      kubeconfigPath,
 		Extensions:            map[string]runtime.Object{},
 	}
@@ -221,7 +226,7 @@ func TestUpdateWithExec(t *testing.T) {
 		namespace   = "kubeNamespace"
 	)
 
-	creds, caCertPEM, err := genUserKey("localhost")
+	creds, caCertPEM, err := genUserKeyRing("localhost")
 	require.NoError(t, err)
 
 	tests := []struct {
@@ -346,7 +351,7 @@ func TestUpdateWithExecAndProxy(t *testing.T) {
 		home        = "/alt/home"
 	)
 	kubeconfigPath, initialConfig := setup(t)
-	creds, caCertPEM, err := genUserKey("localhost")
+	creds, caCertPEM, err := genUserKeyRing("localhost")
 	require.NoError(t, err)
 	err = Update(kubeconfigPath, Values{
 		TeleportClusterName: clusterName,
@@ -411,12 +416,12 @@ func TestUpdateLoadAllCAs(t *testing.T) {
 		clusterAddr     = "https://1.2.3.6:3080"
 	)
 	kubeconfigPath, _ := setup(t)
-	creds, _, err := genUserKey("localhost")
+	creds, _, err := genUserKeyRing("localhost")
 	require.NoError(t, err)
-	_, leafCACertPEM, err := genUserKey("example.com")
+	_, leafCACertPEM, err := genUserKeyRing("example.com")
 	require.NoError(t, err)
 	creds.TrustedCerts[0].ClusterName = clusterName
-	creds.TrustedCerts = append(creds.TrustedCerts, auth.TrustedCerts{
+	creds.TrustedCerts = append(creds.TrustedCerts, authclient.TrustedCerts{
 		ClusterName:     leafClusterName,
 		TLSCertificates: [][]byte{leafCACertPEM},
 	})
@@ -451,7 +456,7 @@ func TestRemoveByClusterName(t *testing.T) {
 	)
 	kubeconfigPath, initialConfig := setup(t)
 
-	creds, _, err := genUserKey("localhost")
+	creds, _, err := genUserKeyRing("localhost")
 	require.NoError(t, err)
 
 	// Add teleport-generated entries to kubeconfig.
@@ -514,7 +519,7 @@ func TestRemoveByServerAddr(t *testing.T) {
 	)
 
 	kubeconfigPath, initialConfig := setup(t)
-	creds, _, err := genUserKey("localhost")
+	creds, _, err := genUserKeyRing("localhost")
 	require.NoError(t, err)
 
 	// Add teleport-generated entries to kubeconfig.
@@ -547,7 +552,7 @@ func TestRemoveByServerAddr(t *testing.T) {
 	require.Equal(t, wantConfig, config)
 }
 
-func genUserKey(hostname string) (*client.Key, []byte, error) {
+func genUserKeyRing(hostname string) (*client.KeyRing, []byte, error) {
 	caKey, caCert, err := tlsca.GenerateSelfSignedCA(pkix.Name{
 		CommonName:   hostname,
 		Organization: []string{hostname},
@@ -560,8 +565,11 @@ func genUserKey(hostname string) (*client.Key, []byte, error) {
 		return nil, nil, trace.Wrap(err)
 	}
 
-	keygen := testauthority.New()
-	priv, err := keygen.GeneratePrivateKey()
+	key, err := cryptosuites.GenerateKeyWithAlgorithm(cryptosuites.ECDSAP256)
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+	priv, err := keys.NewSoftwarePrivateKey(key)
 	if err != nil {
 		return nil, nil, trace.Wrap(err)
 	}
@@ -579,10 +587,10 @@ func genUserKey(hostname string) (*client.Key, []byte, error) {
 		return nil, nil, trace.Wrap(err)
 	}
 
-	return &client.Key{
-		PrivateKey: priv,
-		TLSCert:    tlsCert,
-		TrustedCerts: []auth.TrustedCerts{{
+	return &client.KeyRing{
+		TLSPrivateKey: priv,
+		TLSCert:       tlsCert,
+		TrustedCerts: []authclient.TrustedCerts{{
 			TLSCertificates: [][]byte{caCert},
 		}},
 	}, caCert, nil

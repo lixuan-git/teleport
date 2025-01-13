@@ -1,16 +1,20 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package loginrule
 
@@ -18,26 +22,28 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"os"
 
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 	kyaml "k8s.io/apimachinery/pkg/util/yaml"
 
 	"github.com/gravitational/teleport"
 	loginrulepb "github.com/gravitational/teleport/api/gen/proto/go/teleport/loginrule/v1"
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/service/servicecfg"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/utils"
+	commonclient "github.com/gravitational/teleport/tool/tctl/common/client"
+	tctlcfg "github.com/gravitational/teleport/tool/tctl/common/config"
 )
 
 type subcommand interface {
 	initialize(parent *kingpin.CmdClause, cfg *servicecfg.Config)
-	tryRun(ctx context.Context, selectedCommand string, c auth.ClientI) (match bool, err error)
+	tryRun(ctx context.Context, selectedCommand string, clientFunc commonclient.InitFunc) (match bool, err error)
 }
 
 // Command implements all commands under "tctl login_rule".
@@ -46,7 +52,7 @@ type Command struct {
 }
 
 // Initialize installs the base "login_rule" command and all subcommands.
-func (t *Command) Initialize(app *kingpin.Application, cfg *servicecfg.Config) {
+func (t *Command) Initialize(app *kingpin.Application, _ *tctlcfg.GlobalCLIFlags, cfg *servicecfg.Config) {
 	loginRuleCommand := app.Command("login_rule", "Test login rules")
 
 	t.subcommands = []subcommand{
@@ -60,9 +66,9 @@ func (t *Command) Initialize(app *kingpin.Application, cfg *servicecfg.Config) {
 
 // TryRun calls tryRun for each subcommand, and if none of them match returns
 // (false, nil)
-func (t *Command) TryRun(ctx context.Context, selectedCommand string, c auth.ClientI) (match bool, err error) {
+func (t *Command) TryRun(ctx context.Context, cmd string, clientFunc commonclient.InitFunc) (match bool, err error) {
 	for _, subcommand := range t.subcommands {
-		match, err = subcommand.tryRun(ctx, selectedCommand, c)
+		match, err = subcommand.tryRun(ctx, cmd, clientFunc)
 		if err != nil {
 			return match, trace.Wrap(err)
 		}
@@ -108,7 +114,7 @@ Examples:
   > echo '{"groups": ["example"]}' | tctl login_rule test --resource-file rule.yaml`)
 }
 
-func (t *testCommand) tryRun(ctx context.Context, selectedCommand string, c auth.ClientI) (match bool, err error) {
+func (t *testCommand) tryRun(ctx context.Context, selectedCommand string, clientFunc commonclient.InitFunc) (match bool, err error) {
 	if selectedCommand != t.cmd.FullCommand() {
 		return false, nil
 	}
@@ -116,11 +122,16 @@ func (t *testCommand) tryRun(ctx context.Context, selectedCommand string, c auth
 	if len(t.inputResourceFiles) == 0 && !t.loadFromCluster {
 		return true, trace.BadParameter("no login rules to test, --resource-file or --load-from-cluster must be set")
 	}
+	client, closeFn, err := clientFunc(ctx)
+	if err != nil {
+		return false, trace.Wrap(err)
+	}
+	defer closeFn(ctx)
 
-	return true, trace.Wrap(t.run(ctx, c))
+	return true, trace.Wrap(t.run(ctx, client))
 }
 
-func (t *testCommand) run(ctx context.Context, c auth.ClientI) error {
+func (t *testCommand) run(ctx context.Context, c *authclient.Client) error {
 	loginRules, err := parseLoginRuleFiles(t.inputResourceFiles)
 	if err != nil {
 		return trace.Wrap(err)
@@ -130,7 +141,7 @@ func (t *testCommand) run(ctx context.Context, c auth.ClientI) error {
 	}
 
 	if len(t.inputResourceFiles) > 0 {
-		logrus.Debugf("Loaded %d login rule(s) from input resource files", len(loginRules))
+		slog.DebugContext(ctx, "Loaded login rule(s) from input resource files", "login_rule_count", len(loginRules))
 	}
 
 	traits, err := parseTraitsFile(t.inputTraitsFile)
@@ -155,7 +166,7 @@ func (t *testCommand) run(ctx context.Context, c auth.ClientI) error {
 	case teleport.YAML:
 		utils.WriteYAML(os.Stdout, traitsMapProtoToResource(result.Traits))
 	case teleport.JSON:
-		utils.WriteJSON(os.Stdout, traitsMapProtoToResource(result.Traits))
+		utils.WriteJSONObject(os.Stdout, traitsMapProtoToResource(result.Traits))
 	default:
 		return trace.BadParameter("unsupported output format %q, supported values are %s and %s", t.outputFormat, teleport.YAML, teleport.JSON)
 	}

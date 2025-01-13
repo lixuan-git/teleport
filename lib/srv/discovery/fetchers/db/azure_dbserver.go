@@ -1,28 +1,31 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package db
 
 import (
+	"context"
+	"log/slog"
+
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/cloud/azure"
-	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/srv/discovery/common"
 )
 
@@ -31,20 +34,20 @@ func newAzureMySQLFetcher(config azureFetcherConfig) (common.Fetcher, error) {
 	return newAzureFetcher[*azure.DBServer, azure.DBServersClient](config, &azureDBServerPlugin{})
 }
 
-// newAzureMySQLFetcher creates a fetcher for Azure PostgresSQL.
+// newAzureMySQLFetcher creates a fetcher for Azure PostgreSQL.
 func newAzurePostgresFetcher(config azureFetcherConfig) (common.Fetcher, error) {
 	return newAzureFetcher[*azure.DBServer, azure.DBServersClient](config, &azureDBServerPlugin{})
 }
 
-// azureDBServerPlugin implements azureFetcherPlugin for MySQL and PostgresSQL.
+// azureDBServerPlugin implements azureFetcherPlugin for MySQL and PostgreSQL.
 type azureDBServerPlugin struct{}
 
 func (p *azureDBServerPlugin) GetListClient(cfg *azureFetcherConfig, subID string) (azure.DBServersClient, error) {
 	switch cfg.Type {
-	case services.AzureMatcherMySQL:
+	case types.AzureMatcherMySQL:
 		client, err := cfg.AzureClients.GetAzureMySQLClient(subID)
 		return client, trace.Wrap(err)
-	case services.AzureMatcherPostgres:
+	case types.AzureMatcherPostgres:
 		client, err := cfg.AzureClients.GetAzurePostgresClient(subID)
 		return client, trace.Wrap(err)
 	default:
@@ -56,26 +59,28 @@ func (p *azureDBServerPlugin) GetServerLocation(server *azure.DBServer) string {
 	return server.Location
 }
 
-func (p *azureDBServerPlugin) NewDatabaseFromServer(server *azure.DBServer, log logrus.FieldLogger) types.Database {
+func (p *azureDBServerPlugin) NewDatabaseFromServer(ctx context.Context, server *azure.DBServer, logger *slog.Logger) types.Database {
 	if !server.IsSupported() {
-		log.Debugf("Azure server %q (version %v) does not support AAD authentication. Skipping.",
-			server.Name,
-			server.Properties.Version)
+		logger.DebugContext(ctx, "Skipping Azure server that does not support AAD authentication",
+			"server", server.Name,
+			"version", server.Properties.Version,
+		)
 		return nil
 	}
 
 	if !server.IsAvailable() {
-		log.Debugf("The current status of Azure server %q is %q. Skipping.",
-			server.Name,
-			server.Properties.UserVisibleState)
+		logger.DebugContext(ctx, "Skippin unavailable Azure server",
+			"server", server.Name,
+			"state", server.Properties.UserVisibleState)
 		return nil
 	}
 
-	database, err := services.NewDatabaseFromAzureServer(server)
+	database, err := common.NewDatabaseFromAzureServer(server)
 	if err != nil {
-		log.Warnf("Could not convert Azure server %q to database resource: %v.",
-			server.Name,
-			err)
+		logger.WarnContext(ctx, "Could not convert Azure server to database resource",
+			"server", server.Name,
+			"error", err,
+		)
 		return nil
 	}
 	return database

@@ -1,46 +1,50 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package gcp
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
+	"crypto"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/go-jose/go-jose/v3"
+	"github.com/go-jose/go-jose/v3/jwt"
 	"github.com/jonboulle/clockwork"
 	"github.com/stretchr/testify/require"
-	"gopkg.in/square/go-jose.v2"
-	"gopkg.in/square/go-jose.v2/jwt"
+
+	"github.com/gravitational/teleport/lib/cryptosuites"
 )
 
 type fakeIDP struct {
-	t          *testing.T
-	signer     jose.Signer
-	privateKey *rsa.PrivateKey
-	server     *httptest.Server
+	t         *testing.T
+	signer    jose.Signer
+	publicKey crypto.PublicKey
+	server    *httptest.Server
 }
 
 func newFakeIDP(t *testing.T) *fakeIDP {
-	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	// GCP uses RSA, prefer to test with it.
+	privateKey, err := cryptosuites.GenerateKeyWithAlgorithm(cryptosuites.RSA2048)
 	require.NoError(t, err)
 
 	signer, err := jose.NewSigner(
@@ -50,9 +54,9 @@ func newFakeIDP(t *testing.T) *fakeIDP {
 	require.NoError(t, err)
 
 	f := &fakeIDP{
-		signer:     signer,
-		privateKey: privateKey,
-		t:          t,
+		signer:    signer,
+		publicKey: privateKey.Public(),
+		t:         t,
 	}
 
 	providerMux := http.NewServeMux()
@@ -104,7 +108,7 @@ func (f *fakeIDP) handleJWKSEndpoint(w http.ResponseWriter, r *http.Request) {
 	jwks := jose.JSONWebKeySet{
 		Keys: []jose.JSONWebKey{
 			{
-				Key: &f.privateKey.PublicKey,
+				Key: f.publicKey,
 			},
 		},
 	}

@@ -1,42 +1,50 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package oneoff
 
 import (
 	"bytes"
 	_ "embed"
+	"slices"
 	"text/template"
 
 	"github.com/gravitational/trace"
 
-	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api"
+	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/lib/modules"
+	"github.com/gravitational/teleport/lib/utils/teleportassets"
 )
 
 const (
-	// teleportCDNLocation is the Teleport's CDN URL
-	// This is used to download the Teleport Binary
-	teleportCDNLocation = "https://cdn.teleport.dev"
-
 	// binUname is the default binary name for inspecting the host's OS.
 	binUname = "uname"
 
 	// binMktemp is the default binary name for creating temporary directories.
 	binMktemp = "mktemp"
+
+	// PrefixSUDO is a Teleport Command Prefix that executes with higher privileges
+	// Use with caution.
+	PrefixSUDO = "sudo"
 )
+
+var allowedCommandPrefix = []string{PrefixSUDO}
 
 var (
 	//go:embed oneoff.sh
@@ -48,6 +56,13 @@ var (
 
 // OneOffScriptParams contains the required params to create a script that downloads and executes teleport binary.
 type OneOffScriptParams struct {
+	// TeleportCommandPrefix is a prefix command to use when calling teleport command.
+	// Acceptable values are: "sudo"
+	TeleportCommandPrefix string
+	// binSudo contains the location for the sudo binary.
+	// Used for testing.
+	binSudo string
+
 	// TeleportArgs is the arguments to pass to the teleport binary.
 	// Eg, 'version'
 	TeleportArgs string
@@ -65,6 +80,13 @@ type OneOffScriptParams struct {
 	// Defaults to v<currentTeleportVersion>
 	// Eg, v13.1.0
 	TeleportVersion string
+
+	// TeleportFlavor is the teleport flavor to download.
+	// Only OSS or Enterprise versions are allowed.
+	// Possible values:
+	// - teleport
+	// - teleport-ent
+	TeleportFlavor string
 
 	// SuccessMessage is a message shown to the user after the one off is completed.
 	SuccessMessage string
@@ -84,16 +106,38 @@ func (p *OneOffScriptParams) CheckAndSetDefaults() error {
 		p.BinMktemp = binMktemp
 	}
 
-	if p.CDNBaseURL == "" {
-		p.CDNBaseURL = teleportCDNLocation
+	if p.binSudo == "" {
+		p.binSudo = "sudo"
 	}
 
 	if p.TeleportVersion == "" {
-		p.TeleportVersion = "v" + teleport.Version
+		p.TeleportVersion = "v" + api.Version
+	}
+
+	if p.CDNBaseURL == "" {
+		p.CDNBaseURL = teleportassets.CDNBaseURL()
+	}
+
+	if p.TeleportFlavor == "" {
+		p.TeleportFlavor = types.PackageNameOSS
+		if modules.GetModules().BuildType() == modules.BuildEnterprise {
+			p.TeleportFlavor = types.PackageNameEnt
+		}
+	}
+	if !slices.Contains(types.PackageNameKinds, p.TeleportFlavor) {
+		return trace.BadParameter("invalid teleport flavor, only %v are supported", types.PackageNameKinds)
 	}
 
 	if p.SuccessMessage == "" {
 		p.SuccessMessage = "Completed successfully."
+	}
+
+	switch p.TeleportCommandPrefix {
+	case PrefixSUDO:
+		p.TeleportCommandPrefix = p.binSudo
+	case "":
+	default:
+		return trace.BadParameter("invalid command prefix %q, only %v are supported", p.TeleportCommandPrefix, allowedCommandPrefix)
 	}
 
 	return nil

@@ -1,16 +1,20 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package lib
 
@@ -18,7 +22,9 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -28,7 +34,8 @@ import (
 
 	"github.com/gravitational/trace"
 	"github.com/julienschmidt/httprouter"
-	log "github.com/sirupsen/logrus"
+
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
 // TLSConfig stores TLS configuration for a http service
@@ -39,7 +46,7 @@ type TLSConfig struct {
 }
 
 // HTTPConfig stores configuration of an HTTP service
-// including it's public address, listen host and port,
+// including its public address, listen host and port,
 // TLS certificate and key path, and extra TLS configuration
 // options, represented as TLSConfig.
 type HTTPConfig struct {
@@ -173,7 +180,7 @@ func NewHTTP(config HTTPConfig) (*HTTP, error) {
 			if verify := config.TLS.VerifyClientCertificateFunc; verify != nil {
 				tlsConfig.VerifyPeerCertificate = func(_ [][]byte, chains [][]*x509.Certificate) error {
 					if err := verify(chains); err != nil {
-						log.WithError(err).Error("HTTPS client certificate verification failed")
+						slog.ErrorContext(context.Background(), "HTTPS client certificate verification failed", "error", err)
 						return err
 					}
 					return nil
@@ -212,7 +219,7 @@ func BuildURLPath(args ...interface{}) string {
 
 // ListenAndServe runs a http(s) server on a provided port.
 func (h *HTTP) ListenAndServe(ctx context.Context) error {
-	defer log.Debug("HTTP server terminated")
+	defer slog.DebugContext(ctx, "HTTP server terminated")
 	var err error
 
 	h.server.BaseContext = func(_ net.Listener) context.Context {
@@ -251,13 +258,13 @@ func (h *HTTP) ListenAndServe(ctx context.Context) error {
 	}
 
 	if h.Insecure {
-		log.Debugf("Starting insecure HTTP server on %s", addr)
+		slog.DebugContext(ctx, "Starting insecure HTTP server", "listen_addr", logutils.StringerAttr(addr))
 		err = h.server.Serve(listener)
 	} else {
-		log.Debugf("Starting secure HTTPS server on %s", addr)
+		slog.DebugContext(ctx, "Starting secure HTTPS server", "listen_addr", logutils.StringerAttr(addr))
 		err = h.server.ServeTLS(listener, h.CertFile, h.KeyFile)
 	}
-	if err == http.ErrServerClosed {
+	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
 	return trace.Wrap(err)
@@ -283,7 +290,7 @@ func (h *HTTP) ServiceJob() ServiceJob {
 	return NewServiceJob(func(ctx context.Context) error {
 		MustGetProcess(ctx).OnTerminate(func(ctx context.Context) error {
 			if err := h.ShutdownWithTimeout(ctx, time.Second*5); err != nil {
-				log.Error("HTTP server graceful shutdown failed")
+				slog.ErrorContext(ctx, "HTTP server graceful shutdown failed")
 				return err
 			}
 			return nil

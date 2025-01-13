@@ -1,18 +1,20 @@
 /*
-Copyright 2015-2018 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package authz
 
@@ -21,22 +23,29 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
+	"os"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 	"github.com/vulcand/predicate/builder"
 
 	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/defaults"
+	clusterconfigpb "github.com/gravitational/teleport/api/gen/proto/go/teleport/clusterconfig/v1"
+	mfav1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/mfa/v1"
+	"github.com/gravitational/teleport/api/mfa"
 	"github.com/gravitational/teleport/api/types"
 	apievents "github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/api/utils"
 	"github.com/gravitational/teleport/api/utils/keys"
 	dtauthz "github.com/gravitational/teleport/lib/devicetrust/authz"
 	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/services/readonly"
 	"github.com/gravitational/teleport/lib/tlsca"
 )
 
@@ -54,17 +63,35 @@ func NewBuiltinRoleContext(role types.SystemRole) (*Context, error) {
 	return authContext, nil
 }
 
+// DeviceAuthorizationOpts captures Device Trust options for [AuthorizerOpts].
+type DeviceAuthorizationOpts struct {
+	// DisableGlobalMode disables the global device_trust.mode toggle.
+	// See [types.DeviceTrust.Mode].
+	DisableGlobalMode bool
+
+	// DisableRoleMode disables the role-based device trust toggle.
+	// See [types.RoleOption.DeviceTrustMode].
+	DisableRoleMode bool
+}
+
 // AuthorizerOpts holds creation options for [NewAuthorizer].
 type AuthorizerOpts struct {
-	ClusterName string
-	AccessPoint AuthorizerAccessPoint
-	LockWatcher *services.LockWatcher
-	Logger      logrus.FieldLogger
+	ClusterName         string
+	AccessPoint         AuthorizerAccessPoint
+	ReadOnlyAccessPoint ReadOnlyAuthorizerAccessPoint
+	MFAAuthenticator    MFAAuthenticator
+	LockWatcher         *services.LockWatcher
+	Logger              *slog.Logger
 
-	// DisableDeviceAuthorization disables device authorization via [Authorizer].
-	// It is meant for services that do explicit device authorization, like the
-	// Auth Server APIs. Most services should not set this field.
-	DisableDeviceAuthorization bool
+	// DeviceAuthorization holds Device Trust authorization options.
+	//
+	// Allows services that either do explicit device authorization or don't (yet)
+	// support device trust to disable it.
+	// Most services should not set this field.
+	DeviceAuthorization DeviceAuthorizationOpts
+	// PermitCaching opts into the authorizer setting up its own internal
+	// caching when ReadOnlyAccessPoint is not provided.
+	PermitCaching bool
 }
 
 // NewAuthorizer returns new authorizer using backends
@@ -77,15 +104,43 @@ func NewAuthorizer(opts AuthorizerOpts) (Authorizer, error) {
 	}
 	logger := opts.Logger
 	if logger == nil {
-		logger = logrus.WithFields(logrus.Fields{trace.Component: "authorizer"})
+		logger = slog.With(teleport.ComponentKey, "authorizer")
 	}
+
+	if opts.ReadOnlyAccessPoint == nil {
+		// we create the read-only access point if not provided in order to keep our
+		// code paths simpler, but the it will not perform ttl-caching unless opts.PermitCaching
+		// was set. This is necessary because the vast majority of our test coverage
+		// cannot handle caching, and will fail if caching is enabled.
+		var err error
+		opts.ReadOnlyAccessPoint, err = readonly.NewCache(readonly.CacheConfig{
+			Upstream: accessPointWrapper{opts.AccessPoint},
+			Disabled: !opts.PermitCaching,
+		})
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+	}
+
 	return &authorizer{
-		clusterName:                opts.ClusterName,
-		accessPoint:                opts.AccessPoint,
-		lockWatcher:                opts.LockWatcher,
-		logger:                     logger,
-		disableDeviceAuthorization: opts.DisableDeviceAuthorization,
+		clusterName:             opts.ClusterName,
+		accessPoint:             opts.AccessPoint,
+		readOnlyAccessPoint:     opts.ReadOnlyAccessPoint,
+		mfaAuthenticator:        opts.MFAAuthenticator,
+		lockWatcher:             opts.LockWatcher,
+		logger:                  logger,
+		disableGlobalDeviceMode: opts.DeviceAuthorization.DisableGlobalMode,
+		disableRoleDeviceMode:   opts.DeviceAuthorization.DisableRoleMode,
 	}, nil
+}
+
+type accessPointWrapper struct {
+	AuthorizerAccessPoint
+}
+
+// GetAccessGraphSettings returns the access graph settings.
+func (accessPointWrapper) GetAccessGraphSettings(ctx context.Context) (*clusterconfigpb.AccessGraphSettings, error) {
+	return nil, trace.NotImplemented("GetAccessGraphSettings is not implemented")
 }
 
 // Authorizer authorizes identity and returns auth context
@@ -110,35 +165,70 @@ type AuthorizerAccessPoint interface {
 	// GetAuthPreference returns the cluster authentication configuration.
 	GetAuthPreference(ctx context.Context) (types.AuthPreference, error)
 
-	// GetRole returns role by name
+	// GetRole returns role by name.
 	GetRole(ctx context.Context, name string) (types.Role, error)
 
-	// GetUser returns a services.User for this cluster.
-	GetUser(name string, withSecrets bool) (types.User, error)
+	// GetUser returns user by name.
+	GetUser(ctx context.Context, name string, withSecrets bool) (types.User, error)
 
-	// GetCertAuthority returns cert authority by id
+	// GetCertAuthority returns cert authority by id.
 	GetCertAuthority(ctx context.Context, id types.CertAuthID, loadKeys bool) (types.CertAuthority, error)
 
-	// GetCertAuthorities returns a list of cert authorities
+	// GetCertAuthorities returns a list of cert authorities.
 	GetCertAuthorities(ctx context.Context, caType types.CertAuthType, loadKeys bool) ([]types.CertAuthority, error)
 
 	// GetClusterAuditConfig returns cluster audit configuration.
-	GetClusterAuditConfig(ctx context.Context, opts ...services.MarshalOption) (types.ClusterAuditConfig, error)
+	GetClusterAuditConfig(ctx context.Context) (types.ClusterAuditConfig, error)
 
 	// GetClusterNetworkingConfig returns cluster networking configuration.
-	GetClusterNetworkingConfig(ctx context.Context, opts ...services.MarshalOption) (types.ClusterNetworkingConfig, error)
+	GetClusterNetworkingConfig(ctx context.Context) (types.ClusterNetworkingConfig, error)
 
 	// GetSessionRecordingConfig returns session recording configuration.
-	GetSessionRecordingConfig(ctx context.Context, opts ...services.MarshalOption) (types.SessionRecordingConfig, error)
+	GetSessionRecordingConfig(ctx context.Context) (types.SessionRecordingConfig, error)
+}
+
+// ReadOnlyAuthorizerAccessPoint is an additional optional access point interface that permits
+// optimized access-control checks by sharing references to frequently accessed configuration
+// objects across goroutines.
+type ReadOnlyAuthorizerAccessPoint interface {
+	// GetReadOnlyAuthPreference returns the cluster authentication configuration.
+	GetReadOnlyAuthPreference(ctx context.Context) (readonly.AuthPreference, error)
+
+	// GetReadOnlyClusterNetworkingConfig returns cluster networking configuration.
+	GetReadOnlyClusterNetworkingConfig(ctx context.Context) (readonly.ClusterNetworkingConfig, error)
+
+	// GetReadOnlySessionRecordingConfig returns session recording configuration.
+	GetReadOnlySessionRecordingConfig(ctx context.Context) (readonly.SessionRecordingConfig, error)
+}
+
+// MFAAuthenticator authenticates MFA responses.
+type MFAAuthenticator interface {
+	// ValidateMFAAuthResponse validates an MFA challenge response.
+	ValidateMFAAuthResponse(ctx context.Context, resp *proto.MFAAuthenticateResponse, user string, requiredExtensions *mfav1.ChallengeExtensions) (*MFAAuthData, error)
+}
+
+// MFAAuthData contains a user's MFA authentication data for a validated MFA response.
+type MFAAuthData struct {
+	// User is the authenticated Teleport User.
+	User string
+	// Device is the user's MFA device used to authenticate.
+	Device *types.MFADevice
+	// AllowReuse determines whether the MFA challenge response used to authenticate
+	// can be reused. AllowReuse MFAAuthData may be denied for specific actions.
+	AllowReuse mfav1.ChallengeAllowReuse
 }
 
 // authorizer creates new local authorizer
 type authorizer struct {
-	clusterName                string
-	accessPoint                AuthorizerAccessPoint
-	lockWatcher                *services.LockWatcher
-	disableDeviceAuthorization bool
-	logger                     logrus.FieldLogger
+	clusterName         string
+	accessPoint         AuthorizerAccessPoint
+	readOnlyAccessPoint ReadOnlyAuthorizerAccessPoint
+	mfaAuthenticator    MFAAuthenticator
+	lockWatcher         *services.LockWatcher
+	logger              *slog.Logger
+
+	disableGlobalDeviceMode bool
+	disableRoleDeviceMode   bool
 }
 
 // Context is authorization context
@@ -160,9 +250,35 @@ type Context struct {
 	// it's identical to Identity.
 	UnmappedIdentity IdentityGetter
 
-	// disableDeviceAuthorization disables device verification.
+	// disableDeviceRoleMode disables role-based device verification.
 	// Inherited from the authorizer that creates the context.
-	disableDeviceAuthorization bool
+	disableDeviceRoleMode bool
+
+	// AdminActionAuthState is the state of admin action authorization for this auth context.
+	AdminActionAuthState AdminActionAuthState
+}
+
+// AdminActionAuthState is an admin action authorization state.
+type AdminActionAuthState int
+
+const (
+	// AdminActionAuthUnauthorized admin action is not authorized.
+	AdminActionAuthUnauthorized AdminActionAuthState = iota
+	// AdminActionAuthNotRequired admin action authorization is not authorized.
+	// This state is used for non-user cases, like internal service roles or Machine ID.
+	AdminActionAuthNotRequired
+	// AdminActionAuthMFAVerified admin action is authorized with MFA verification.
+	AdminActionAuthMFAVerified
+	// AdminActionAuthMFAVerifiedWithReuse admin action is authorized with MFA verification.
+	// The MFA challenged used for verification allows reuse, which may be denied by some
+	// admin actions.
+	AdminActionAuthMFAVerifiedWithReuse
+)
+
+// GetUserMetadata returns information about the authenticated identity
+// to be included in audit events.
+func (c *Context) GetUserMetadata() apievents.UserMetadata {
+	return c.Identity.GetIdentity().GetUserMetadata()
 }
 
 // LockTargets returns a list of LockTargets inferred from the context's
@@ -238,7 +354,7 @@ func (c *Context) WithExtraRoles(access services.RoleGetter, clusterName string,
 
 // GetAccessState returns the AccessState based on the underlying
 // [services.AccessChecker] and [tlsca.Identity].
-func (c *Context) GetAccessState(authPref types.AuthPreference) services.AccessState {
+func (c *Context) GetAccessState(authPref readonly.AuthPreference) services.AccessState {
 	state := c.Checker.GetAccessState(authPref)
 	identity := c.Identity.GetIdentity()
 
@@ -247,14 +363,52 @@ func (c *Context) GetAccessState(authPref types.AuthPreference) services.AccessS
 	_, isService := c.Identity.(BuiltinRole)
 	state.MFAVerified = isService || identity.IsMFAVerified()
 
-	state.EnableDeviceVerification = !c.disableDeviceAuthorization
+	state.EnableDeviceVerification = !c.disableDeviceRoleMode
 	state.DeviceVerified = isService || dtauthz.IsTLSDeviceVerified(&identity.DeviceExtensions)
 
 	return state
 }
 
+// GetDisconnectCertExpiry calculates the proper value for DisconnectExpiredCert
+// based on whether a connection is set to disconnect on cert expiry, and whether
+// the cert is a short-lived (<1m) one issued for an MFA verified session. If the session
+// doesn't need to be disconnected on cert expiry, it will return a zero [time.Time].
+func (c *Context) GetDisconnectCertExpiry(authPref readonly.AuthPreference) time.Time {
+	// In the case where both disconnect_expired_cert and require_session_mfa are enabled,
+	// the PreviousIdentityExpires value of the certificate will be used, which is the
+	// expiry of the certificate used to issue the short-lived MFA verified certificate.
+	//
+	// See https://github.com/gravitational/teleport/issues/18544
+
+	// If the session doesn't need to be disconnected on cert expiry just return the default value.
+	disconnectExpiredCert := authPref.GetDisconnectExpiredCert()
+	if c.Checker != nil {
+		disconnectExpiredCert = c.Checker.AdjustDisconnectExpiredCert(disconnectExpiredCert)
+	}
+
+	if !disconnectExpiredCert {
+		return time.Time{}
+	}
+
+	identity := c.Identity.GetIdentity()
+	if !identity.PreviousIdentityExpires.IsZero() {
+		// If this is a short-lived mfa verified cert, return the certificate extension
+		// that holds its issuing certificates expiry value.
+		return identity.PreviousIdentityExpires
+	}
+
+	// Otherwise, return the current certificates expiration
+	return identity.Expires
+}
+
 // Authorize authorizes user based on identity supplied via context
-func (a *authorizer) Authorize(ctx context.Context) (*Context, error) {
+func (a *authorizer) Authorize(ctx context.Context) (authCtx *Context, err error) {
+	defer func() {
+		if err != nil {
+			err = a.convertAuthorizerError(err)
+		}
+	}()
+
 	if ctx == nil {
 		return nil, trace.AccessDenied("missing authentication context")
 	}
@@ -272,7 +426,7 @@ func (a *authorizer) Authorize(ctx context.Context) (*Context, error) {
 	}
 
 	// Enforce applicable locks.
-	authPref, err := a.accessPoint.GetAuthPreference(ctx)
+	authPref, err := a.readOnlyAccessPoint.GetReadOnlyAuthPreference(ctx)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -288,16 +442,20 @@ func (a *authorizer) Authorize(ctx context.Context) (*Context, error) {
 	}
 
 	// Device Trust: authorize device extensions.
-	if !a.disableDeviceAuthorization {
-		if err := dtauthz.VerifyTLSUser(authPref.GetDeviceTrust(), authContext.Identity.GetIdentity()); err != nil {
+	if !a.disableGlobalDeviceMode {
+		if err := dtauthz.VerifyTLSUser(ctx, authPref.GetDeviceTrust(), authContext.Identity.GetIdentity()); err != nil {
 			return nil, trace.Wrap(err)
 		}
+	}
+
+	if err := a.checkAdminActionVerification(ctx, authContext); err != nil {
+		return nil, trace.Wrap(err)
 	}
 
 	return authContext, nil
 }
 
-func (a *authorizer) enforcePrivateKeyPolicy(ctx context.Context, authContext *Context, authPref types.AuthPreference) error {
+func (a *authorizer) enforcePrivateKeyPolicy(ctx context.Context, authContext *Context, authPref readonly.AuthPreference) error {
 	switch authContext.Identity.(type) {
 	case BuiltinRole, RemoteBuiltinRole:
 		// built in roles do not need to pass private key policies
@@ -307,9 +465,12 @@ func (a *authorizer) enforcePrivateKeyPolicy(ctx context.Context, authContext *C
 	// Check that the required private key policy, defined by roles and auth pref,
 	// is met by this Identity's tls certificate.
 	identityPolicy := authContext.Identity.GetIdentity().PrivateKeyPolicy
-	requiredPolicy := authContext.Checker.PrivateKeyPolicy(authPref.GetPrivateKeyPolicy())
-	if err := requiredPolicy.VerifyPolicy(identityPolicy); err != nil {
+	requiredPolicy, err := authContext.Checker.PrivateKeyPolicy(authPref.GetPrivateKeyPolicy())
+	if err != nil {
 		return trace.Wrap(err)
+	}
+	if !requiredPolicy.IsSatisfiedBy(identityPolicy) {
+		return keys.NewPrivateKeyPolicyError(requiredPolicy)
 	}
 
 	return nil
@@ -318,7 +479,7 @@ func (a *authorizer) enforcePrivateKeyPolicy(ctx context.Context, authContext *C
 func (a *authorizer) fromUser(ctx context.Context, userI interface{}) (*Context, error) {
 	switch user := userI.(type) {
 	case LocalUser:
-		return a.authorizeLocalUser(user)
+		return a.authorizeLocalUser(ctx, user)
 	case RemoteUser:
 		return a.authorizeRemoteUser(ctx, user)
 	case BuiltinRole:
@@ -328,6 +489,140 @@ func (a *authorizer) fromUser(ctx context.Context, userI interface{}) (*Context,
 	default:
 		return nil, trace.AccessDenied("unsupported context type %T", userI)
 	}
+}
+
+// checkAdminActionVerification checks if this auth request is verified for admin actions.
+func (a *authorizer) checkAdminActionVerification(ctx context.Context, authContext *Context) error {
+	required, err := a.isAdminActionAuthorizationRequired(ctx, authContext)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	if !required {
+		authContext.AdminActionAuthState = AdminActionAuthNotRequired
+		return nil
+	}
+
+	if err := a.authorizeAdminAction(ctx, authContext); err != nil {
+		return trace.Wrap(err)
+	}
+
+	return nil
+}
+
+func (a *authorizer) isAdminActionAuthorizationRequired(ctx context.Context, authContext *Context) (bool, error) {
+	// Provide a way to turn off admin MFA requirements in case expected functionality
+	// is disrupted by this requirement, such as for integrations essential to a user
+	// which do not yet make use of a machine ID / AdminRole impersonated identity.
+	//
+	// TODO(Joerger): once we have fully transitioned to requiring machine ID for
+	// integrations and ironed out any bugs with admin MFA, this env var should be removed.
+	if os.Getenv("TELEPORT_UNSTABLE_DISABLE_MFA_ADMIN_ACTIONS") == "yes" {
+		return false, nil
+	}
+
+	// Builtin roles do not require MFA to perform admin actions.
+	switch authContext.Identity.(type) {
+	case BuiltinRole, RemoteBuiltinRole:
+		return false, nil
+	}
+
+	authpref, err := a.readOnlyAccessPoint.GetReadOnlyAuthPreference(ctx)
+	if err != nil {
+		return false, trace.Wrap(err)
+	}
+
+	// Check if this cluster enforces MFA for admin actions.
+	if !authpref.IsAdminActionMFAEnforced() {
+		return false, nil
+	}
+
+	ident := authContext.Identity.GetIdentity()
+	// Skip MFA check if the user is a Bot.
+	if user, err := a.accessPoint.GetUser(ctx, ident.Username, false); err == nil && user.IsBot() {
+		a.logger.DebugContext(ctx, "Skipping admin action MFA check for bot identity", "identity", ident)
+		return false, nil
+	}
+
+	// Skip MFA if the identity is being impersonated by the Bot or Admin built in role.
+	if impersonator := ident.Impersonator; impersonator != "" {
+		impersonatorUser, err := a.accessPoint.GetUser(ctx, impersonator, false)
+		if err == nil && impersonatorUser.IsBot() {
+			a.logger.DebugContext(ctx, "Skipping admin action MFA check for bot-impersonated identity", "identity", ident)
+			return false, nil
+		}
+
+		// If we don't find a user matching the impersonator, it may be the admin role impersonating.
+		// Check that the impersonator matches a host service FQDN - <host-id>.<clustername>
+		if trace.IsNotFound(err) {
+			hostFQDNParts := strings.SplitN(impersonator, ".", 2)
+			if hostFQDNParts[1] == a.clusterName {
+				if _, err := uuid.Parse(hostFQDNParts[0]); err == nil {
+					a.logger.DebugContext(ctx, "Skipping admin action MFA check for admin-impersonated identity", "identity", ident)
+					return false, nil
+				}
+			}
+		}
+	}
+
+	return true, nil
+}
+
+func (a *authorizer) authorizeAdminAction(ctx context.Context, authContext *Context) error {
+	// MFA is required to be passed through the request context.
+	mfaResp, err := mfa.CredentialsFromContext(ctx)
+	if err != nil {
+		if trace.IsNotFound(err) {
+			// missing MFA verification should be a noop.
+			return nil
+		}
+		return trace.Wrap(err)
+	}
+
+	if a.mfaAuthenticator == nil {
+		return trace.Errorf("failed to validate MFA auth response, authorizer missing mfaAuthenticator field")
+	}
+
+	requiredExt := &mfav1.ChallengeExtensions{Scope: mfav1.ChallengeScope_CHALLENGE_SCOPE_ADMIN_ACTION}
+	mfaData, err := a.mfaAuthenticator.ValidateMFAAuthResponse(ctx, mfaResp, authContext.User.GetName(), requiredExt)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	authContext.AdminActionAuthState = AdminActionAuthMFAVerified
+	if mfaData.AllowReuse == mfav1.ChallengeAllowReuse_CHALLENGE_ALLOW_REUSE_YES {
+		authContext.AdminActionAuthState = AdminActionAuthMFAVerifiedWithReuse
+	}
+
+	return nil
+}
+
+// convertAuthorizerError will take an authorizer error and convert it into an error easily
+// handled by gRPC services.
+func (a *authorizer) convertAuthorizerError(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	// propagate connection problem error so we can differentiate
+	// between connection failed and access denied
+	case trace.IsConnectionProblem(err):
+		return trace.ConnectionProblem(err, "failed to connect to the database")
+	case trace.IsNotFound(err):
+		// user not found, wrap error with access denied
+		return trace.Wrap(err, "access denied")
+	case errors.Is(err, ErrIPPinningMissing) || errors.Is(err, ErrIPPinningMismatch) || errors.Is(err, ErrIPPinningNotAllowed):
+		a.logger.WarnContext(context.Background(), "ip pinning requirements not satisfied", "error", err)
+		return trace.Wrap(err)
+	case trace.IsAccessDenied(err):
+		a.logger.WarnContext(context.Background(), "access denied", "error", err)
+	case keys.IsPrivateKeyPolicyError(err):
+		// private key policy errors should be returned to the client
+		// unaltered so that they know to reauthenticate with a valid key.
+		return trace.Unwrap(err)
+	default:
+		a.logger.WarnContext(context.Background(), "Suppressing unknown authz error", "error", err)
+	}
+	return trace.AccessDenied("access denied")
 }
 
 // ErrIPPinningMissing is returned when user cert should be pinned but isn't.
@@ -342,7 +637,7 @@ var ErrIPPinningNotAllowed = trace.AccessDenied("IP pinning is not allowed for c
 
 // CheckIPPinning verifies IP pinning for the identity, using the client IP taken from context.
 // Check is considered successful if no error is returned.
-func CheckIPPinning(ctx context.Context, identity tlsca.Identity, pinSourceIP bool, log logrus.FieldLogger) error {
+func CheckIPPinning(ctx context.Context, identity tlsca.Identity, pinSourceIP bool, log *slog.Logger) error {
 	if identity.PinnedIP == "" {
 		if pinSourceIP {
 			return ErrIPPinningMissing
@@ -350,7 +645,7 @@ func CheckIPPinning(ctx context.Context, identity tlsca.Identity, pinSourceIP bo
 		return nil
 	}
 
-	clientSrcAddr, err := ClientAddrFromContext(ctx)
+	clientSrcAddr, err := ClientSrcAddrFromContext(ctx)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -362,10 +657,10 @@ func CheckIPPinning(ctx context.Context, identity tlsca.Identity, pinSourceIP bo
 
 	if clientIP != identity.PinnedIP {
 		if log != nil {
-			log.WithFields(logrus.Fields{
-				"client_ip": clientIP,
-				"pinned_ip": identity.PinnedIP,
-			}).Debug("Pinned IP and client IP mismatch")
+			log.DebugContext(ctx, "Pinned IP and client IP mismatch",
+				"client_ip", clientIP,
+				"pinned_ip", identity.PinnedIP,
+			)
 		}
 		return ErrIPPinningMismatch
 	}
@@ -373,10 +668,9 @@ func CheckIPPinning(ctx context.Context, identity tlsca.Identity, pinSourceIP bo
 	// For security reason we don't allow such connection for IP pinning because we can't rely on client IP being correct.
 	if clientPort == "0" {
 		if log != nil {
-			log.WithFields(logrus.Fields{
-				"client_ip": clientIP,
-				"pinned_ip": identity.PinnedIP,
-			}).Debug(ErrIPPinningNotAllowed.Error())
+			const msg = "IP pinning is not allowed for connections behind L4 load balancers with " +
+				"PROXY protocol enabled without explicitly setting 'proxy_protocol: on' in the proxy_service and/or auth_service config"
+			log.DebugContext(ctx, msg, "client_ip", clientIP, "pinned_ip", identity.PinnedIP)
 		}
 		return ErrIPPinningMismatch
 	}
@@ -385,8 +679,8 @@ func CheckIPPinning(ctx context.Context, identity tlsca.Identity, pinSourceIP bo
 }
 
 // authorizeLocalUser returns authz context based on the username
-func (a *authorizer) authorizeLocalUser(u LocalUser) (*Context, error) {
-	return ContextForLocalUser(u, a.accessPoint, a.clusterName, a.disableDeviceAuthorization)
+func (a *authorizer) authorizeLocalUser(ctx context.Context, u LocalUser) (*Context, error) {
+	return ContextForLocalUser(ctx, u, a.accessPoint, a.clusterName, a.disableRoleDeviceMode)
 }
 
 // authorizeRemoteUser returns checker based on cert authority roles
@@ -410,7 +704,7 @@ func (a *authorizer) authorizeRemoteUser(ctx context.Context, u RemoteUser) (*Co
 
 	// The user is prefixed with "remote-" and suffixed with cluster name with
 	// the hope that it does not match a real local user.
-	user, err := types.NewUser(fmt.Sprintf("remote-%v-%v", u.Username, u.ClusterName))
+	user, err := types.NewUser(services.UsernameForRemoteCluster(u.Username, u.ClusterName))
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -471,17 +765,17 @@ func (a *authorizer) authorizeRemoteUser(ctx context.Context, u RemoteUser) (*Co
 	}
 
 	return &Context{
-		User:                       user,
-		Checker:                    checker,
-		Identity:                   WrapIdentity(identity),
-		UnmappedIdentity:           u,
-		disableDeviceAuthorization: a.disableDeviceAuthorization,
+		User:                  user,
+		Checker:               checker,
+		Identity:              WrapIdentity(identity),
+		UnmappedIdentity:      u,
+		disableDeviceRoleMode: a.disableRoleDeviceMode,
 	}, nil
 }
 
 // authorizeBuiltinRole authorizes builtin role
 func (a *authorizer) authorizeBuiltinRole(ctx context.Context, r BuiltinRole) (*Context, error) {
-	recConfig, err := a.accessPoint.GetSessionRecordingConfig(ctx)
+	recConfig, err := a.readOnlyAccessPoint.GetReadOnlySessionRecordingConfig(ctx)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -501,6 +795,9 @@ func (a *authorizer) authorizeRemoteBuiltinRole(r RemoteBuiltinRole) (*Context, 
 				AppLabels:        types.Labels{types.Wildcard: []string{types.Wildcard}},
 				DatabaseLabels:   types.Labels{types.Wildcard: []string{types.Wildcard}},
 				KubernetesLabels: types.Labels{types.Wildcard: []string{types.Wildcard}},
+				GitHubPermissions: []types.GitHubPermission{{
+					Organizations: []string{types.Wildcard},
+				}},
 				Rules: []types.Rule{
 					types.NewRule(types.KindNode, services.RO()),
 					types.NewRule(types.KindProxy, services.RO()),
@@ -520,6 +817,7 @@ func (a *authorizer) authorizeRemoteBuiltinRole(r RemoteBuiltinRole) (*Context, 
 					types.NewRule(types.KindInstaller, services.RO()),
 					types.NewRule(types.KindUIConfig, services.RO()),
 					types.NewRule(types.KindDatabaseService, services.RO()),
+					types.NewRule(types.KindGitServer, services.RO()),
 					// this rule allows remote proxy to update the cluster's certificate authorities
 					// during certificates renewal
 					{
@@ -549,11 +847,11 @@ func (a *authorizer) authorizeRemoteBuiltinRole(r RemoteBuiltinRole) (*Context, 
 		AllowedResourceIDs: nil,
 	}, a.clusterName, roleSet)
 	return &Context{
-		User:                       user,
-		Checker:                    checker,
-		Identity:                   r,
-		UnmappedIdentity:           r,
-		disableDeviceAuthorization: a.disableDeviceAuthorization,
+		User:                  user,
+		Checker:               checker,
+		Identity:              r,
+		UnmappedIdentity:      r,
+		disableDeviceRoleMode: a.disableRoleDeviceMode,
 	}, nil
 }
 
@@ -573,6 +871,9 @@ func roleSpecForProxy(clusterName string) types.RoleSpecV6 {
 			DatabaseLabels:        types.Labels{types.Wildcard: []string{types.Wildcard}},
 			DatabaseServiceLabels: types.Labels{types.Wildcard: []string{types.Wildcard}},
 			KubernetesLabels:      types.Labels{types.Wildcard: []string{types.Wildcard}},
+			GitHubPermissions: []types.GitHubPermission{{
+				Organizations: []string{types.Wildcard},
+			}},
 			Rules: []types.Rule{
 				types.NewRule(types.KindProxy, services.RW()),
 				types.NewRule(types.KindOIDCRequest, services.RW()),
@@ -605,6 +906,7 @@ func roleSpecForProxy(clusterName string) types.RoleSpecV6 {
 				types.NewRule(types.KindWebSession, services.RW()),
 				types.NewRule(types.KindWebToken, services.RW()),
 				types.NewRule(types.KindKubeServer, services.RW()),
+				types.NewRule(types.KindKubeWaitingContainer, services.RW()),
 				types.NewRule(types.KindDatabaseServer, services.RO()),
 				types.NewRule(types.KindLock, services.RO()),
 				types.NewRule(types.KindToken, []string{types.VerbRead, types.VerbDelete}),
@@ -616,7 +918,16 @@ func roleSpecForProxy(clusterName string) types.RoleSpecV6 {
 				types.NewRule(types.KindDatabaseService, services.RO()),
 				types.NewRule(types.KindSAMLIdPServiceProvider, services.RO()),
 				types.NewRule(types.KindUserGroup, services.RO()),
+				types.NewRule(types.KindClusterMaintenanceConfig, services.RO()),
+				types.NewRule(types.KindAutoUpdateConfig, services.RO()),
+				types.NewRule(types.KindAutoUpdateVersion, services.RO()),
+				types.NewRule(types.KindAutoUpdateAgentRollout, services.RO()),
 				types.NewRule(types.KindIntegration, append(services.RO(), types.VerbUse)),
+				types.NewRule(types.KindAuditQuery, services.RO()),
+				types.NewRule(types.KindSecurityReport, services.RO()),
+				types.NewRule(types.KindSecurityReportState, services.RO()),
+				types.NewRule(types.KindUserTask, services.RO()),
+				types.NewRule(types.KindGitServer, services.RO()),
 				// this rule allows cloud proxies to read
 				// plugins of `openai` type, since Assist uses the OpenAI API and runs in Proxy.
 				{
@@ -650,7 +961,7 @@ func roleSpecForProxy(clusterName string) types.RoleSpecV6 {
 }
 
 // RoleSetForBuiltinRoles returns RoleSet for embedded builtin role
-func RoleSetForBuiltinRoles(clusterName string, recConfig types.SessionRecordingConfig, roles ...types.SystemRole) (services.RoleSet, error) {
+func RoleSetForBuiltinRoles(clusterName string, recConfig readonly.SessionRecordingConfig, roles ...types.SystemRole) (services.RoleSet, error) {
 	var definitions []types.Role
 	for _, role := range roles {
 		rd, err := definitionForBuiltinRole(clusterName, recConfig, role)
@@ -663,7 +974,7 @@ func RoleSetForBuiltinRoles(clusterName string, recConfig types.SessionRecording
 }
 
 // definitionForBuiltinRole constructs the appropriate role definition for a given builtin role.
-func definitionForBuiltinRole(clusterName string, recConfig types.SessionRecordingConfig, role types.SystemRole) (types.Role, error) {
+func definitionForBuiltinRole(clusterName string, recConfig readonly.SessionRecordingConfig, role types.SystemRole) (types.Role, error) {
 	switch role {
 	case types.RoleAuth:
 		return services.RoleFromSpec(
@@ -707,6 +1018,7 @@ func definitionForBuiltinRole(clusterName string, recConfig types.SessionRecordi
 						types.NewRule(types.KindLock, services.RO()),
 						types.NewRule(types.KindNetworkRestrictions, services.RO()),
 						types.NewRule(types.KindConnectionDiagnostic, services.RW()),
+						types.NewRule(types.KindStaticHostUser, services.RO()),
 					},
 				},
 			})
@@ -734,8 +1046,6 @@ func definitionForBuiltinRole(clusterName string, recConfig types.SessionRecordi
 						types.NewRule(types.KindClusterAuthPreference, services.RO()),
 						types.NewRule(types.KindAppServer, services.RW()),
 						types.NewRule(types.KindApp, services.RO()),
-						types.NewRule(types.KindWebSession, services.RO()),
-						types.NewRule(types.KindWebToken, services.RO()),
 						types.NewRule(types.KindJWT, services.RW()),
 						types.NewRule(types.KindLock, services.RO()),
 					},
@@ -769,6 +1079,8 @@ func definitionForBuiltinRole(clusterName string, recConfig types.SessionRecordi
 						types.NewRule(types.KindSemaphore, services.RW()),
 						types.NewRule(types.KindLock, services.RO()),
 						types.NewRule(types.KindConnectionDiagnostic, services.RW()),
+						types.NewRule(types.KindDatabaseObjectImportRule, services.RO()),
+						types.NewRule(types.KindDatabaseObject, services.RW()),
 					},
 				},
 			})
@@ -809,6 +1121,9 @@ func definitionForBuiltinRole(clusterName string, recConfig types.SessionRecordi
 					DatabaseServiceLabels: types.Labels{types.Wildcard: []string{types.Wildcard}},
 					ClusterLabels:         types.Labels{types.Wildcard: []string{types.Wildcard}},
 					WindowsDesktopLabels:  types.Labels{types.Wildcard: []string{types.Wildcard}},
+					GitHubPermissions: []types.GitHubPermission{{
+						Organizations: []string{types.Wildcard},
+					}},
 					Rules: []types.Rule{
 						types.NewRule(types.Wildcard, services.RW()),
 						types.NewRule(types.KindDevice, append(services.RW(), types.VerbCreateEnrollToken, types.VerbEnroll)),
@@ -833,6 +1148,7 @@ func definitionForBuiltinRole(clusterName string, recConfig types.SessionRecordi
 					KubernetesLabels: types.Labels{types.Wildcard: []string{types.Wildcard}},
 					Rules: []types.Rule{
 						types.NewRule(types.KindKubeServer, services.RW()),
+						types.NewRule(types.KindKubeWaitingContainer, services.RW()),
 						types.NewRule(types.KindEvent, services.RW()),
 						types.NewRule(types.KindCertAuthority, services.ReadNoSecrets()),
 						types.NewRule(types.KindClusterName, services.RO()),
@@ -870,6 +1186,7 @@ func definitionForBuiltinRole(clusterName string, recConfig types.SessionRecordi
 						types.NewRule(types.KindLock, services.RO()),
 						types.NewRule(types.KindWindowsDesktopService, services.RW()),
 						types.NewRule(types.KindWindowsDesktop, services.RW()),
+						types.NewRule(types.KindDynamicWindowsDesktop, services.RW()),
 					},
 				},
 			})
@@ -884,11 +1201,16 @@ func definitionForBuiltinRole(clusterName string, recConfig types.SessionRecordi
 						types.NewRule(types.KindCertAuthority, services.ReadNoSecrets()),
 						types.NewRule(types.KindClusterName, services.RO()),
 						types.NewRule(types.KindNamespace, services.RO()),
-						types.NewRule(types.KindNode, services.RO()),
+						types.NewRule(types.KindNode, services.RW()),
+						types.NewRule(types.KindKubeServer, services.RO()),
 						types.NewRule(types.KindKubernetesCluster, services.RW()),
 						types.NewRule(types.KindDatabase, services.RW()),
 						types.NewRule(types.KindServerInfo, services.RW()),
 						types.NewRule(types.KindApp, services.RW()),
+						types.NewRule(types.KindDiscoveryConfig, services.RO()),
+						types.NewRule(types.KindIntegration, append(services.RO(), types.VerbUse)),
+						types.NewRule(types.KindSemaphore, services.RW()),
+						types.NewRule(types.KindUserTask, services.RW()),
 					},
 					// Discovery service should only access kubes/apps/dbs that originated from discovery.
 					KubernetesLabels: types.Labels{types.OriginLabel: []string{types.OriginCloud}},
@@ -911,14 +1233,33 @@ func definitionForBuiltinRole(clusterName string, recConfig types.SessionRecordi
 						types.NewRule(types.KindEvent, services.RW()),
 						types.NewRule(types.KindAppServer, services.RW()),
 						types.NewRule(types.KindClusterNetworkingConfig, services.RO()),
-						types.NewRule(types.KindUser, services.RO()),
+						types.NewRule(types.KindUser, services.RW()),
 						types.NewRule(types.KindUserGroup, services.RW()),
 						types.NewRule(types.KindOktaImportRule, services.RO()),
 						types.NewRule(types.KindOktaAssignment, services.RW()),
 						types.NewRule(types.KindProxy, services.RO()),
 						types.NewRule(types.KindClusterAuthPreference, services.RO()),
 						types.NewRule(types.KindRole, services.RO()),
-						types.NewRule(types.KindLock, services.RO()),
+						types.NewRule(types.KindLock, services.RW()),
+						types.NewRule(types.KindSAML, services.ReadNoSecrets()),
+						types.NewRule(types.KindAccessList, services.RO()),
+						// Okta can read/write access lists and roles it creates.
+						{
+							Resources: []string{types.KindRole},
+							Verbs:     services.RW(),
+							Where: builder.Equals(
+								builder.Identifier(`resource.metadata.labels["`+types.OriginLabel+`"]`),
+								builder.String(types.OriginOkta),
+							).String(),
+						},
+						{
+							Resources: []string{types.KindAccessList},
+							Verbs:     services.RW(),
+							Where: builder.Equals(
+								builder.Identifier(`resource.metadata.labels["`+types.OriginLabel+`"]`),
+								builder.String(types.OriginOkta),
+							).String(),
+						},
 					},
 				},
 			})
@@ -933,13 +1274,27 @@ func definitionForBuiltinRole(clusterName string, recConfig types.SessionRecordi
 					},
 				},
 			})
+
+	case types.RoleAccessGraphPlugin:
+		// RoleAccessGraphPlugin is a special role that is used by the Access Graph plugins
+		// to access the semaphore resource.
+		return services.RoleFromSpec(
+			role.String(),
+			types.RoleSpecV6{
+				Allow: types.RoleConditions{
+					Namespaces: []string{types.Wildcard},
+					Rules: []types.Rule{
+						types.NewRule(types.KindSemaphore, services.RW()),
+					},
+				},
+			})
 	}
 
 	return nil, trace.NotFound("builtin role %q is not recognized", role.String())
 }
 
 // ContextForBuiltinRole returns a context with the builtin role information embedded.
-func ContextForBuiltinRole(r BuiltinRole, recConfig types.SessionRecordingConfig) (*Context, error) {
+func ContextForBuiltinRole(r BuiltinRole, recConfig readonly.SessionRecordingConfig) (*Context, error) {
 	var systemRoles []types.SystemRole
 	if r.Role == types.RoleInstance {
 		// instance certs encode multiple system roles in a separate field
@@ -972,18 +1327,19 @@ func ContextForBuiltinRole(r BuiltinRole, recConfig types.SessionRecordingConfig
 		AllowedResourceIDs: nil,
 	}, r.ClusterName, roleSet)
 	return &Context{
-		User:                       user,
-		Checker:                    checker,
-		Identity:                   r,
-		UnmappedIdentity:           r,
-		disableDeviceAuthorization: true, // Builtin roles skip device trust.
+		User:                  user,
+		Checker:               checker,
+		Identity:              r,
+		UnmappedIdentity:      r,
+		disableDeviceRoleMode: true,                       // Builtin roles skip device trust.
+		AdminActionAuthState:  AdminActionAuthNotRequired, // builtin roles skip mfa for admin actions.
 	}, nil
 }
 
 // ContextForLocalUser returns a context with the local user info embedded.
-func ContextForLocalUser(u LocalUser, accessPoint AuthorizerAccessPoint, clusterName string, disableDeviceAuthz bool) (*Context, error) {
+func ContextForLocalUser(ctx context.Context, u LocalUser, accessPoint AuthorizerAccessPoint, clusterName string, disableDeviceRoleMode bool) (*Context, error) {
 	// User has to be fetched to check if it's a blocked username
-	user, err := accessPoint.GetUser(u.Username, false)
+	user, err := accessPoint.GetUser(ctx, u.Username, false)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -1006,11 +1362,11 @@ func ContextForLocalUser(u LocalUser, accessPoint AuthorizerAccessPoint, cluster
 	user.SetTraits(accessInfo.Traits)
 
 	return &Context{
-		User:                       user,
-		Checker:                    accessChecker,
-		Identity:                   u,
-		UnmappedIdentity:           u,
-		disableDeviceAuthorization: disableDeviceAuthz,
+		User:                  user,
+		Checker:               accessChecker,
+		Identity:              u,
+		UnmappedIdentity:      u,
+		disableDeviceRoleMode: disableDeviceRoleMode,
 	}, nil
 }
 
@@ -1025,8 +1381,14 @@ const (
 	// contextUser is a user set in the context of the request
 	contextUser contextKey = "teleport-user"
 
-	// contextClientAddr is a client address set in the context of the request
-	contextClientAddr contextKey = "client-addr"
+	// contextClientSrcAddr is a client source address set in the context of the request
+	contextClientSrcAddr contextKey = "teleport-client-src-addr"
+
+	// contextClientDstAddr is a client destination address set in the context of the request
+	contextClientDstAddr contextKey = "teleport-client-dst-addr"
+
+	// contextConn is a connection in the context associated with the request
+	contextConn contextKey = "teleport-connection"
 )
 
 // WithDelegator alias for backwards compatibility
@@ -1121,76 +1483,67 @@ func ClientUserMetadataWithUser(ctx context.Context, user string) apievents.User
 	return meta
 }
 
-// ConvertAuthorizerError will take an authorizer error and convert it into an error easily
-// handled by gRPC services.
-func ConvertAuthorizerError(ctx context.Context, log logrus.FieldLogger, err error) error {
-	switch {
-	case err == nil:
-		return nil
-	// propagate connection problem error so we can differentiate
-	// between connection failed and access denied
-	case trace.IsConnectionProblem(err):
-		return trace.ConnectionProblem(err, "failed to connect to the database")
-	case trace.IsNotFound(err):
-		// user not found, wrap error with access denied
-		return trace.Wrap(err, "access denied")
-	case errors.Is(err, ErrIPPinningMissing) || errors.Is(err, ErrIPPinningMismatch) || errors.Is(err, ErrIPPinningNotAllowed):
-		log.Warn(err)
-		return trace.Wrap(err)
-	case trace.IsAccessDenied(err):
-		// don't print stack trace, just log the warning
-		log.Warn(err)
-	case keys.IsPrivateKeyPolicyError(err):
-		// private key policy errors should be returned to the client
-		// unaltered so that they know to reauthenticate with a valid key.
-		return trace.Unwrap(err)
-	default:
-		log.Warn(trace.DebugReport(err))
+// CheckAccessToKind will ensure that the user has access to the given verbs for the given kind.
+func (c *Context) CheckAccessToKind(kind string, verb string, additionalVerbs ...string) error {
+	ruleCtx := &services.Context{
+		User: c.User,
 	}
-	return trace.AccessDenied("access denied")
+
+	return c.CheckAccessToRule(ruleCtx, kind, verb, additionalVerbs...)
 }
 
-// AuthorizeResourceWithVerbs will ensure that the user has access to the given verbs for the given kind.
-func AuthorizeResourceWithVerbs(ctx context.Context, log logrus.FieldLogger, authorizer Authorizer, quiet bool, resource types.Resource, verbs ...string) (*Context, error) {
-	authCtx, err := authorizer.Authorize(ctx)
-	if err != nil {
-		return nil, ConvertAuthorizerError(ctx, log, err)
-	}
-
+// CheckAccessToResource will ensure that the user has access to the given verbs for the given resource.
+func (c *Context) CheckAccessToResource(resource types.Resource, verb string, additionalVerbs ...string) error {
 	ruleCtx := &services.Context{
-		User:     authCtx.User,
+		User:     c.User,
 		Resource: resource,
 	}
 
-	return AuthorizeContextWithVerbs(ctx, log, authCtx, quiet, ruleCtx, resource.GetKind(), verbs...)
+	return c.CheckAccessToRule(ruleCtx, resource.GetKind(), verb, additionalVerbs...)
 }
 
-// AuthorizeWithVerbs will ensure that the user has access to the given verbs for the given kind.
-func AuthorizeWithVerbs(ctx context.Context, log logrus.FieldLogger, authorizer Authorizer, quiet bool, kind string, verbs ...string) (*Context, error) {
-	authCtx, err := authorizer.Authorize(ctx)
-	if err != nil {
-		return nil, ConvertAuthorizerError(ctx, log, err)
+// CheckAccessToRule will ensure that the user has access to the given verbs for the given [services.Context] and kind.
+// Prefer to use [Context.CheckAccessToKind] or [Context.CheckAccessToResource] for common checks.
+func (c *Context) CheckAccessToRule(ruleCtx *services.Context, kind string, verb string, additionalVerbs ...string) error {
+	var errs []error
+	for _, verb := range append(additionalVerbs, verb) {
+		if err := c.Checker.CheckAccessToRule(ruleCtx, defaults.Namespace, kind, verb); err != nil {
+			errs = append(errs, err)
+		}
 	}
 
-	ruleCtx := &services.Context{
-		User: authCtx.User,
-	}
-
-	return AuthorizeContextWithVerbs(ctx, log, authCtx, quiet, ruleCtx, kind, verbs...)
+	return trace.NewAggregate(errs...)
 }
 
-// AuthorizeContextWithVerbs will ensure that the user has access to the given verbs for the given services.context.
-func AuthorizeContextWithVerbs(ctx context.Context, log logrus.FieldLogger, authCtx *Context, quiet bool, ruleCtx *services.Context, kind string, verbs ...string) (*Context, error) {
-	errs := make([]error, len(verbs))
-	for i, verb := range verbs {
-		errs[i] = authCtx.Checker.CheckAccessToRule(ruleCtx, defaults.Namespace, kind, verb, quiet)
+// AuthorizeAdminAction will ensure that the user is authorized to perform admin actions.
+// MFA challenges that allow reuse will not be accepted.
+//
+// In the majority of cases, allowing reuse is ok and can result in better UX. Forbidding
+// reuse should be reserved for critical actions (e.g. CA rotation, cert generation) and
+// other actions that are not expected to be performed in bulk (e.g. access request reviews).
+//
+// See https://github.com/gravitational/teleport/blob/master/rfd/0155-scoped-webauthn-credentials.md#when-to-extend-reuse
+func (c *Context) AuthorizeAdminAction() error {
+	switch c.AdminActionAuthState {
+	case AdminActionAuthMFAVerified, AdminActionAuthNotRequired:
+		return nil
 	}
+	return trace.Wrap(&mfa.ErrAdminActionMFARequired)
+}
 
-	// Convert generic aggregate error to AccessDenied (auth_with_roles also does this).
-	if err := trace.NewAggregate(errs...); err != nil {
-		return nil, trace.AccessDenied(err.Error())
+// AuthorizeAdminActionAllowReusedMFA will ensure that the user is authorized to perform
+// admin actions. MFA challenges that allow reuse will be accepted.
+//
+// In the majority of cases, allowing reuse is ok and can result in better UX. Forbidding
+// reuse should be reserved for critical actions (e.g. CA rotation, cert generation) and
+// other actions that are not expected to be performed in bulk (e.g. access request reviews).
+//
+// See https://github.com/gravitational/teleport/blob/master/rfd/0155-scoped-webauthn-credentials.md#when-to-extend-reuse
+func (c *Context) AuthorizeAdminActionAllowReusedMFA() error {
+	if c.AdminActionAuthState == AdminActionAuthMFAVerifiedWithReuse {
+		return nil
 	}
-	return authCtx, nil
+	return c.AuthorizeAdminAction()
 }
 
 // LocalUser is a local user
@@ -1338,25 +1691,71 @@ func ContextWithUserCertificate(ctx context.Context, cert *x509.Certificate) con
 
 // UserCertificateFromContext returns the user certificate from the context.
 func UserCertificateFromContext(ctx context.Context) (*x509.Certificate, error) {
+	if ctx == nil {
+		return nil, trace.BadParameter("context is nil")
+	}
 	cert, ok := ctx.Value(contextUserCertificate).(*x509.Certificate)
 	if !ok {
-		return nil, trace.BadParameter("expected type *x509.Certificate, got %T", cert)
+		return nil, trace.BadParameter("user certificate was not found in the context")
 	}
 	return cert, nil
 }
 
-// ContextWithClientAddr returns the context with the address embedded.
-func ContextWithClientAddr(ctx context.Context, addr net.Addr) context.Context {
-	return context.WithValue(ctx, contextClientAddr, addr)
+// ContextWithClientSrcAddr returns the context with the address embedded.
+func ContextWithClientSrcAddr(ctx context.Context, addr net.Addr) context.Context {
+	if ctx == nil {
+		return nil
+	}
+	return context.WithValue(ctx, contextClientSrcAddr, addr)
 }
 
-// ClientAddrFromContext returns the client address from the context.
-func ClientAddrFromContext(ctx context.Context) (net.Addr, error) {
-	addr, ok := ctx.Value(contextClientAddr).(net.Addr)
+// ClientSrcAddrFromContext returns the client address from the context.
+func ClientSrcAddrFromContext(ctx context.Context) (net.Addr, error) {
+	if ctx == nil {
+		return nil, trace.BadParameter("context is nil")
+	}
+	addr, ok := ctx.Value(contextClientSrcAddr).(net.Addr)
 	if !ok {
-		return nil, trace.BadParameter("expected type net.Addr, got %T", addr)
+		return nil, trace.BadParameter("client source address was not found in the context")
 	}
 	return addr, nil
+}
+
+// ContextWithClientAddrs returns the context with the client source and destination addresses embedded.
+func ContextWithClientAddrs(ctx context.Context, src, dst net.Addr) context.Context {
+	if ctx == nil {
+		return nil
+	}
+	ctx = context.WithValue(ctx, contextClientSrcAddr, src)
+	return context.WithValue(ctx, contextClientDstAddr, dst)
+}
+
+// ClientAddrsFromContext returns the client address from the context.
+func ClientAddrsFromContext(ctx context.Context) (src net.Addr, dst net.Addr) {
+	if ctx == nil {
+		return nil, nil
+	}
+	src, _ = ctx.Value(contextClientSrcAddr).(net.Addr)
+	dst, _ = ctx.Value(contextClientDstAddr).(net.Addr)
+	return
+}
+
+func ContextWithConn(ctx context.Context, conn net.Conn) context.Context {
+	if ctx == nil {
+		return nil
+	}
+	return context.WithValue(ctx, contextConn, conn)
+}
+
+func ConnFromContext(ctx context.Context) (net.Conn, error) {
+	if ctx == nil {
+		return nil, trace.BadParameter("context is nil")
+	}
+	conn, ok := ctx.Value(contextConn).(net.Conn)
+	if !ok {
+		return nil, trace.NotFound("connection was not found in the context")
+	}
+	return conn, nil
 }
 
 // ContextWithUser returns the context with the user embedded.
@@ -1366,9 +1765,12 @@ func ContextWithUser(ctx context.Context, user IdentityGetter) context.Context {
 
 // UserFromContext returns the user from the context.
 func UserFromContext(ctx context.Context) (IdentityGetter, error) {
+	if ctx == nil {
+		return nil, trace.BadParameter("context is nil")
+	}
 	user, ok := ctx.Value(contextUser).(IdentityGetter)
 	if !ok {
-		return nil, trace.BadParameter("expected type IdentityGetter, got %T", user)
+		return nil, trace.BadParameter("user identity was not found in the context")
 	}
 	return user, nil
 }
@@ -1388,14 +1790,24 @@ func HasBuiltinRole(authContext Context, name string) bool {
 
 // IsLocalUser checks if the identity is a local user.
 func IsLocalUser(authContext Context) bool {
-	_, ok := authContext.Identity.(LocalUser)
+	_, ok := authContext.UnmappedIdentity.(LocalUser)
 	return ok
 }
 
 // IsLocalOrRemoteUser checks if the identity is either a local or remote user.
 func IsLocalOrRemoteUser(authContext Context) bool {
-	switch authContext.Identity.(type) {
+	switch authContext.UnmappedIdentity.(type) {
 	case LocalUser, RemoteUser:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsLocalOrRemoteService checks if the identity is either a local or remote service.
+func IsLocalOrRemoteService(authContext Context) bool {
+	switch authContext.UnmappedIdentity.(type) {
+	case BuiltinRole, RemoteBuiltinRole:
 		return true
 	default:
 		return false
@@ -1409,6 +1821,20 @@ func IsCurrentUser(authContext Context, username string) bool {
 
 // IsRemoteUser checks if the identity is a remote user.
 func IsRemoteUser(authContext Context) bool {
-	_, ok := authContext.Identity.(RemoteUser)
+	_, ok := authContext.UnmappedIdentity.(RemoteUser)
 	return ok
+}
+
+// ConnectionMetadata returns a ConnectionMetadata suitable for events caused by
+// a remote client making a call. If ctx didn't pass through auth middleware or
+// did not come from an HTTP request, empty metadata is returned.
+func ConnectionMetadata(ctx context.Context) apievents.ConnectionMetadata {
+	remoteAddr, err := ClientSrcAddrFromContext(ctx)
+	if err != nil {
+		return apievents.ConnectionMetadata{}
+	}
+
+	return apievents.ConnectionMetadata{
+		RemoteAddr: remoteAddr.String(),
+	}
 }

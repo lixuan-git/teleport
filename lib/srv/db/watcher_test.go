@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package db
 
@@ -281,21 +283,32 @@ func setDiscoveryGroupLabel(r types.ResourceWithLabels, discoveryGroup string) {
 	r.SetStaticLabels(staticLabels)
 }
 
+func setDiscoveryTypeLabel(r types.ResourceWithLabels, matcherType string) {
+	staticLabels := r.GetStaticLabels()
+	if staticLabels == nil {
+		staticLabels = make(map[string]string)
+	}
+	staticLabels[types.DiscoveryTypeLabel] = matcherType
+	r.SetStaticLabels(staticLabels)
+}
+
 // TestWatcherCloudFetchers tests usage of discovery database fetchers by the
 // database service.
 func TestWatcherCloudFetchers(t *testing.T) {
 	// Test an AWS fetcher. Note that status AWS can be set by Metadata
 	// service.
 	redshiftServerlessWorkgroup := mocks.RedshiftServerlessWorkgroup("discovery-aws", "us-east-1")
-	redshiftServerlessDatabase, err := services.NewDatabaseFromRedshiftServerlessWorkgroup(redshiftServerlessWorkgroup, nil)
+	redshiftServerlessDatabase, err := discovery.NewDatabaseFromRedshiftServerlessWorkgroup(redshiftServerlessWorkgroup, nil)
 	require.NoError(t, err)
 	redshiftServerlessDatabase.SetStatusAWS(redshiftServerlessDatabase.GetAWS())
 	setDiscoveryGroupLabel(redshiftServerlessDatabase, "")
+	setDiscoveryTypeLabel(redshiftServerlessDatabase, types.AWSMatcherRedshiftServerless)
 	redshiftServerlessDatabase.SetOrigin(types.OriginCloud)
-	discovery.ApplyAWSDatabaseNameSuffix(redshiftServerlessDatabase, services.AWSMatcherRedshiftServerless)
+	discovery.ApplyAWSDatabaseNameSuffix(redshiftServerlessDatabase, types.AWSMatcherRedshiftServerless)
 	// Test an Azure fetcher.
 	azSQLServer, azSQLServerDatabase := makeAzureSQLServer(t, "discovery-azure", "group")
 	setDiscoveryGroupLabel(azSQLServerDatabase, "")
+	setDiscoveryTypeLabel(azSQLServerDatabase, types.AzureMatcherSQLServer)
 	azSQLServerDatabase.SetOrigin(types.OriginCloud)
 	ctx := context.Background()
 	testCtx := setupTestContext(ctx, t)
@@ -307,7 +320,6 @@ func TestWatcherCloudFetchers(t *testing.T) {
 			reconcileCh <- d
 		},
 		CloudClients: &clients.TestCloudClients{
-			RDS: &mocks.RDSMockUnauth{}, // Access denied error should not affect other fetchers.
 			RedshiftServerless: &mocks.RedshiftServerlessMock{
 				Workgroups: []*redshiftserverless.Workgroup{redshiftServerlessWorkgroup},
 			},
@@ -318,11 +330,11 @@ func TestWatcherCloudFetchers(t *testing.T) {
 		},
 		AzureMatchers: []types.AzureMatcher{{
 			Subscriptions: []string{"sub"},
-			Types:         []string{services.AzureMatcherSQLServer},
+			Types:         []string{types.AzureMatcherSQLServer},
 			ResourceTags:  types.Labels{types.Wildcard: []string{types.Wildcard}},
 		}},
 		AWSMatchers: []types.AWSMatcher{{
-			Types:   []string{services.AWSMatcherRDS, services.AWSMatcherRedshiftServerless},
+			Types:   []string{types.AWSMatcherRDS, types.AWSMatcherRedshiftServerless},
 			Regions: []string{"us-east-1"},
 			Tags:    types.Labels{types.Wildcard: []string{types.Wildcard}},
 		}},
@@ -341,11 +353,11 @@ func assertReconciledResource(t *testing.T, ch chan types.Databases, databases t
 		sort.Sort(d)
 		require.Equal(t, len(d), len(databases))
 		require.Empty(t, cmp.Diff(databases, d,
-			cmpopts.IgnoreFields(types.Metadata{}, "ID"),
+			cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
 			cmpopts.IgnoreFields(types.DatabaseStatusV3{}, "CACert"),
 		))
 	case <-time.After(time.Second):
-		t.Fatal("Didn't receive reconcile event after 1s.")
+		require.FailNow(t, "Didn't receive reconcile event after 1s.")
 	}
 }
 
@@ -403,8 +415,8 @@ func makeAzureSQLServer(t *testing.T, name, group string) (*armsql.Server, types
 			FullyQualifiedDomainName: to.Ptr("localhost"),
 		},
 	}
-	database, err := services.NewDatabaseFromAzureSQLServer(server)
+	database, err := discovery.NewDatabaseFromAzureSQLServer(server)
 	require.NoError(t, err)
-	discovery.ApplyAzureDatabaseNameSuffix(database, services.AzureMatcherSQLServer)
+	discovery.ApplyAzureDatabaseNameSuffix(database, types.AzureMatcherSQLServer)
 	return server, database
 }

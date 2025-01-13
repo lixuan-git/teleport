@@ -1,130 +1,141 @@
 /*
-Copyright 2016-2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package utils
 
 import (
 	"bytes"
+	"context"
 	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	stdlog "log"
+	"log/slog"
 	"os"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"unicode"
 
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
+	"golang.org/x/term"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/constants"
 	"github.com/gravitational/teleport/api/types"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
+// LoggingPurpose specifies which kind of application logging is
+// to be configured for.
 type LoggingPurpose int
 
 const (
+	// LoggingForDaemon configures logging for non-user interactive applications (teleport, tbot, tsh deamon).
 	LoggingForDaemon LoggingPurpose = iota
+	// LoggingForCLI configures logging for user face utilities (tctl, tsh).
 	LoggingForCLI
 )
 
-// InitLogger configures the global logger for a given purpose / verbosity level
-func InitLogger(purpose LoggingPurpose, level logrus.Level, verbose ...bool) {
-	logrus.StandardLogger().ReplaceHooks(make(logrus.LevelHooks))
-	logrus.SetLevel(level)
-	switch purpose {
-	case LoggingForCLI:
-		// If debug logging was asked for on the CLI, then write logs to stderr.
-		// Otherwise, discard all logs.
-		if level == logrus.DebugLevel {
-			debugFormatter := NewDefaultTextFormatter(trace.IsTerminal(os.Stderr))
-			debugFormatter.timestampEnabled = true
-			logrus.SetFormatter(debugFormatter)
-			logrus.SetOutput(os.Stderr)
-		} else {
-			logrus.SetOutput(io.Discard)
-		}
-	case LoggingForDaemon:
-		logrus.SetFormatter(NewDefaultTextFormatter(trace.IsTerminal(os.Stderr)))
-		logrus.SetOutput(os.Stderr)
+// LoggingFormat defines the possible logging output formats.
+type LoggingFormat = string
+
+const (
+	// LogFormatJSON configures logs to be emitted in json.
+	LogFormatJSON LoggingFormat = "json"
+	// LogFormatText configures logs to be emitted in a human readable text format.
+	LogFormatText LoggingFormat = "text"
+)
+
+type logOpts struct {
+	format LoggingFormat
+}
+
+// LoggerOption enables customizing the global logger.
+type LoggerOption func(opts *logOpts)
+
+// WithLogFormat initializes the default logger with the provided format.
+func WithLogFormat(format LoggingFormat) LoggerOption {
+	return func(opts *logOpts) {
+		opts.format = format
 	}
 }
+
+// IsTerminal checks whether writer is a terminal
+func IsTerminal(w io.Writer) bool {
+	switch v := w.(type) {
+	case *os.File:
+		return term.IsTerminal(int(v.Fd()))
+	default:
+		return false
+	}
+}
+
+// InitLogger configures the global logger for a given purpose / verbosity level
+func InitLogger(purpose LoggingPurpose, level slog.Level, opts ...LoggerOption) {
+	var o logOpts
+
+	for _, opt := range opts {
+		opt(&o)
+	}
+
+	// If debug or trace logging is not enabled for CLIs,
+	// then discard all log output.
+	if purpose == LoggingForCLI && level > slog.LevelDebug {
+		slog.SetDefault(slog.New(logutils.DiscardHandler{}))
+		return
+	}
+
+	logutils.Initialize(logutils.Config{
+		Severity:     level.String(),
+		Format:       o.format,
+		EnableColors: IsTerminal(os.Stderr),
+	})
+}
+
+var initTestLoggerOnce = sync.Once{}
 
 // InitLoggerForTests initializes the standard logger for tests.
 func InitLoggerForTests() {
-	// Parse flags to check testing.Verbose().
-	flag.Parse()
+	initTestLoggerOnce.Do(func() {
+		// Parse flags to check testing.Verbose().
+		flag.Parse()
 
-	logger := logrus.StandardLogger()
-	logger.ReplaceHooks(make(logrus.LevelHooks))
-	logrus.SetFormatter(NewTestJSONFormatter())
-	logger.SetLevel(logrus.DebugLevel)
-	logger.SetOutput(os.Stderr)
-	if testing.Verbose() {
-		return
-	}
-	logger.SetLevel(logrus.WarnLevel)
-	logger.SetOutput(io.Discard)
+		if !testing.Verbose() {
+			slog.SetDefault(slog.New(logutils.DiscardHandler{}))
+			return
+		}
+
+		logutils.Initialize(logutils.Config{
+			Severity: slog.LevelDebug.String(),
+			Format:   LogFormatJSON,
+		})
+	})
 }
 
-// NewLoggerForTests creates a new logger for test environment
-func NewLoggerForTests() *logrus.Logger {
-	logger := logrus.New()
-	logger.ReplaceHooks(make(logrus.LevelHooks))
-	logger.SetFormatter(NewTestJSONFormatter())
-	logger.SetLevel(logrus.DebugLevel)
-	logger.SetOutput(os.Stderr)
-	return logger
-}
-
-// WrapLogger wraps an existing logger entry and returns
-// an value satisfying the Logger interface
-func WrapLogger(logger *logrus.Entry) Logger {
-	return &logWrapper{Entry: logger}
-}
-
-// NewLogger creates a new empty logger
-func NewLogger() *logrus.Logger {
-	logger := logrus.New()
-	logger.SetFormatter(NewDefaultTextFormatter(trace.IsTerminal(os.Stderr)))
-	return logger
-}
-
-// Logger describes a logger value
-type Logger interface {
-	logrus.FieldLogger
-	// GetLevel specifies the level at which this logger
-	// value is logging
-	GetLevel() logrus.Level
-	// SetLevel sets the logger's level to the specified value
-	SetLevel(level logrus.Level)
-}
-
-// FieldLoggerWithWriter describes a logger that can expose a writer
-// to be used by stdlib loggers.
-type FieldLoggerWithWriter interface {
-	logrus.FieldLogger
-	Writer() *io.PipeWriter
-	WriterLevel(logrus.Level) *io.PipeWriter
+// NewSlogLoggerForTests creates a new slog logger for test environments.
+func NewSlogLoggerForTests() *slog.Logger {
+	InitLoggerForTests()
+	return slog.Default()
 }
 
 // FatalError is for CLI front-ends: it detects gravitational/trace debugging
@@ -145,7 +156,7 @@ func GetIterations() int {
 	if err != nil {
 		panic(err)
 	}
-	logrus.Debugf("Starting tests with %v iterations.", iter)
+	slog.DebugContext(context.Background(), "Running tests multiple times due to presence of ITERATIONS environment variable", "iterations", iter)
 	return iter
 }
 
@@ -156,7 +167,7 @@ func UserMessageFromError(err error) string {
 	if err == nil {
 		return ""
 	}
-	if logrus.IsLevelEnabled(logrus.DebugLevel) {
+	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
 		return trace.DebugReport(err)
 	}
 	var buf bytes.Buffer
@@ -177,19 +188,13 @@ func UserMessageFromError(err error) string {
 // The error message is escaped if necessary. A newline is added if the error text
 // does not end with a newline.
 func FormatErrorWithNewline(err error) string {
-	message := formatError(err)
+	var buf bytes.Buffer
+	formatErrorWriter(err, &buf)
+	message := buf.String()
 	if !strings.HasSuffix(message, "\n") {
 		message = message + "\n"
 	}
 	return message
-}
-
-// formatError returns user friendly error message from error.
-// The error message is escaped if necessary
-func formatError(err error) string {
-	var buf bytes.Buffer
-	formatErrorWriter(err, &buf)
-	return buf.String()
 }
 
 // formatErrorWriter formats the specified error into the provided writer.
@@ -202,22 +207,15 @@ func formatErrorWriter(err error, w io.Writer) {
 		fmt.Fprintln(w, certErr)
 		return
 	}
-	// If the error is a trace error, check if it has a user message embedded in
-	// it, if it does, print it, otherwise escape and print the original error.
-	if traceErr, ok := err.(*trace.TraceErr); ok {
-		for _, message := range traceErr.Messages {
-			fmt.Fprintln(w, AllowWhitespace(message))
-		}
-		fmt.Fprintln(w, AllowWhitespace(trace.Unwrap(traceErr).Error()))
+
+	msg := trace.UserMessage(err)
+	// Error can be of type trace.proxyError where error message didn't get captured.
+	if msg == "" {
+		fmt.Fprintln(w, "please check Teleport's log for more details")
 		return
 	}
-	strErr := err.Error()
-	// Error can be of type trace.proxyError where error message didn't get captured.
-	if strErr == "" {
-		fmt.Fprintln(w, "please check Teleport's log for more details")
-	} else {
-		fmt.Fprintln(w, AllowWhitespace(err.Error()))
-	}
+
+	fmt.Fprintln(w, AllowWhitespace(msg))
 }
 
 func formatCertError(err error) string {
@@ -409,47 +407,6 @@ func AllowWhitespace(s string) string {
 		i += sepIdx
 	}
 	return sb.String()
-}
-
-// NewStdlogger creates a new stdlib logger that uses the specified leveled logger
-// for output and the given component as a logging prefix.
-func NewStdlogger(logger LeveledOutputFunc, component string) *stdlog.Logger {
-	return stdlog.New(&stdlogAdapter{
-		log: logger,
-	}, component, stdlog.LstdFlags)
-}
-
-// Write writes the specified buffer p to the underlying leveled logger.
-// Implements io.Writer
-func (r *stdlogAdapter) Write(p []byte) (n int, err error) {
-	r.log(string(p))
-	return len(p), nil
-}
-
-// stdlogAdapter is an io.Writer that writes into an instance
-// of logrus.Logger
-type stdlogAdapter struct {
-	log LeveledOutputFunc
-}
-
-// LeveledOutputFunc describes a function that emits given
-// arguments at a specific level to an underlying logger
-type LeveledOutputFunc func(args ...interface{})
-
-// GetLevel returns the level of the underlying logger
-func (r *logWrapper) GetLevel() logrus.Level {
-	return r.Entry.Logger.GetLevel()
-}
-
-// SetLevel sets the logging level to the given value
-func (r *logWrapper) SetLevel(level logrus.Level) {
-	r.Entry.Logger.SetLevel(level)
-}
-
-// logWrapper wraps a log entry.
-// Implements Logger
-type logWrapper struct {
-	*logrus.Entry
 }
 
 // needsQuoting returns true if any non-printable characters are found.

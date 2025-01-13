@@ -1,24 +1,25 @@
 /*
-Copyright 2015-2017 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package common
 
 import (
 	"context"
-	"errors"
 	"path/filepath"
 	"testing"
 
@@ -26,10 +27,12 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/lib/config"
 	"github.com/gravitational/teleport/lib/service/servicecfg"
 	"github.com/gravitational/teleport/lib/utils"
 	toolcommon "github.com/gravitational/teleport/tool/common"
 	"github.com/gravitational/teleport/tool/tctl/common"
+	tctlcfg "github.com/gravitational/teleport/tool/tctl/common/config"
 )
 
 func TestLoadConfigFromProfile(t *testing.T) {
@@ -52,41 +55,37 @@ func TestLoadConfigFromProfile(t *testing.T) {
 		"login",
 		"--insecure",
 		"--debug",
-		"--auth", connector.GetName(),
 		"--proxy", proxyAddr.String(),
-	}, setHomePath(tmpHomePath), CliOption(func(cf *CLIConf) error {
-		cf.MockSSOLogin = mockSSOLogin(t, authServer, alice)
-		return nil
-	}))
+	}, setHomePath(tmpHomePath), setMockSSOLogin(authServer, alice, connector.GetName()))
 	require.NoError(t, err)
 
 	tests := []struct {
 		name string
-		ccf  *common.GlobalCLIFlags
+		ccf  *tctlcfg.GlobalCLIFlags
 		cfg  *servicecfg.Config
 		want error
 	}{
 		{
 			name: "teleportHome is valid dir",
-			ccf:  &common.GlobalCLIFlags{},
+			ccf:  &tctlcfg.GlobalCLIFlags{},
 			cfg: &servicecfg.Config{
 				TeleportHome: tmpHomePath,
 			},
 			want: nil,
 		}, {
 			name: "teleportHome is nonexistent dir",
-			ccf:  &common.GlobalCLIFlags{},
+			ccf:  &tctlcfg.GlobalCLIFlags{},
 			cfg: &servicecfg.Config{
 				TeleportHome: "some/dir/that/does/not/exist",
 			},
-			want: trace.NotFound("profile is not found"),
+			want: trace.NotFound("current-profile is not set"),
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := common.LoadConfigFromProfile(tc.ccf, tc.cfg)
+			_, err := tctlcfg.LoadConfigFromProfile(tc.ccf, tc.cfg)
 			if tc.want != nil {
-				require.Error(t, err, tc.want)
+				require.ErrorIs(t, err, tc.want)
 				return
 			}
 			require.NoError(t, err)
@@ -114,12 +113,8 @@ func TestRemoteTctlWithProfile(t *testing.T) {
 		"login",
 		"--insecure",
 		"--debug",
-		"--auth", connector.GetName(),
 		"--proxy", proxyAddr.String(),
-	}, setHomePath(tmpHomePath), CliOption(func(cf *CLIConf) error {
-		cf.MockSSOLogin = mockSSOLogin(t, authServer, alice)
-		return nil
-	}))
+	}, setHomePath(tmpHomePath), setMockSSOLogin(authServer, alice, connector.GetName()))
 	require.NoError(t, err)
 
 	t.Setenv(types.HomeEnvVar, tmpHomePath)
@@ -148,7 +143,7 @@ func TestRemoteTctlWithProfile(t *testing.T) {
 			err := common.TryRun(tt.commands, tt.args)
 			if tt.wantErrContains != "" {
 				var exitError *toolcommon.ExitCodeError
-				require.True(t, errors.As(err, &exitError))
+				require.ErrorAs(t, err, &exitError)
 				require.ErrorContains(t, err, tt.wantErrContains)
 				return
 			}
@@ -176,24 +171,44 @@ func TestSetAuthServerFlagWhileLoggedIn(t *testing.T) {
 	proxyAddr, err := proxyProcess.ProxyWebAddr()
 	require.NoError(t, err)
 
+	// we wont actually run this agent, just make a config file to test with.
+	fileConfigAgent := &config.FileConfig{
+		Global: config.Global{
+			DataDir: t.TempDir(),
+		},
+		Auth: config.Auth{
+			Service: config.Service{
+				EnabledFlag:   "false",
+				ListenAddress: authProcess.Config.Auth.ListenAddr.String(),
+			},
+		},
+		SSH: config.SSH{
+			Service: config.Service{
+				EnabledFlag: "true",
+			},
+		},
+	}
+
 	err = Run(context.Background(), []string{
 		"login",
 		"--insecure",
 		"--debug",
-		"--auth", connector.GetName(),
 		"--proxy", proxyAddr.String(),
-	}, setHomePath(tmpHomePath), CliOption(func(cf *CLIConf) error {
-		cf.MockSSOLogin = mockSSOLogin(t, authServer, alice)
-		return nil
-	}))
+	}, setHomePath(tmpHomePath), setMockSSOLogin(authServer, alice, connector.GetName()))
 	require.NoError(t, err)
 	// we're now logged in with a profile in tmpHomePath.
 
 	tests := []struct {
 		desc           string
 		authServerFlag []string
+		configFileFlag string
 		want           []utils.NetAddr
 	}{
+		{
+			desc:           "ignores agent config file and loads profile setting",
+			configFileFlag: mustWriteFileConfig(t, fileConfigAgent),
+			want:           []utils.NetAddr{*proxyAddr},
+		},
 		{
 			desc: "sets default web proxy addr without auth server flag",
 			want: []utils.NetAddr{*proxyAddr},
@@ -217,8 +232,9 @@ func TestSetAuthServerFlagWhileLoggedIn(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.desc, func(t *testing.T) {
-			ccf := &common.GlobalCLIFlags{}
+			ccf := &tctlcfg.GlobalCLIFlags{}
 			ccf.AuthServerAddr = tt.authServerFlag
+			ccf.ConfigFile = tt.configFileFlag
 
 			cfg := &servicecfg.Config{}
 			cfg.TeleportHome = tmpHomePath
@@ -226,7 +242,7 @@ func TestSetAuthServerFlagWhileLoggedIn(t *testing.T) {
 			// ApplyConfig will try to read local auth server identity if the profile is not found.
 			cfg.DataDir = authProcess.Config.DataDir
 
-			_, err = common.ApplyConfig(ccf, cfg)
+			_, err = tctlcfg.ApplyConfig(ccf, cfg)
 			require.NoError(t, err)
 			require.NotEmpty(t, cfg.AuthServerAddresses(), "auth servers should be set to a non-empty default if not specified")
 

@@ -1,25 +1,24 @@
-/*
-Copyright 2019-2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React from 'react';
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 import FormLogin, { Props } from './FormLogin';
 
 const props: Props = {
-  title: 'Custom Title',
   attempt: {
     isFailed: false,
     isSuccess: false,
@@ -34,7 +33,6 @@ const props: Props = {
   auth2faType: 'off',
   primaryAuthType: 'local',
   isPasswordlessEnabled: false,
-  privateKeyPolicyEnabled: false,
 };
 
 export default {
@@ -73,7 +71,6 @@ export const LocalWithOnAndPwdless = () => (
 export const Cloud = () => (
   <FormLogin
     {...props}
-    title="Teleport Cloud"
     auth2faType="on"
     isRecoveryEnabled={true}
     onRecover={() => null}
@@ -88,7 +85,7 @@ export const ServerError = () => {
       'invalid credentials with looooooooooooooooooooooooooooooooong text',
   };
 
-  return <FormLogin {...props} title="Welcome!" attempt={attempt} />;
+  return <FormLogin {...props} attempt={attempt} />;
 };
 
 export const LocalWithSso = () => {
@@ -97,7 +94,7 @@ export const LocalWithSso = () => {
     { name: 'google', type: 'oidc', url: '' } as const,
   ];
 
-  return <FormLogin {...props} title="Welcome!" authProviders={ssoProvider} />;
+  return <FormLogin {...props} authProviders={ssoProvider} />;
 };
 
 export const LocalWithSsoAndPwdless = () => {
@@ -113,16 +110,11 @@ export const LocalWithSsoAndPwdless = () => {
   return (
     <FormLogin
       {...props}
-      title="Welcome!"
       authProviders={ssoProvider}
       isPasswordlessEnabled={true}
     />
   );
 };
-
-export const PrivateKeyPolicyEnabled = () => (
-  <FormLogin {...props} privateKeyPolicyEnabled={true} />
-);
 
 export const LocalDisabledWithSso = () => {
   const ssoProvider = [
@@ -133,7 +125,6 @@ export const LocalDisabledWithSso = () => {
   return (
     <FormLogin
       {...props}
-      title="Welcome!"
       authProviders={ssoProvider}
       isLocalAuthEnabled={false}
     />
@@ -141,17 +132,27 @@ export const LocalDisabledWithSso = () => {
 };
 
 export const LocalDisabledNoSso = () => (
-  <FormLogin {...props} title="Welcome!" isLocalAuthEnabled={false} />
+  <FormLogin {...props} isLocalAuthEnabled={false} />
 );
 
 export const PrimarySso = () => {
   const ssoProvider = [
-    { name: 'github', type: 'oidc', url: '' } as const,
-    { name: 'google', type: 'oidc', url: '' } as const,
-    { name: 'bitbucket', type: 'oidc', url: '' } as const,
+    { name: 'github', displayName: 'GitHub', type: 'oidc', url: '' } as const,
+    { name: 'google', displayName: 'Google', type: 'oidc', url: '' } as const,
+    {
+      name: 'bitbucket',
+      displayName: 'Bitbucket',
+      type: 'oidc',
+      url: '',
+    } as const,
     {
       name: 'Mission Control',
       type: 'oidc',
+      url: '',
+    } as const,
+    {
+      name: 'Okta',
+      type: 'saml',
       url: '',
     } as const,
     {
@@ -163,12 +164,7 @@ export const PrimarySso = () => {
   ];
 
   return (
-    <FormLogin
-      {...props}
-      title="Welcome!"
-      primaryAuthType="sso"
-      authProviders={ssoProvider}
-    />
+    <FormLogin {...props} primaryAuthType="sso" authProviders={ssoProvider} />
   );
 };
 
@@ -181,7 +177,6 @@ export const PrimarySsoWithPwdless = () => {
   return (
     <FormLogin
       {...props}
-      title="Welcome!"
       primaryAuthType="sso"
       authProviders={ssoProvider}
       isPasswordlessEnabled={true}
@@ -198,7 +193,6 @@ export const PrimarySsoWithSecondFactor = () => {
   return (
     <FormLogin
       {...props}
-      title="Welcome!"
       primaryAuthType="sso"
       auth2faType="on"
       authProviders={ssoProvider}
@@ -215,7 +209,6 @@ export const PrimaryPwdless = () => {
   return (
     <FormLogin
       {...props}
-      title="Welcome!"
       primaryAuthType="passwordless"
       auth2faType="webauthn"
       authProviders={ssoProvider}
@@ -227,7 +220,6 @@ export const PrimaryPwdlessWithNoSso = () => {
   return (
     <FormLogin
       {...props}
-      title="Welcome!"
       primaryAuthType="passwordless"
       auth2faType="optional"
     />

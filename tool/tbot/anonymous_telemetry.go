@@ -1,29 +1,33 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package main
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
 
-	"github.com/bufbuild/connect-go"
+	"connectrpc.com/connect"
 	"github.com/google/uuid"
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/gravitational/teleport"
@@ -38,8 +42,6 @@ const (
 
 	helperEnv        = "_TBOT_TELEMETRY_HELPER"
 	helperVersionEnv = "_TBOT_TELEMETRY_HELPER_VERSION"
-
-	telemetryDocs = "https://goteleport.com/docs/machine-id/reference/telemetry/"
 )
 
 type envGetter func(key string) string
@@ -74,15 +76,15 @@ func sendTelemetry(
 	ctx context.Context,
 	client prehogv1ac.TbotReportingServiceClient,
 	envGetter envGetter,
-	log logrus.FieldLogger,
+	log *slog.Logger,
 	cfg *config.BotConfig,
 ) error {
 	start := time.Now()
 	if !telemetryEnabled(envGetter) {
-		log.Infof("Anonymous telemetry is not enabled. Find out more about Machine ID's anonymous telemetry at %s", telemetryDocs)
+		log.InfoContext(ctx, "Anonymous telemetry is not enabled. Find out more about Machine ID's anonymous telemetry at https://goteleport.com/docs/machine-id/reference/telemetry/")
 		return nil
 	}
-	log.Infof("Anonymous telemetry is enabled. Find out more about Machine ID's anonymous telemetry at %s", telemetryDocs)
+	log.InfoContext(ctx, "Anonymous telemetry is enabled. Find out more about Machine ID's anonymous telemetry at https://goteleport.com/docs/machine-id/reference/telemetry/")
 
 	data := &prehogv1a.TbotStartEvent{
 		RunMode:  prehogv1a.TbotStartEvent_RUN_MODE_DAEMON,
@@ -96,7 +98,7 @@ func sendTelemetry(
 		data.Helper = helper
 		data.HelperVersion = envGetter(helperVersionEnv)
 	}
-	for _, output := range cfg.Outputs {
+	for _, output := range cfg.Services {
 		switch output.(type) {
 		case *config.ApplicationOutput:
 			data.DestinationsApplication++
@@ -118,9 +120,12 @@ func sendTelemetry(
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	log.WithField("distinct_id", distinctID).
-		WithField("duration", time.Since(start)).
-		Debug("Successfully transmitted anonymous telemetry")
+	log.DebugContext(
+		ctx,
+		"Successfully transmitted anonymous telemetry",
+		"distinct_id", distinctID,
+		"duration", time.Since(start),
+	)
 
 	return nil
 }

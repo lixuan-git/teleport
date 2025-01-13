@@ -1,18 +1,20 @@
 /*
-Copyright 2015 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 // Package httplib implements common utility functions for writing
 // classic HTTP handlers
@@ -60,10 +62,12 @@ func newCSPCache() *cspCache {
 	}
 }
 
-type cspMap map[string][]string
+// CSPMap holds a map of Content Security Policy.
+type CSPMap map[string][]string
 
-var defaultContentSecurityPolicy = cspMap{
+var defaultContentSecurityPolicy = CSPMap{
 	"default-src": {"'self'"},
+	"script-src":  {"'self'"},
 	// specify CSP directives not covered by `default-src`
 	"base-uri":        {"'self'"},
 	"form-action":     {"'self'"},
@@ -74,24 +78,18 @@ var defaultContentSecurityPolicy = cspMap{
 	"style-src":  {"'self'", "'unsafe-inline'"},
 }
 
-var defaultFontSrc = cspMap{"font-src": {"'self'", "data:"}}
-var defaultConnectSrc = cspMap{"connect-src": {"'self'", "wss:"}}
+var defaultFontSrc = CSPMap{"font-src": {"'self'", "data:"}}
+var defaultConnectSrc = CSPMap{"connect-src": {"'self'", "wss:"}}
 
-var stripeSecurityPolicy = cspMap{
-	// auto-pay plans in Cloud use stripe.com to manage billing information
-	"script-src": {"'self'", "https://js.stripe.com"},
-	"frame-src":  {"https://js.stripe.com"},
-}
-
-var wasmSecurityPolicy = cspMap{
+var wasmSecurityPolicy = CSPMap{
 	"script-src": {"'self'", "'wasm-unsafe-eval'"},
 }
 
 // combineCSPMaps combines multiple CSP maps into a single map.
-// When multiple of the input cspMaps have the same key, their
+// When multiple of the input CSPMap have the same key, their
 // respective lists are concatenated.
-func combineCSPMaps(cspMaps ...cspMap) cspMap {
-	combinedMap := make(cspMap)
+func combineCSPMaps(cspMaps ...CSPMap) CSPMap {
+	combinedMap := make(CSPMap)
 
 	for _, cspMap := range cspMaps {
 		for key, value := range cspMap {
@@ -103,11 +101,11 @@ func combineCSPMaps(cspMaps ...cspMap) cspMap {
 	return combinedMap
 }
 
-// getContentSecurityPolicyString combines multiple CSP maps into a single
+// GetContentSecurityPolicyString combines multiple CSP maps into a single
 // CSP string, alphabetically sorted by the directive key.
 // When multiple of the input cspMaps have the same key, their
 // respective lists are concatenated.
-func getContentSecurityPolicyString(cspMaps ...cspMap) string {
+func GetContentSecurityPolicyString(cspMaps ...CSPMap) string {
 	combined := combineCSPMaps(cspMaps...)
 
 	keys := make([]string, 0, len(combined))
@@ -141,6 +139,13 @@ func SetCacheHeaders(h http.Header, maxAge time.Duration) {
 	h.Set("Cache-Control", fmt.Sprintf("max-age=%.f, immutable", maxAge.Seconds()))
 }
 
+// SetEntityTagCacheHeaders tells proxies and browsers to cache the content
+// and sets an ETag based on teleport version which can be used to check for modifications
+func SetEntityTagCacheHeaders(h http.Header, etag string) {
+	h.Set("Cache-Control", "no-cache")
+	h.Set("ETag", etag)
+}
+
 // SetDefaultSecurityHeaders adds headers that should generally be considered safe defaults.  It is expected that all
 // responses should be able to add these headers without negative impact.
 func SetDefaultSecurityHeaders(h http.Header) {
@@ -165,12 +170,8 @@ func SetDefaultSecurityHeaders(h http.Header) {
 	h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 }
 
-func getIndexContentSecurityPolicy(withStripe, withWasm bool) cspMap {
-	cspMaps := []cspMap{defaultContentSecurityPolicy, defaultFontSrc, defaultConnectSrc}
-
-	if withStripe {
-		cspMaps = append(cspMaps, stripeSecurityPolicy)
-	}
+func getIndexContentSecurityPolicy(withWasm bool) CSPMap {
+	cspMaps := []CSPMap{defaultContentSecurityPolicy, defaultFontSrc, defaultConnectSrc}
 
 	if withWasm {
 		cspMaps = append(cspMaps, wasmSecurityPolicy)
@@ -183,23 +184,29 @@ func getIndexContentSecurityPolicy(withStripe, withWasm bool) cspMap {
 // which is a route to a desktop session that uses WASM.
 var desktopSessionRe = regexp.MustCompile(`^/web/cluster/[^/]+/desktops/[^/]+/[^/]+$`)
 
+// regex for the recordings endpoint /web/cluster/:clusterId/session/:sid
+// which is a route to a desktop recording that uses WASM.
+var recordingRe = regexp.MustCompile(`^/web/cluster/[^/]+/session/[^/]+$`)
+
+// regex for the ssh terminal endpoint /web/cluster/:clusterId/console/node/:sid/:login
+// which is a route to a ssh session that uses WASM.
+var sshSessionRe = regexp.MustCompile(`^/web/cluster/[^/]+/console/node/[^/]+/[^/]+$`)
+
 var indexCSPStringCache *cspCache = newCSPCache()
 
 func getIndexContentSecurityPolicyString(cfg proto.Features, urlPath string) string {
 	// Check for result with this cfg and urlPath in cache
-	withStripe := cfg.GetCloud() && cfg.GetIsUsageBased()
-	key := fmt.Sprintf("%v-%v", withStripe, urlPath)
-	if cspString, ok := indexCSPStringCache.get(key); ok {
+	if cspString, ok := indexCSPStringCache.get(urlPath); ok {
 		return cspString
 	}
 
 	// Nothing found in cache, calculate regex and result
-	withWasm := desktopSessionRe.MatchString(urlPath)
-	cspString := getContentSecurityPolicyString(
-		getIndexContentSecurityPolicy(withStripe, withWasm),
+	withWasm := desktopSessionRe.MatchString(urlPath) || recordingRe.MatchString(urlPath) || sshSessionRe.MatchString(urlPath)
+	cspString := GetContentSecurityPolicyString(
+		getIndexContentSecurityPolicy(withWasm),
 	)
 	// Add result to cache
-	indexCSPStringCache.set(key, cspString)
+	indexCSPStringCache.set(urlPath, cspString)
 
 	return cspString
 }
@@ -210,31 +217,6 @@ func SetIndexContentSecurityPolicy(h http.Header, cfg proto.Features, urlPath st
 	h.Set("Content-Security-Policy", cspString)
 }
 
-var appLaunchCSPStringCache *cspCache = newCSPCache()
-
-func getAppLaunchContentSecurityPolicyString(applicationURL string) string {
-	if cspString, ok := appLaunchCSPStringCache.get(applicationURL); ok {
-		return cspString
-	}
-
-	cspString := getContentSecurityPolicyString(
-		defaultContentSecurityPolicy,
-		defaultFontSrc,
-		cspMap{
-			"connect-src": {"'self'", applicationURL},
-		},
-	)
-	appLaunchCSPStringCache.set(applicationURL, cspString)
-
-	return cspString
-}
-
-// SetAppLaunchContentSecurityPolicy sets the Content-Security-Policy header for /web/launch
-func SetAppLaunchContentSecurityPolicy(h http.Header, applicationURL string) {
-	cspString := getAppLaunchContentSecurityPolicyString(applicationURL)
-	h.Set("Content-Security-Policy", cspString)
-}
-
 var redirectCSPStringCache *cspCache = newCSPCache()
 
 func getRedirectPageContentSecurityPolicyString(scriptSrc string) string {
@@ -242,9 +224,9 @@ func getRedirectPageContentSecurityPolicyString(scriptSrc string) string {
 		return cspString
 	}
 
-	cspString := getContentSecurityPolicyString(
+	cspString := GetContentSecurityPolicyString(
 		defaultContentSecurityPolicy,
-		cspMap{
+		CSPMap{
 			"script-src": {"'" + scriptSrc + "'"},
 		},
 	)

@@ -1,18 +1,20 @@
-/*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 /* MIT License
 
@@ -38,7 +40,7 @@ SOFTWARE.
 
 */
 
-import React from 'react';
+import { forwardRef } from 'react';
 
 import { Icon, IconProps } from '../Icon';
 
@@ -48,17 +50,14 @@ THIS FILE IS GENERATED. DO NOT EDIT.
 
 */
 
-export function NotificationsActive({
-  size = 24,
-  color,
-  ...otherProps
-}: IconProps) {
-  return (
+export const NotificationsActive = forwardRef<HTMLSpanElement, IconProps>(
+  ({ size = 24, color, ...otherProps }, ref) => (
     <Icon
       size={size}
       color={color}
       className="icon icon-notificationsactive"
       {...otherProps}
+      ref={ref}
     >
       <path d="M17.6535 1.61784C17.3043 1.39503 16.8406 1.49748 16.6178 1.84667C16.395 2.19586 16.4975 2.65955 16.8467 2.88235C18.1822 3.73448 19.2653 4.9284 19.9839 6.34027C20.1717 6.70942 20.6233 6.85638 20.9925 6.66851C21.3616 6.48064 21.5086 6.02908 21.3207 5.65992C20.4808 4.00954 19.2146 2.61393 17.6535 1.61784Z" />
       <path
@@ -68,5 +67,5 @@ export function NotificationsActive({
       />
       <path d="M7.38226 1.84667C7.60507 2.19586 7.50261 2.65955 7.15343 2.88235C5.81794 3.73448 4.73476 4.9284 4.01623 6.34027C3.82836 6.70942 3.3768 6.85638 3.00764 6.66851C2.63849 6.48064 2.49153 6.02908 2.6794 5.65992C3.51931 4.00954 4.78548 2.61393 6.34658 1.61784C6.69577 1.39503 7.15946 1.49748 7.38226 1.84667Z" />
     </Icon>
-  );
-}
+  )
+);

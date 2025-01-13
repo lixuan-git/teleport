@@ -1,16 +1,20 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package servicecfg
 
@@ -30,6 +34,8 @@ type DiscoveryConfig struct {
 	GCPMatchers []types.GCPMatcher
 	// KubernetesMatchers are used to match services inside Kubernetes cluster for auto discovery
 	KubernetesMatchers []types.KubernetesMatcher
+	// AccessGraph is used to sync cloud provider resources into Access Graph.
+	AccessGraph *types.AccessGraphSync
 	// DiscoveryGroup is the name of the discovery group that the current
 	// discovery service is a part of.
 	// It is used to filter out discovered resources that belong to another
@@ -40,11 +46,15 @@ type DiscoveryConfig struct {
 	DiscoveryGroup string
 	// PollInterval is the cadence at which the discovery server will run each of its
 	// discovery cycles.
+	// Default: [github.com/gravitational/teleport/lib/srv/discovery/common.DefaultDiscoveryPollInterval]
 	PollInterval time.Duration
 }
 
-// IsEmpty validates if the Discovery Service config has no cloud matchers.
+// IsEmpty validates if the Discovery Service config has no matchers and no discovery group.
+// DiscoveryGroup is used to dynamically load Matchers when changing DiscoveryConfig resources.
 func (d DiscoveryConfig) IsEmpty() bool {
 	return len(d.AWSMatchers) == 0 && len(d.AzureMatchers) == 0 &&
-		len(d.GCPMatchers) == 0 && len(d.KubernetesMatchers) == 0
+		len(d.GCPMatchers) == 0 && len(d.KubernetesMatchers) == 0 &&
+		d.DiscoveryGroup == "" &&
+		(d.AccessGraph == nil || len(d.AccessGraph.AWS) == 0)
 }

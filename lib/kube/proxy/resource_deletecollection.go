@@ -1,34 +1,37 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package proxy
 
 import (
 	"context"
 	"io"
+	"log/slog"
 	"net/http"
 
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
 	oteltrace "go.opentelemetry.io/otel/trace"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	certificatesv1 "k8s.io/api/certificates/v1"
 	corev1 "k8s.io/api/core/v1"
+	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
 	networkingv1 "k8s.io/api/networking/v1"
 	authv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -41,6 +44,7 @@ import (
 	"github.com/gravitational/teleport/lib/kube/proxy/responsewriters"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/lib/utils/slices"
 )
 
 // deleteResourcesCollection calls listResources method to list the resources the user
@@ -59,7 +63,7 @@ func (f *Forwarder) deleteResourcesCollection(sess *clusterSession, w http.Respo
 	defer span.End()
 	req = req.WithContext(ctx)
 	var (
-		isLocalKubeCluster = f.isLocalKubeCluster(sess.teleportCluster.isRemote, sess.kubeClusterName)
+		isLocalKubeCluster = sess.isLocalKubernetesCluster
 		kubeObjType        string
 		namespace          string
 	)
@@ -136,7 +140,9 @@ func (f *Forwarder) handleDeleteCollectionReq(req *http.Request, sess *clusterSe
 	req.Body.Close()
 
 	// decode memory rw body.
-	obj, err := decodeAndSetGVK(decoder, memWriter.Buffer().Bytes())
+	// We are reading an API request and API honors the GVK in the request so we don't
+	// need to set it.
+	obj, err := decodeAndSetGVK(decoder, memWriter.Buffer().Bytes(), nil /* defaults GVK */)
 	if err != nil {
 		return internalErrStatus, trace.Wrap(err)
 	}
@@ -169,7 +175,7 @@ func (f *Forwarder) handleDeleteCollectionReq(req *http.Request, sess *clusterSe
 		items, err := deleteResources(
 			params,
 			types.KindKubePod,
-			arrayToPointerArray(o.Items),
+			slices.ToPointers(o.Items),
 			func(ctx context.Context, client kubernetes.Interface, name, namespace string) error {
 				return trace.Wrap(client.CoreV1().Pods(namespace).Delete(ctx, name, deleteOptions))
 			},
@@ -177,12 +183,12 @@ func (f *Forwarder) handleDeleteCollectionReq(req *http.Request, sess *clusterSe
 		if err != nil {
 			return internalErrStatus, trace.Wrap(err)
 		}
-		o.Items = pointerArrayToArray(items)
+		o.Items = slices.FromPointers(items)
 	case *corev1.SecretList:
 		items, err := deleteResources(
 			params,
 			types.KindKubeSecret,
-			arrayToPointerArray(o.Items),
+			slices.ToPointers(o.Items),
 			func(ctx context.Context, client kubernetes.Interface, name, namespace string) error {
 				return trace.Wrap(client.CoreV1().Secrets(namespace).Delete(ctx, name, deleteOptions))
 			},
@@ -190,12 +196,12 @@ func (f *Forwarder) handleDeleteCollectionReq(req *http.Request, sess *clusterSe
 		if err != nil {
 			return internalErrStatus, trace.Wrap(err)
 		}
-		o.Items = pointerArrayToArray(items)
+		o.Items = slices.FromPointers(items)
 	case *corev1.ConfigMapList:
 		items, err := deleteResources(
 			params,
 			types.KindKubeConfigmap,
-			arrayToPointerArray(o.Items),
+			slices.ToPointers(o.Items),
 			func(ctx context.Context, client kubernetes.Interface, name, namespace string) error {
 				return trace.Wrap(client.CoreV1().ConfigMaps(namespace).Delete(ctx, name, deleteOptions))
 			},
@@ -203,12 +209,12 @@ func (f *Forwarder) handleDeleteCollectionReq(req *http.Request, sess *clusterSe
 		if err != nil {
 			return internalErrStatus, trace.Wrap(err)
 		}
-		o.Items = pointerArrayToArray(items)
+		o.Items = slices.FromPointers(items)
 	case *corev1.NamespaceList:
 		items, err := deleteResources(
 			params,
 			types.KindKubeNamespace,
-			arrayToPointerArray(o.Items),
+			slices.ToPointers(o.Items),
 			func(ctx context.Context, client kubernetes.Interface, name, _ string) error {
 				return trace.Wrap(client.CoreV1().Namespaces().Delete(ctx, name, deleteOptions))
 			},
@@ -216,12 +222,12 @@ func (f *Forwarder) handleDeleteCollectionReq(req *http.Request, sess *clusterSe
 		if err != nil {
 			return internalErrStatus, trace.Wrap(err)
 		}
-		o.Items = pointerArrayToArray(items)
+		o.Items = slices.FromPointers(items)
 	case *corev1.ServiceAccountList:
 		items, err := deleteResources(
 			params,
 			types.KindKubeServiceAccount,
-			arrayToPointerArray(o.Items),
+			slices.ToPointers(o.Items),
 			func(ctx context.Context, client kubernetes.Interface, name, namespace string) error {
 				return trace.Wrap(client.CoreV1().ServiceAccounts(namespace).Delete(ctx, name, deleteOptions))
 			},
@@ -229,12 +235,12 @@ func (f *Forwarder) handleDeleteCollectionReq(req *http.Request, sess *clusterSe
 		if err != nil {
 			return internalErrStatus, trace.Wrap(err)
 		}
-		o.Items = pointerArrayToArray(items)
+		o.Items = slices.FromPointers(items)
 	case *corev1.PersistentVolumeList:
 		items, err := deleteResources(
 			params,
 			types.KindKubePersistentVolume,
-			arrayToPointerArray(o.Items),
+			slices.ToPointers(o.Items),
 			func(ctx context.Context, client kubernetes.Interface, name, _ string) error {
 				return trace.Wrap(client.CoreV1().PersistentVolumes().Delete(ctx, name, deleteOptions))
 			},
@@ -242,13 +248,13 @@ func (f *Forwarder) handleDeleteCollectionReq(req *http.Request, sess *clusterSe
 		if err != nil {
 			return internalErrStatus, trace.Wrap(err)
 		}
-		o.Items = pointerArrayToArray(items)
+		o.Items = slices.FromPointers(items)
 
 	case *corev1.PersistentVolumeClaimList:
 		items, err := deleteResources(
 			params,
 			types.KindKubePersistentVolumeClaim,
-			arrayToPointerArray(o.Items),
+			slices.ToPointers(o.Items),
 			func(ctx context.Context, client kubernetes.Interface, name, namespace string) error {
 				return trace.Wrap(client.CoreV1().PersistentVolumeClaims(namespace).Delete(ctx, name, deleteOptions))
 			},
@@ -256,12 +262,12 @@ func (f *Forwarder) handleDeleteCollectionReq(req *http.Request, sess *clusterSe
 		if err != nil {
 			return internalErrStatus, trace.Wrap(err)
 		}
-		o.Items = pointerArrayToArray(items)
+		o.Items = slices.FromPointers(items)
 	case *appsv1.DeploymentList:
 		items, err := deleteResources(
 			params,
 			types.KindKubeDeployment,
-			arrayToPointerArray(o.Items),
+			slices.ToPointers(o.Items),
 			func(ctx context.Context, client kubernetes.Interface, name, namespace string) error {
 				return trace.Wrap(client.AppsV1().Deployments(namespace).Delete(ctx, name, deleteOptions))
 			},
@@ -269,12 +275,12 @@ func (f *Forwarder) handleDeleteCollectionReq(req *http.Request, sess *clusterSe
 		if err != nil {
 			return internalErrStatus, trace.Wrap(err)
 		}
-		o.Items = pointerArrayToArray(items)
+		o.Items = slices.FromPointers(items)
 	case *appsv1.ReplicaSetList:
 		items, err := deleteResources(
 			params,
 			types.KindKubeReplicaSet,
-			arrayToPointerArray(o.Items),
+			slices.ToPointers(o.Items),
 			func(ctx context.Context, client kubernetes.Interface, name, namespace string) error {
 				return trace.Wrap(client.AppsV1().ReplicaSets(namespace).Delete(ctx, name, deleteOptions))
 			},
@@ -282,13 +288,13 @@ func (f *Forwarder) handleDeleteCollectionReq(req *http.Request, sess *clusterSe
 		if err != nil {
 			return internalErrStatus, trace.Wrap(err)
 		}
-		o.Items = pointerArrayToArray(items)
+		o.Items = slices.FromPointers(items)
 
 	case *appsv1.StatefulSetList:
 		items, err := deleteResources(
 			params,
 			types.KindKubeStatefulset,
-			arrayToPointerArray(o.Items),
+			slices.ToPointers(o.Items),
 			func(ctx context.Context, client kubernetes.Interface, name, namespace string) error {
 				return trace.Wrap(client.AppsV1().StatefulSets(namespace).Delete(ctx, name, deleteOptions))
 			},
@@ -296,12 +302,12 @@ func (f *Forwarder) handleDeleteCollectionReq(req *http.Request, sess *clusterSe
 		if err != nil {
 			return internalErrStatus, trace.Wrap(err)
 		}
-		o.Items = pointerArrayToArray(items)
+		o.Items = slices.FromPointers(items)
 	case *appsv1.DaemonSetList:
 		items, err := deleteResources(
 			params,
 			types.KindKubeDaemonSet,
-			arrayToPointerArray(o.Items),
+			slices.ToPointers(o.Items),
 			func(ctx context.Context, client kubernetes.Interface, name, namespace string) error {
 				return trace.Wrap(client.AppsV1().DaemonSets(namespace).Delete(ctx, name, deleteOptions))
 			},
@@ -309,13 +315,13 @@ func (f *Forwarder) handleDeleteCollectionReq(req *http.Request, sess *clusterSe
 		if err != nil {
 			return internalErrStatus, trace.Wrap(err)
 		}
-		o.Items = pointerArrayToArray(items)
+		o.Items = slices.FromPointers(items)
 
 	case *authv1.ClusterRoleList:
 		items, err := deleteResources(
 			params,
 			types.KindKubeClusterRole,
-			arrayToPointerArray(o.Items),
+			slices.ToPointers(o.Items),
 			func(ctx context.Context, client kubernetes.Interface, name, _ string) error {
 				return trace.Wrap(client.RbacV1().ClusterRoles().Delete(ctx, name, deleteOptions))
 			},
@@ -323,12 +329,12 @@ func (f *Forwarder) handleDeleteCollectionReq(req *http.Request, sess *clusterSe
 		if err != nil {
 			return internalErrStatus, trace.Wrap(err)
 		}
-		o.Items = pointerArrayToArray(items)
+		o.Items = slices.FromPointers(items)
 	case *authv1.RoleList:
 		items, err := deleteResources(
 			params,
 			types.KindKubeRole,
-			arrayToPointerArray(o.Items),
+			slices.ToPointers(o.Items),
 			func(ctx context.Context, client kubernetes.Interface, name, namespace string) error {
 				return trace.Wrap(client.RbacV1().Roles(namespace).Delete(ctx, name, deleteOptions))
 			},
@@ -336,12 +342,12 @@ func (f *Forwarder) handleDeleteCollectionReq(req *http.Request, sess *clusterSe
 		if err != nil {
 			return internalErrStatus, trace.Wrap(err)
 		}
-		o.Items = pointerArrayToArray(items)
+		o.Items = slices.FromPointers(items)
 	case *authv1.ClusterRoleBindingList:
 		items, err := deleteResources(
 			params,
 			types.KindKubeClusterRoleBinding,
-			arrayToPointerArray(o.Items),
+			slices.ToPointers(o.Items),
 			func(ctx context.Context, client kubernetes.Interface, name, _ string) error {
 				return trace.Wrap(client.RbacV1().ClusterRoleBindings().Delete(ctx, name, deleteOptions))
 			},
@@ -349,12 +355,12 @@ func (f *Forwarder) handleDeleteCollectionReq(req *http.Request, sess *clusterSe
 		if err != nil {
 			return internalErrStatus, trace.Wrap(err)
 		}
-		o.Items = pointerArrayToArray(items)
+		o.Items = slices.FromPointers(items)
 	case *authv1.RoleBindingList:
 		items, err := deleteResources(
 			params,
 			types.KindKubeRoleBinding,
-			arrayToPointerArray(o.Items),
+			slices.ToPointers(o.Items),
 			func(ctx context.Context, client kubernetes.Interface, name, namespace string) error {
 				return trace.Wrap(client.RbacV1().RoleBindings(namespace).Delete(ctx, name, deleteOptions))
 			},
@@ -362,12 +368,12 @@ func (f *Forwarder) handleDeleteCollectionReq(req *http.Request, sess *clusterSe
 		if err != nil {
 			return internalErrStatus, trace.Wrap(err)
 		}
-		o.Items = pointerArrayToArray(items)
+		o.Items = slices.FromPointers(items)
 	case *batchv1.CronJobList:
 		items, err := deleteResources(
 			params,
 			types.KindKubeCronjob,
-			arrayToPointerArray(o.Items),
+			slices.ToPointers(o.Items),
 			func(ctx context.Context, client kubernetes.Interface, name, namespace string) error {
 				return trace.Wrap(client.BatchV1().CronJobs(namespace).Delete(ctx, name, deleteOptions))
 			},
@@ -375,12 +381,12 @@ func (f *Forwarder) handleDeleteCollectionReq(req *http.Request, sess *clusterSe
 		if err != nil {
 			return internalErrStatus, trace.Wrap(err)
 		}
-		o.Items = pointerArrayToArray(items)
+		o.Items = slices.FromPointers(items)
 	case *batchv1.JobList:
 		items, err := deleteResources(
 			params,
 			types.KindKubeJob,
-			arrayToPointerArray(o.Items),
+			slices.ToPointers(o.Items),
 			func(ctx context.Context, client kubernetes.Interface, name, namespace string) error {
 				return trace.Wrap(client.BatchV1().Jobs(namespace).Delete(ctx, name, deleteOptions))
 			},
@@ -388,12 +394,12 @@ func (f *Forwarder) handleDeleteCollectionReq(req *http.Request, sess *clusterSe
 		if err != nil {
 			return internalErrStatus, trace.Wrap(err)
 		}
-		o.Items = pointerArrayToArray(items)
+		o.Items = slices.FromPointers(items)
 	case *certificatesv1.CertificateSigningRequestList:
 		items, err := deleteResources(
 			params,
 			types.KindKubeCertificateSigningRequest,
-			arrayToPointerArray(o.Items),
+			slices.ToPointers(o.Items),
 			func(ctx context.Context, client kubernetes.Interface, name, _ string) error {
 				return trace.Wrap(client.CertificatesV1().CertificateSigningRequests().Delete(ctx, name, deleteOptions))
 			},
@@ -401,12 +407,12 @@ func (f *Forwarder) handleDeleteCollectionReq(req *http.Request, sess *clusterSe
 		if err != nil {
 			return internalErrStatus, trace.Wrap(err)
 		}
-		o.Items = pointerArrayToArray(items)
+		o.Items = slices.FromPointers(items)
 	case *networkingv1.IngressList:
 		items, err := deleteResources(
 			params,
 			types.KindKubeIngress,
-			arrayToPointerArray(o.Items),
+			slices.ToPointers(o.Items),
 			func(ctx context.Context, client kubernetes.Interface, name, namespace string) error {
 				return trace.Wrap(client.NetworkingV1().Ingresses(namespace).Delete(ctx, name, deleteOptions))
 			},
@@ -414,7 +420,59 @@ func (f *Forwarder) handleDeleteCollectionReq(req *http.Request, sess *clusterSe
 		if err != nil {
 			return internalErrStatus, trace.Wrap(err)
 		}
-		o.Items = pointerArrayToArray(items)
+		o.Items = slices.FromPointers(items)
+	case *extensionsv1beta1.IngressList:
+		items, err := deleteResources(
+			params,
+			types.KindKubeIngress,
+			slices.ToPointers(o.Items),
+			func(ctx context.Context, client kubernetes.Interface, name, namespace string) error {
+				return trace.Wrap(client.ExtensionsV1beta1().Ingresses(namespace).Delete(ctx, name, deleteOptions))
+			},
+		)
+		if err != nil {
+			return internalErrStatus, trace.Wrap(err)
+		}
+		o.Items = slices.FromPointers(items)
+	case *extensionsv1beta1.DaemonSetList:
+		items, err := deleteResources(
+			params,
+			types.KindKubeDaemonSet,
+			slices.ToPointers(o.Items),
+			func(ctx context.Context, client kubernetes.Interface, name, namespace string) error {
+				return trace.Wrap(client.ExtensionsV1beta1().DaemonSets(namespace).Delete(ctx, name, deleteOptions))
+			},
+		)
+		if err != nil {
+			return internalErrStatus, trace.Wrap(err)
+		}
+		o.Items = slices.FromPointers(items)
+	case *extensionsv1beta1.DeploymentList:
+		items, err := deleteResources(
+			params,
+			types.KindKubeDeployment,
+			slices.ToPointers(o.Items),
+			func(ctx context.Context, client kubernetes.Interface, name, namespace string) error {
+				return trace.Wrap(client.ExtensionsV1beta1().Deployments(namespace).Delete(ctx, name, deleteOptions))
+			},
+		)
+		if err != nil {
+			return internalErrStatus, trace.Wrap(err)
+		}
+		o.Items = slices.FromPointers(items)
+	case *extensionsv1beta1.ReplicaSetList:
+		items, err := deleteResources(
+			params,
+			types.KindKubeReplicaSet,
+			slices.ToPointers(o.Items),
+			func(ctx context.Context, client kubernetes.Interface, name, namespace string) error {
+				return trace.Wrap(client.ExtensionsV1beta1().ReplicaSets(namespace).Delete(ctx, name, deleteOptions))
+			},
+		)
+		if err != nil {
+			return internalErrStatus, trace.Wrap(err)
+		}
+		o.Items = slices.FromPointers(items)
 	default:
 		return internalErrStatus, trace.BadParameter("unexpected type %T", obj)
 	}
@@ -497,7 +555,7 @@ func (f *Forwarder) handleDeleteCustomResourceCollection(w http.ResponseWriter, 
 	kubeUsers, kubeGroups := fillDefaultKubePrincipalDetails(allowedKubeGroups, allowedKubeUsers, sess.User.GetName())
 	sess.kubeUsers = utils.StringsSet(kubeUsers)
 	sess.kubeGroups = utils.StringsSet(kubeGroups)
-	if err := setupImpersonationHeaders(f.log, sess.authContext, req.Header); err != nil {
+	if err := setupImpersonationHeaders(sess, req.Header); err != nil {
 		return 0, trace.Wrap(err)
 	}
 
@@ -509,7 +567,7 @@ func (f *Forwarder) handleDeleteCustomResourceCollection(w http.ResponseWriter, 
 
 type deleteResourcesCommonParams struct {
 	ctx         context.Context
-	log         logrus.FieldLogger
+	log         *slog.Logger
 	authCtx     *authContext
 	header      http.Header
 	kubeDetails *kubeDetails

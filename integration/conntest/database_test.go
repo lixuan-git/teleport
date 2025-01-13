@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package conntest
 
@@ -37,6 +41,7 @@ import (
 	"github.com/gravitational/teleport/lib/client"
 	"github.com/gravitational/teleport/lib/client/conntest"
 	"github.com/gravitational/teleport/lib/defaults"
+	"github.com/gravitational/teleport/lib/modules"
 	"github.com/gravitational/teleport/lib/service/servicecfg"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/srv/db/common"
@@ -62,6 +67,8 @@ func startPostgresTestServer(t *testing.T, authServer *auth.Server) *postgres.Te
 }
 
 func TestDiagnoseConnectionForPostgresDatabases(t *testing.T) {
+	modules.SetInsecureTestMode(true)
+
 	ctx := context.Background()
 	diagnoseConnectionEndpoint := strings.Join([]string{"sites", "$site", "diagnostics", "connections"}, "/")
 
@@ -98,7 +105,8 @@ func TestDiagnoseConnectionForPostgresDatabases(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	require.NoError(t, authServer.UpsertRole(ctx, roleWithFullAccess))
+	roleWithFullAccess, err = authServer.UpsertRole(ctx, roleWithFullAccess)
+	require.NoError(t, err)
 
 	for _, tt := range []struct {
 		name         string
@@ -126,12 +134,12 @@ func TestDiagnoseConnectionForPostgresDatabases(t *testing.T) {
 				{
 					Type:    types.ConnectionDiagnosticTrace_RBAC_DATABASE,
 					Status:  types.ConnectionDiagnosticTrace_SUCCESS,
-					Details: "A Database Agent is available to proxy the connection to the Database.",
+					Details: "A Teleport Database Service is available to proxy the connection to the Database.",
 				},
 				{
 					Type:    types.ConnectionDiagnosticTrace_CONNECTIVITY,
 					Status:  types.ConnectionDiagnosticTrace_SUCCESS,
-					Details: "Database is accessible from the Database Agent.",
+					Details: "Database is accessible from the Teleport Database Service.",
 				},
 				{
 					Type:    types.ConnectionDiagnosticTrace_RBAC_DATABASE_LOGIN,
@@ -167,8 +175,8 @@ func TestDiagnoseConnectionForPostgresDatabases(t *testing.T) {
 					Status: types.ConnectionDiagnosticTrace_FAILED,
 					Details: "Database not found. " +
 						"Ensure your role grants access by adding it to the 'db_labels' property. " +
-						"This can also happen when you don't have a Database Agent proxying the database - " +
-						"you can fix that by adding the database labels to the 'db_service.resources.labels' in 'teleport.yaml' file of the database agent.",
+						"This can also happen when you don't have a Teleport Database Service proxying the database - " +
+						"you can fix that by adding the database labels to the 'db_service.resources.labels' in 'teleport.yaml' file of the Database Service.",
 				},
 			},
 		},
@@ -199,7 +207,8 @@ func TestDiagnoseConnectionForPostgresDatabases(t *testing.T) {
 			require.NoError(t, err)
 
 			user.AddRole(roleWithFullAccess.GetName())
-			require.NoError(t, authServer.UpsertUser(user))
+			_, err = authServer.UpsertUser(ctx, user)
+			require.NoError(t, err)
 
 			userPassword := uuid.NewString()
 			require.NoError(t, authServer.UpsertPassword(tt.teleportUser, []byte(userPassword)))
@@ -264,7 +273,8 @@ func TestDiagnoseConnectionForPostgresDatabases(t *testing.T) {
 	user, err := types.NewUser("llama")
 	require.NoError(t, err)
 	user.AddRole(roleWithFullAccess.GetName())
-	require.NoError(t, authServer.UpsertUser(user))
+	_, err = authServer.UpsertUser(ctx, user)
+	require.NoError(t, err)
 	userPassword := uuid.NewString()
 	require.NoError(t, authServer.UpsertPassword("llama", []byte(userPassword)))
 	webPack := helpers.LoginWebClient(t, proxyAddr.String(), "llama", userPassword)
@@ -276,7 +286,7 @@ func TestDiagnoseConnectionForPostgresDatabases(t *testing.T) {
 		RequireMFAType: types.RequireMFAType_SESSION,
 	})
 	require.NoError(t, err)
-	err = authServer.SetAuthPreference(ctx, ap)
+	_, err = authServer.UpsertAuthPreference(ctx, ap)
 	require.NoError(t, err)
 
 	// Set up otp device.

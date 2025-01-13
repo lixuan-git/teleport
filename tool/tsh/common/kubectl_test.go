@@ -1,23 +1,25 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package common
 
 import (
-	"path"
+	"path/filepath"
 	"testing"
 
 	"github.com/google/uuid"
@@ -26,8 +28,9 @@ import (
 
 	"github.com/gravitational/teleport/api/profile"
 	"github.com/gravitational/teleport/api/utils/keys"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/client"
+	"github.com/gravitational/teleport/lib/cryptosuites"
 	"github.com/gravitational/teleport/lib/fixtures"
 	"github.com/gravitational/teleport/lib/kube/kubeconfig"
 )
@@ -110,7 +113,7 @@ func Test_maybeStartKubeLocalProxy(t *testing.T) {
 
 			var localProxyCreated bool
 			var loadedKubeClusters kubeconfig.LocalProxyClusters
-			wantLocalProxyKubeConfigLocation := path.Join(tshHome, uuid.NewString())
+			wantLocalProxyKubeConfigLocation := filepath.Join(tshHome, uuid.NewString())
 
 			closeFn, actualKubeConfigLocation, err := maybeStartKubeLocalProxy(cf,
 				withKubectlArgs(test.inputArgs),
@@ -263,17 +266,19 @@ func Test_overwriteKubeconfigFlagInEnv(t *testing.T) {
 }
 
 func mustSetupKubeconfig(t *testing.T, tshHome, kubeCluster string) string {
-	kubeconfigLocation := path.Join(tshHome, "kubeconfig")
-	priv, err := keys.ParsePrivateKey([]byte(fixtures.SSHCAPrivateKey))
+	kubeconfigLocation := filepath.Join(tshHome, "kubeconfig")
+	key, err := cryptosuites.GenerateKeyWithAlgorithm(cryptosuites.ECDSAP256)
+	require.NoError(t, err)
+	priv, err := keys.NewSoftwarePrivateKey(key)
 	require.NoError(t, err)
 	err = kubeconfig.Update(kubeconfigLocation, kubeconfig.Values{
 		TeleportClusterName: "localhost",
 		ClusterAddr:         "https://localhost:443",
 		KubeClusters:        []string{kubeCluster},
-		Credentials: &client.Key{
-			PrivateKey: priv,
-			TLSCert:    []byte(fixtures.TLSCACertPEM),
-			TrustedCerts: []auth.TrustedCerts{{
+		Credentials: &client.KeyRing{
+			TLSPrivateKey: priv,
+			TLSCert:       []byte(fixtures.TLSCACertPEM),
+			TrustedCerts: []authclient.TrustedCerts{{
 				TLSCertificates: [][]byte{[]byte(fixtures.TLSCACertPEM)},
 			}},
 		},

@@ -1,18 +1,20 @@
-/*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 /* MIT License
 
@@ -38,7 +40,7 @@ SOFTWARE.
 
 */
 
-import React from 'react';
+import { forwardRef } from 'react';
 
 import { Icon, IconProps } from '../Icon';
 
@@ -48,17 +50,14 @@ THIS FILE IS GENERATED. DO NOT EDIT.
 
 */
 
-export function ArrowFatLinesUp({
-  size = 24,
-  color,
-  ...otherProps
-}: IconProps) {
-  return (
+export const ArrowFatLinesUp = forwardRef<HTMLSpanElement, IconProps>(
+  ({ size = 24, color, ...otherProps }, ref) => (
     <Icon
       size={size}
       color={color}
       className="icon icon-arrowfatlinesup"
       {...otherProps}
+      ref={ref}
     >
       <path
         fillRule="evenodd"
@@ -68,5 +67,5 @@ export function ArrowFatLinesUp({
       <path d="M6.75 20.25C6.75 19.8358 7.08579 19.5 7.5 19.5H16.5C16.9142 19.5 17.25 19.8358 17.25 20.25C17.25 20.6642 16.9142 21 16.5 21H7.5C7.08579 21 6.75 20.6642 6.75 20.25Z" />
       <path d="M7.5 16.5C7.08579 16.5 6.75 16.8358 6.75 17.25C6.75 17.6642 7.08579 18 7.5 18H16.5C16.9142 18 17.25 17.6642 17.25 17.25C17.25 16.8358 16.9142 16.5 16.5 16.5H7.5Z" />
     </Icon>
-  );
-}
+  )
+);

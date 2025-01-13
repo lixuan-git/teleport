@@ -1,30 +1,32 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package kubernetes
 
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"sync"
 
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	kubeerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -170,7 +172,7 @@ func NewSharedWithClient(restClient kubernetes.Interface) (*Backend, error) {
 	ident := os.Getenv(ReleaseNameEnv)
 	if ident == "" {
 		ident = "teleport"
-		log.Warnf("Var %q is not set, falling back to default identifier %q for shared store.", ReleaseNameEnv, ident)
+		slog.WarnContext(context.Background(), "Var RELEASE_NAME is not set, falling back to default identifier teleport for shared store.")
 	}
 
 	return NewWithConfig(
@@ -219,7 +221,7 @@ func (b *Backend) Exists(ctx context.Context) bool {
 // Get reads the secret and extracts the key from it.
 // If the secret does not exist or the key is not found it returns trace.Notfound,
 // otherwise returns the underlying error.
-func (b *Backend) Get(ctx context.Context, key []byte) (*backend.Item, error) {
+func (b *Backend) Get(ctx context.Context, key backend.Key) (*backend.Item, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -258,7 +260,7 @@ func (b *Backend) getSecret(ctx context.Context) (*corev1.Secret, error) {
 
 // readSecretData reads the secret content and extracts the content for key.
 // returns an error if the key does not exist or the data is empty.
-func (b *Backend) readSecretData(ctx context.Context, key []byte) (*backend.Item, error) {
+func (b *Backend) readSecretData(ctx context.Context, key backend.Key) (*backend.Item, error) {
 	secret, err := b.getSecret(ctx)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -266,7 +268,7 @@ func (b *Backend) readSecretData(ctx context.Context, key []byte) (*backend.Item
 
 	data, ok := secret.Data[backendKeyToSecret(key)]
 	if !ok || len(data) == 0 {
-		return nil, trace.NotFound("key [%s] not found in secret %s", string(key), b.SecretName)
+		return nil, trace.NotFound("key [%s] not found in secret %s", key.String(), b.SecretName)
 	}
 
 	return &backend.Item{
@@ -350,8 +352,8 @@ func generateSecretAnnotations(namespace, releaseNameEnv string) map[string]stri
 
 // backendKeyToSecret replaces the "/" with "."
 // "/" chars are not allowed in Kubernetes Secret keys.
-func backendKeyToSecret(k []byte) string {
-	return strings.ReplaceAll(string(k), "/", ".")
+func backendKeyToSecret(k backend.Key) string {
+	return strings.ReplaceAll(k.String(), string(backend.Separator), ".")
 }
 
 func updateDataMap(data map[string][]byte, items ...backend.Item) {

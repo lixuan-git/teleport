@@ -1,28 +1,31 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React from 'react';
 import styled from 'styled-components';
-import { ButtonBorder, Box, Flex, Text } from 'design';
+
+import { Box, Button, ButtonBorder, Flex, Text } from 'design';
 import * as Icons from 'design/Icon';
+
+import { useConsoleContext } from 'teleport/Console/consoleContextProvider';
 import {
   FileTransferRequest,
   isOwnRequest,
 } from 'teleport/Console/DocumentSsh/useFileTransfer';
-import { useConsoleContext } from 'teleport/Console/consoleContextProvider';
 import { UserContext } from 'teleport/services/user';
 
 type FileTransferRequestsProps = {
@@ -41,7 +44,7 @@ export const FileTransferRequests = ({
 
   if (requests.length > 0) {
     return (
-      <Container show={requests.length > 0}>
+      <Container>
         <Flex justifyContent="space-between" alignItems="baseline">
           <Text fontSize={3} bold>
             File Transfer Requests
@@ -128,18 +131,25 @@ const ResponseForm = ({
         {getPendingText(request)}
       </Text>
       <Flex gap={2}>
-        <ButtonBorder
+        <Button
+          fill="border"
+          intent="success"
           disabled={request.approvers.includes(currentUser.username)}
           block
           onClick={() => onApprove(request.requestID, true)}
         >
           <Icons.Check size="small" mr={2} />
           Approve
-        </ButtonBorder>
-        <ButtonBorder block onClick={() => onDeny(request.requestID, false)}>
+        </Button>
+        <Button
+          fill="border"
+          intent="danger"
+          block
+          onClick={() => onDeny(request.requestID, false)}
+        >
           <Icons.Cross size="small" mr={2} />
           Deny
-        </ButtonBorder>
+        </Button>
       </Flex>
     </Box>
   );
@@ -152,7 +162,7 @@ const getPendingText = (request: FileTransferRequest) => {
   return `${request.requester} wants to upload ${request.filename} to ${request.location}`;
 };
 
-const Container = styled.div`
+const Container = styled.div<{ backgroundColor?: string }>`
   background: ${props =>
     props.backgroundColor || props.theme.colors.levels.surface};
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);

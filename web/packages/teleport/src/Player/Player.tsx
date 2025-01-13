@@ -1,56 +1,81 @@
-/*
-Copyright 2019 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React from 'react';
+import { useCallback, useEffect } from 'react';
 import styled from 'styled-components';
 
-import { Flex, Box } from 'design';
-
+import { Box, Flex, Indicator } from 'design';
 import { Danger } from 'design/Alert';
+import { makeSuccessAttempt, useAsync } from 'shared/hooks/useAsync';
 
-import { useParams, useLocation } from 'teleport/components/Router';
-
-import session from 'teleport/services/websession';
+import { useLocation, useParams } from 'teleport/components/Router';
 import { UrlPlayerParams } from 'teleport/config';
 import { getUrlParameter } from 'teleport/services/history';
-
 import { RecordingType } from 'teleport/services/recordings';
+import session from 'teleport/services/websession';
+import useTeleport from 'teleport/useTeleport';
 
 import ActionBar from './ActionBar';
 import { DesktopPlayer } from './DesktopPlayer';
-import SshPlayer from './SshPlayer';
 import Tabs, { TabItem } from './PlayerTabs';
+import SshPlayer from './SshPlayer';
 
-export default function Player() {
+const validRecordingTypes = ['ssh', 'k8s', 'desktop', 'database'];
+
+export function Player() {
+  const ctx = useTeleport();
   const { sid, clusterId } = useParams<UrlPlayerParams>();
   const { search } = useLocation();
+
+  useEffect(() => {
+    document.title = `Play ${sid} • ${clusterId}`;
+  }, [sid, clusterId]);
 
   const recordingType = getUrlParameter(
     'recordingType',
     search
   ) as RecordingType;
+
+  // In order to render the progress bar, we need to know the length of the session.
+  // All in-product links to the session player should include the session duration in the URL.
+  // Some users manually build the URL based on the session ID and don't specify the session duration.
+  // For those cases, we make a separate API call to get the duration.
+  const [fetchDurationAttempt, fetchDuration] = useAsync(
+    useCallback(
+      () => ctx.recordingsService.fetchRecordingDuration(clusterId, sid),
+      [ctx.recordingsService, clusterId, sid]
+    )
+  );
+
+  const validRecordingType = validRecordingTypes.includes(recordingType);
   const durationMs = Number(getUrlParameter('durationMs', search));
+  const shouldFetchSessionDuration =
+    validRecordingType && (!Number.isInteger(durationMs) || durationMs <= 0);
 
-  const validRecordingType =
-    recordingType === 'ssh' ||
-    recordingType === 'k8s' ||
-    recordingType === 'desktop';
-  const validDurationMs = Number.isInteger(durationMs) && durationMs > 0;
+  useEffect(() => {
+    if (shouldFetchSessionDuration) {
+      fetchDuration();
+    }
+  }, [fetchDuration, shouldFetchSessionDuration]);
 
-  document.title = `${clusterId} • Play ${sid}`;
+  const combinedAttempt = shouldFetchSessionDuration
+    ? fetchDurationAttempt
+    : makeSuccessAttempt({ durationMs });
 
   function onLogout() {
     session.logout();
@@ -62,20 +87,32 @@ export default function Player() {
         <Box textAlign="center" mx={10} mt={5}>
           <Danger mb={0}>
             Invalid query parameter recordingType: {recordingType}, should be
-            'ssh' or 'desktop'
+            one of {validRecordingTypes.join(', ')}.
           </Danger>
         </Box>
       </StyledPlayer>
     );
   }
 
-  if (recordingType === 'desktop' && !validDurationMs) {
+  if (
+    combinedAttempt.status === '' ||
+    combinedAttempt.status === 'processing'
+  ) {
+    return (
+      <StyledPlayer>
+        <Box textAlign="center" mx={10} mt={5}>
+          <Indicator />
+        </Box>
+      </StyledPlayer>
+    );
+  }
+  if (combinedAttempt.status === 'error') {
     return (
       <StyledPlayer>
         <Box textAlign="center" mx={10} mt={5}>
           <Danger mb={0}>
-            Invalid query parameter durationMs:{' '}
-            {getUrlParameter('durationMs', search)}, should be an integer.
+            Unable to determine the length of this session. The session
+            recording may be incomplete or corrupted.
           </Danger>
         </Box>
       </StyledPlayer>
@@ -101,15 +138,20 @@ export default function Player() {
           <DesktopPlayer
             sid={sid}
             clusterId={clusterId}
-            durationMs={durationMs}
+            durationMs={combinedAttempt.data.durationMs}
           />
         ) : (
-          <SshPlayer sid={sid} clusterId={clusterId} />
+          <SshPlayer
+            sid={sid}
+            clusterId={clusterId}
+            durationMs={combinedAttempt.data.durationMs}
+          />
         )}
       </Flex>
     </StyledPlayer>
   );
 }
+
 const StyledPlayer = styled.div`
   display: flex;
   height: 100%;

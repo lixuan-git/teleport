@@ -1,58 +1,58 @@
 /**
- * Copyright 2023 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-import React from 'react';
 
+import { Fragment, ReactNode } from 'react';
 import { useTheme } from 'styled-components';
 
 import { IconCircle } from 'design/Icon/IconCircle';
 
 import Flex from '../Flex';
 import Text from '../Text';
-
-import * as SvgIcons from '.';
+import { SVGIconProps } from './common';
+import { TeleportGearIcon } from './TeleportGearIcon';
 
 export default {
   title: 'Design/Icon',
 };
 
 export const CustomIcons = () => {
-  const icons = Object.keys(SvgIcons);
+  const icons = Object.entries({ TeleportGearIcon });
   return (
     <Flex flexWrap="wrap">
-      {icons.map(icon => {
-        // eslint-disable-next-line import/namespace
-        const S = SvgIcons[icon];
+      {icons.map(([icon, S]) => {
         const size = 64;
 
         return (
-          <>
+          <Fragment key={icon}>
             <IconBox text={icon}>
               <IconContainer Icon={S} size={size} />
             </IconBox>
             <IconBox text={icon}>
               <IconCircle Icon={S} size={size} />
             </IconBox>
-          </>
+          </Fragment>
         );
       })}
     </Flex>
   );
 };
 
-const IconBox = ({ children, text }) => {
+const IconBox = ({ children, text }: { children: ReactNode; text: string }) => {
   const theme = useTheme();
 
   return (
@@ -68,21 +68,21 @@ const IconBox = ({ children, text }) => {
       <Flex justifyContent="center" p={2}>
         {children}
       </Flex>
-      <Text typography="paragraph2" mt={2}>
+      <Text typography="body3" mt={2}>
         {text}
       </Text>
     </Flex>
   );
 };
 
-const IconContainer = ({ Icon, size }) => {
+const IconContainer = ({
+  Icon,
+  size,
+}: {
+  Icon: React.ComponentType<SVGIconProps>;
+  size: number;
+}) => {
   const theme = useTheme();
 
-  return (
-    <Icon
-      size={size}
-      bg={theme.colors.spotBackground[0]}
-      fill={theme.colors.text.main}
-    />
-  );
+  return <Icon size={size} fill={theme.colors.text.main} />;
 };

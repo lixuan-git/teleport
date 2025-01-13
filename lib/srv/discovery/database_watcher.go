@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package discovery
 
@@ -26,30 +28,32 @@ import (
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/srv/discovery/common"
+	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/lib/utils/slices"
 )
 
 const databaseEventPrefix = "db/"
 
 func (s *Server) startDatabaseWatchers() error {
-	if len(s.databaseFetchers) == 0 {
+	if len(s.databaseFetchers) == 0 && s.dynamicMatcherWatcher == nil {
 		return nil
 	}
 
 	var (
-		newDatabases types.ResourcesWithLabels
+		newDatabases []types.Database
 		mu           sync.Mutex
 	)
 
 	reconciler, err := services.NewReconciler(
-		services.ReconcilerConfig{
-			Matcher:             func(_ types.ResourceWithLabels) bool { return true },
+		services.ReconcilerConfig[types.Database]{
+			Matcher:             func(database types.Database) bool { return true },
 			GetCurrentResources: s.getCurrentDatabases,
-			GetNewResources: func() types.ResourcesWithLabelsMap {
+			GetNewResources: func() map[string]types.Database {
 				mu.Lock()
 				defer mu.Unlock()
-				return newDatabases.ToMap()
+				return utils.FromSlice(newDatabases, types.Database.GetName)
 			},
-			Log:      s.Log.WithField("kind", types.KindDatabase),
+			Logger:   s.Log.With("kind", types.KindDatabase),
 			OnCreate: s.onDatabaseCreate,
 			OnUpdate: s.onDatabaseUpdate,
 			OnDelete: s.onDatabaseDelete,
@@ -59,13 +63,18 @@ func (s *Server) startDatabaseWatchers() error {
 		return trace.Wrap(err)
 	}
 
-	watcher, err := common.NewWatcher(s.ctx, common.WatcherConfig{
-		Fetchers:       s.databaseFetchers,
-		Log:            s.Log.WithField("kind", types.KindDatabase),
-		DiscoveryGroup: s.DiscoveryGroup,
-		Interval:       s.PollInterval,
-		Origin:         types.OriginCloud,
-	})
+	watcher, err := common.NewWatcher(s.ctx,
+		common.WatcherConfig{
+			FetchersFn:     s.getAllDatabaseFetchers,
+			Logger:         s.Log.With("kind", types.KindDatabase),
+			DiscoveryGroup: s.DiscoveryGroup,
+			Interval:       s.PollInterval,
+			TriggerFetchC:  s.newDiscoveryConfigChangedSub(),
+			Origin:         types.OriginCloud,
+			Clock:          s.clock,
+			PreFetchHookFn: s.databaseWatcherIterationStarted,
+		},
+	)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -73,55 +82,134 @@ func (s *Server) startDatabaseWatchers() error {
 
 	go func() {
 		for {
+			discoveryConfigsChanged := map[string]struct{}{}
+			resourcesFoundByGroup := make(map[awsResourceGroup]int)
+
 			select {
 			case newResources := <-watcher.ResourcesC():
+				dbs := make([]types.Database, 0, len(newResources))
+				for _, r := range newResources {
+					db, ok := r.(types.Database)
+					if !ok {
+						continue
+					}
+
+					resourceGroup := awsResourceGroupFromLabels(db.GetStaticLabels())
+					resourcesFoundByGroup[resourceGroup] += 1
+					discoveryConfigsChanged[resourceGroup.discoveryConfigName] = struct{}{}
+
+					dbs = append(dbs, db)
+				}
 				mu.Lock()
-				newDatabases = newResources
+				newDatabases = dbs
 				mu.Unlock()
 
+				for group, count := range resourcesFoundByGroup {
+					s.awsRDSResourcesStatus.incrementFound(group, count)
+				}
+
 				if err := reconciler.Reconcile(s.ctx); err != nil {
-					s.Log.WithError(err).Warn("Unable to reconcile database resources.")
-				} else if s.onDatabaseReconcile != nil {
+					s.Log.WarnContext(s.ctx, "Unable to reconcile database resources", "error", err)
+
+					// When reconcile fails, it is assumed that everything failed.
+					for group, count := range resourcesFoundByGroup {
+						s.awsRDSResourcesStatus.incrementFailed(group, count)
+					}
+
+					break
+				}
+
+				for group, count := range resourcesFoundByGroup {
+					s.awsRDSResourcesStatus.incrementEnrolled(group, count)
+				}
+
+				if s.onDatabaseReconcile != nil {
 					s.onDatabaseReconcile()
 				}
 
 			case <-s.ctx.Done():
 				return
 			}
+
+			for dc := range discoveryConfigsChanged {
+				s.updateDiscoveryConfigStatus(dc)
+			}
 		}
 	}()
 	return nil
 }
 
-func (s *Server) getCurrentDatabases() types.ResourcesWithLabelsMap {
+func (s *Server) databaseWatcherIterationStarted() {
+	allFetchers := s.getAllDatabaseFetchers()
+	if len(allFetchers) == 0 {
+		return
+	}
+
+	s.submitFetchersEvent(allFetchers)
+
+	awsResultGroups := slices.FilterMapUnique(
+		allFetchers,
+		func(f common.Fetcher) (awsResourceGroup, bool) {
+			include := f.GetDiscoveryConfigName() != "" && f.IntegrationName() != ""
+			resourceGroup := awsResourceGroup{
+				discoveryConfigName: f.GetDiscoveryConfigName(),
+				integration:         f.IntegrationName(),
+			}
+			return resourceGroup, include
+		},
+	)
+
+	for _, g := range awsResultGroups {
+		s.awsRDSResourcesStatus.iterationStarted(g)
+	}
+
+	discoveryConfigs := slices.FilterMapUnique(awsResultGroups, func(g awsResourceGroup) (s string, include bool) {
+		return g.discoveryConfigName, true
+	})
+	s.updateDiscoveryConfigStatus(discoveryConfigs...)
+
+	s.awsRDSResourcesStatus.reset()
+}
+
+func (s *Server) getAllDatabaseFetchers() []common.Fetcher {
+	allFetchers := make([]common.Fetcher, 0, len(s.databaseFetchers))
+
+	s.muDynamicDatabaseFetchers.RLock()
+	for _, fetcherSet := range s.dynamicDatabaseFetchers {
+		allFetchers = append(allFetchers, fetcherSet...)
+	}
+	s.muDynamicDatabaseFetchers.RUnlock()
+
+	allFetchers = append(allFetchers, s.databaseFetchers...)
+
+	return allFetchers
+}
+
+func (s *Server) getCurrentDatabases() map[string]types.Database {
 	databases, err := s.AccessPoint.GetDatabases(s.ctx)
 	if err != nil {
-		s.Log.WithError(err).Warn("Failed to get databases from cache.")
+		s.Log.WarnContext(s.ctx, "Failed to get databases from cache", "error", err)
 		return nil
 	}
 
-	return types.Databases(filterResources(databases, types.OriginCloud, s.DiscoveryGroup)).AsResources().ToMap()
+	return utils.FromSlice[types.Database](filterResources(databases, types.OriginCloud, s.DiscoveryGroup), func(database types.Database) string {
+		return database.GetName()
+	})
 }
 
-func (s *Server) onDatabaseCreate(ctx context.Context, resource types.ResourceWithLabels) error {
-	database, ok := resource.(types.Database)
-	if !ok {
-		return trace.BadParameter("invalid type received; expected types.Database, received %T", database)
-	}
-	s.Log.Debugf("Creating database %s.", database.GetName())
+func (s *Server) onDatabaseCreate(ctx context.Context, database types.Database) error {
+	s.Log.DebugContext(ctx, "Creating database", "database", database.GetName())
 	err := s.AccessPoint.CreateDatabase(ctx, database)
-	// If the resource already exists, it means that the resource was created
-	// by a previous discovery_service instance that didn't support the discovery
-	// group feature or the discovery group was changed.
-	// In this case, we need to update the resource with the
-	// discovery group label to ensure the user doesn't have to manually delete
-	// the resource.
-	// TODO(tigrato): DELETE on 15.0.0
-	if trace.IsAlreadyExists(err) {
-		return trace.Wrap(s.onDatabaseUpdate(ctx, resource))
-	}
+	// If the database already exists but has cloud origin and an empty
+	// discovery group, then update it.
 	if err != nil {
-		return trace.Wrap(err)
+		err := s.resolveCreateErr(err, types.OriginCloud, func() (types.ResourceWithLabels, error) {
+			return s.AccessPoint.GetDatabase(ctx, database.GetName())
+		})
+		if err != nil {
+			return trace.Wrap(err)
+		}
+		return trace.Wrap(s.onDatabaseUpdate(ctx, database, nil))
 	}
 	err = s.emitUsageEvents(map[string]*usageeventsv1.ResourceCreateEvent{
 		databaseEventPrefix + database.GetName(): {
@@ -135,26 +223,18 @@ func (s *Server) onDatabaseCreate(ctx context.Context, resource types.ResourceWi
 		},
 	})
 	if err != nil {
-		s.Log.WithError(err).Debug("Error emitting usage event.")
+		s.Log.DebugContext(ctx, "Error emitting usage event", "error", err)
 	}
 	return nil
 }
 
-func (s *Server) onDatabaseUpdate(ctx context.Context, resource types.ResourceWithLabels) error {
-	database, ok := resource.(types.Database)
-	if !ok {
-		return trace.BadParameter("invalid type received; expected types.Database, received %T", database)
-	}
-	s.Log.Debugf("Updating database %s.", database.GetName())
+func (s *Server) onDatabaseUpdate(ctx context.Context, database, _ types.Database) error {
+	s.Log.DebugContext(ctx, "Updating database", "database", database.GetName())
 	return trace.Wrap(s.AccessPoint.UpdateDatabase(ctx, database))
 }
 
-func (s *Server) onDatabaseDelete(ctx context.Context, resource types.ResourceWithLabels) error {
-	database, ok := resource.(types.Database)
-	if !ok {
-		return trace.BadParameter("invalid type received; expected types.Database, received %T", database)
-	}
-	s.Log.Debugf("Deleting database %s.", database.GetName())
+func (s *Server) onDatabaseDelete(ctx context.Context, database types.Database) error {
+	s.Log.DebugContext(ctx, "Deleting database", "database", database.GetName())
 	return trace.Wrap(s.AccessPoint.DeleteDatabase(ctx, database.GetName()))
 }
 

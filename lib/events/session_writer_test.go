@@ -1,18 +1,20 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package events_test
 
@@ -26,7 +28,6 @@ import (
 	"time"
 
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 
 	apidefaults "github.com/gravitational/teleport/api/defaults"
@@ -61,7 +62,7 @@ func TestSessionWriter(t *testing.T) {
 		select {
 		case event := <-test.eventsCh:
 			require.Equal(t, string(test.sid), event.SessionID)
-			require.Nil(t, event.Error)
+			require.NoError(t, event.Error)
 		case <-test.ctx.Done():
 			t.Fatalf("Timeout waiting for async upload, try `go test -v` to get more logs for details")
 		}
@@ -75,7 +76,7 @@ func TestSessionWriter(t *testing.T) {
 		for _, part := range parts {
 			reader := events.NewProtoReader(bytes.NewReader(part))
 			out, err := reader.ReadAll(test.ctx)
-			require.Nil(t, err, "part crash %#v", part)
+			require.NoError(t, err, "part crash %#v", part)
 			outEvents = append(outEvents, out...)
 		}
 
@@ -93,7 +94,7 @@ func TestSessionWriter(t *testing.T) {
 				OnRecordEvent: func(ctx context.Context, sid session.ID, pe apievents.PreparedSessionEvent) error {
 					event := pe.GetAuditEvent()
 					if event.GetIndex() > 1 && terminateConnection.CompareAndSwap(1, 0) == true {
-						log.Debugf("Terminating connection at event %v", event.GetIndex())
+						t.Logf("Terminating connection at event %v", event.GetIndex())
 						return trace.ConnectionProblem(nil, "connection terminated")
 					}
 					return nil
@@ -105,7 +106,7 @@ func TestSessionWriter(t *testing.T) {
 						// simulate status update loss
 						select {
 						case <-stream.Status():
-							log.Debugf("Stealing status update.")
+							t.Log("Stealing status update.")
 						case <-time.After(time.Second):
 							return nil, trace.BadParameter("timeout")
 						}
@@ -135,7 +136,7 @@ func TestSessionWriter(t *testing.T) {
 			err = test.writer.RecordEvent(test.ctx, event)
 			require.NoError(t, err)
 		}
-		log.Debugf("Emitted %v events in %v.", len(inEvents), time.Since(start))
+		t.Logf("Emitted %v events in %v.", len(inEvents), time.Since(start))
 		err := test.writer.Complete(test.ctx)
 		require.NoError(t, err)
 
@@ -158,7 +159,7 @@ func TestSessionWriter(t *testing.T) {
 				OnRecordEvent: func(ctx context.Context, sid session.ID, pe apievents.PreparedSessionEvent) error {
 					event := pe.GetAuditEvent()
 					if event.GetIndex() > 600 && terminateConnection.CompareAndSwap(1, 0) == true {
-						log.Debugf("Terminating connection at event %v", event.GetIndex())
+						t.Logf("Terminating connection at event %v", event.GetIndex())
 						return trace.ConnectionProblem(nil, "connection terminated")
 					}
 					return nil
@@ -192,7 +193,7 @@ func TestSessionWriter(t *testing.T) {
 			err = test.writer.RecordEvent(test.ctx, event)
 			require.NoError(t, err)
 		}
-		log.Debugf("Emitted all events in %v.", time.Since(start))
+		t.Logf("Emitted all events in %v.", time.Since(start))
 		err := test.writer.Complete(test.ctx)
 		require.NoError(t, err)
 
@@ -219,7 +220,7 @@ func TestSessionWriter(t *testing.T) {
 				OnRecordEvent: func(ctx context.Context, sid session.ID, pe apievents.PreparedSessionEvent) error {
 					event := pe.GetAuditEvent()
 					if event.GetIndex() >= int64(submitEvents-1) && terminateConnection.CompareAndSwap(1, 0) == true {
-						log.Debugf("Locking connection at event %v", event.GetIndex())
+						t.Logf("Locking connection at event %v", event.GetIndex())
 						<-hangCtx.Done()
 						return trace.ConnectionProblem(hangCtx.Err(), "stream hangs")
 					}
@@ -255,8 +256,8 @@ func TestSessionWriter(t *testing.T) {
 			require.NoError(t, err)
 		}
 		elapsedTime := time.Since(start)
-		log.Debugf("Emitted all events in %v.", elapsedTime)
-		require.True(t, elapsedTime < time.Second)
+		t.Logf("Emitted all events in %v.", elapsedTime)
+		require.Less(t, elapsedTime, time.Second)
 		hangCancel()
 		err := test.writer.Complete(test.ctx)
 		require.NoError(t, err)
@@ -292,7 +293,7 @@ func TestSessionWriter(t *testing.T) {
 		test.Close(context.Background())
 		require.Equal(t, len(inEvents), len(emittedEvents))
 		for _, event := range emittedEvents {
-			require.Equal(t, event.GetClusterName(), "cluster")
+			require.Equal(t, "cluster", event.GetClusterName())
 		}
 	})
 
@@ -404,9 +405,9 @@ func (a *sessionWriterTest) collectEvents(t *testing.T) []apievents.AuditEvent {
 	var uploadID string
 	select {
 	case event := <-a.eventsCh:
-		log.Debugf("Got status update, upload %v in %v.", event.UploadID, time.Since(start))
+		t.Logf("Got status update, upload %v in %v.", event.UploadID, time.Since(start))
 		require.Equal(t, string(a.sid), event.SessionID)
-		require.Nil(t, event.Error)
+		require.NoError(t, event.Error)
 		uploadID = event.UploadID
 	case <-a.ctx.Done():
 		t.Fatalf("Timeout waiting for async upload, try `go test -v` to get more logs for details")
@@ -421,8 +422,8 @@ func (a *sessionWriterTest) collectEvents(t *testing.T) []apievents.AuditEvent {
 	}
 	reader := events.NewProtoReader(io.MultiReader(readers...))
 	outEvents, err := reader.ReadAll(a.ctx)
-	require.Nil(t, err, "failed to read")
-	log.WithFields(reader.GetStats().ToFields()).Debugf("Reader stats.")
+	require.NoError(t, err, "failed to read")
+	t.Logf("Reader stats :%v", reader.GetStats().ToFields())
 
 	return outEvents
 }

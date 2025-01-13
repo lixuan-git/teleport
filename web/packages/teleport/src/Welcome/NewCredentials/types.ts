@@ -1,28 +1,30 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-
-import { Attempt } from 'shared/hooks/useAttemptNext';
-
-import { Auth2faType, PrimaryAuthType } from 'shared/services';
-
-import { NewFlow, StepComponentProps } from 'design/StepSlider';
 
 import { ReactElement } from 'react';
 
+import { NewFlow, StepComponentProps } from 'design/StepSlider';
+import { Attempt } from 'shared/hooks/useAttemptNext';
+import { Auth2faType, PrimaryAuthType } from 'shared/services';
+
+import { RecoveryCodesProps } from 'teleport/components/RecoveryCodes';
 import { RecoveryCodes, ResetToken } from 'teleport/services/auth';
+import { DeviceUsage } from 'teleport/services/mfa';
 
 export type UseTokenState = {
   auth2faType: Auth2faType;
@@ -30,15 +32,16 @@ export type UseTokenState = {
   isPasswordlessEnabled: boolean;
   fetchAttempt: Attempt;
   submitAttempt: Attempt;
+  credential?: Credential;
   clearSubmitAttempt: () => void;
   onSubmit: (password: string, otpCode?: string, deviceName?: string) => void;
+  createNewWebAuthnDevice: (usage: DeviceUsage) => void;
   onSubmitWithWebauthn: (password?: string, deviceName?: string) => void;
   resetToken: ResetToken;
   recoveryCodes: RecoveryCodes;
   redirect: () => void;
   success: boolean;
   finishedRegister: () => void;
-  privateKeyPolicyEnabled: boolean;
 };
 
 // Note: QuestionnaireProps is duplicated in Enterprise (e-teleport/Welcome/Questionnaire/Questionnaire)
@@ -46,6 +49,12 @@ export type QuestionnaireProps = {
   onboard: boolean;
   username?: string;
   onSubmit?: () => void;
+};
+
+// Note: InviteCollaboratorsCardProps is duplicated in Enterprise
+// (e-teleport/Welcome/InviteCollaborators/InviteCollaborators)
+export type InviteCollaboratorsCardProps = {
+  onSubmit: () => void;
 };
 
 export type NewCredentialsProps = UseTokenState & {
@@ -60,6 +69,15 @@ export type NewCredentialsProps = UseTokenState & {
     username,
     onSubmit,
   }: QuestionnaireProps) => ReactElement;
+
+  // support for E's invite collaborators at onboarding
+  displayInviteCollaborators?: boolean;
+  setDisplayInviteCollaborators?: (bool: boolean) => void;
+  InviteCollaborators?: ({
+    onSubmit,
+  }: InviteCollaboratorsCardProps) => ReactElement;
+
+  RecoveryCodes?: React.ComponentType<RecoveryCodesProps>;
 };
 
 export type RegisterSuccessProps = {

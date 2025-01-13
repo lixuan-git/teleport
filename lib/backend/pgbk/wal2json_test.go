@@ -1,16 +1,20 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package pgbk
 
@@ -153,12 +157,11 @@ func TestMessage(t *testing.T) {
 	require.Empty(t, cmp.Diff(evs[0], backend.Event{
 		Type: types.OpPut,
 		Item: backend.Item{
-			Key:      []byte("foo"),
+			Key:      backend.KeyFromString("foo"),
 			Value:    []byte(""),
-			ID:       idFromRevision(rev),
 			Revision: revisionToString(rev),
 		},
-	}))
+	}, cmp.AllowUnexported(backend.Key{})))
 
 	m = &wal2jsonMessage{
 		Action: "U",
@@ -178,12 +181,11 @@ func TestMessage(t *testing.T) {
 	require.Empty(t, cmp.Diff(evs[0], backend.Event{
 		Type: types.OpPut,
 		Item: backend.Item{
-			Key:      []byte("foo"),
+			Key:      backend.KeyFromString("foo"),
 			Value:    []byte("foo2"),
-			ID:       idFromRevision(rev),
 			Revision: revisionToString(rev),
 		},
-	}))
+	}, cmp.AllowUnexported(backend.Key{})))
 
 	m = &wal2jsonMessage{
 		Action: "U",
@@ -207,19 +209,18 @@ func TestMessage(t *testing.T) {
 	require.Empty(t, cmp.Diff(evs[0], backend.Event{
 		Type: types.OpDelete,
 		Item: backend.Item{
-			Key: []byte("foo"),
+			Key: backend.KeyFromString("foo"),
 		},
-	}))
+	}, cmp.AllowUnexported(backend.Key{})))
 	require.Empty(t, cmp.Diff(evs[1], backend.Event{
 		Type: types.OpPut,
 		Item: backend.Item{
-			Key:      []byte("foo2"),
+			Key:      backend.KeyFromString("foo2"),
 			Value:    []byte("foo2"),
 			Expires:  time.Date(2023, 9, 5, 15, 57, 1, 340426000, time.UTC),
-			ID:       idFromRevision(rev),
 			Revision: revisionToString(rev),
 		},
-	}))
+	}, cmp.AllowUnexported(backend.Key{})))
 
 	m = &wal2jsonMessage{
 		Action: "U",
@@ -251,7 +252,7 @@ func TestMessage(t *testing.T) {
 	require.Empty(t, cmp.Diff(evs[0], backend.Event{
 		Type: types.OpDelete,
 		Item: backend.Item{
-			Key: []byte("foo"),
+			Key: backend.KeyFromString("foo"),
 		},
-	}))
+	}, cmp.AllowUnexported(backend.Key{})))
 }

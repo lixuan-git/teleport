@@ -1,16 +1,20 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package pgevents
 
@@ -24,6 +28,7 @@ import (
 	"github.com/jonboulle/clockwork"
 	"github.com/stretchr/testify/require"
 
+	pgcommon "github.com/gravitational/teleport/lib/backend/pgbk/common"
 	"github.com/gravitational/teleport/lib/events/test"
 	"github.com/gravitational/teleport/lib/utils"
 )
@@ -82,7 +87,18 @@ func TestPostgresEvents(t *testing.T) {
 func TestConfig(t *testing.T) {
 	configs := map[string]*Config{
 		"postgres://foo#auth_mode=azure": {
-			AuthMode:        AzureADAuth,
+			AuthConfig: pgcommon.AuthConfig{
+				AuthMode: pgcommon.AzureADAuth,
+			},
+			RetentionPeriod: defaultRetentionPeriod,
+			CleanupInterval: defaultCleanupInterval,
+		},
+		"postgres://foo#auth_mode=gcp-cloudsql&gcp_connection_name=project:location:instance&gcp_ip_type=private": {
+			AuthConfig: pgcommon.AuthConfig{
+				AuthMode:          pgcommon.GCPCloudSQLIAMAuth,
+				GCPConnectionName: "project:location:instance",
+				GCPIPType:         pgcommon.GCPIPTypePrivateIP,
+			},
 			RetentionPeriod: defaultRetentionPeriod,
 			CleanupInterval: defaultCleanupInterval,
 		},
@@ -119,5 +135,48 @@ func TestConfig(t *testing.T) {
 		actualConfig.PoolConfig = nil
 
 		require.Equal(t, expectedConfig, &actualConfig)
+	}
+}
+
+func TestBuildSchema(t *testing.T) {
+	testLog := utils.NewSlogLoggerForTests()
+
+	testConfig := &Config{
+		Log: testLog,
+	}
+
+	hasDateIndex := func(t require.TestingT, schemasRaw any, args ...any) {
+		require.IsType(t, []string(nil), schemasRaw)
+		schemas := schemasRaw.([]string)
+		require.NotEmpty(t, schemas)
+		require.Contains(t, schemas[0], dateIndex, args...)
+	}
+	hasNoDateIndex := func(t require.TestingT, schemasRaw any, args ...any) {
+		require.IsType(t, []string(nil), schemasRaw)
+		schemas := schemasRaw.([]string)
+		require.NotContains(t, schemas[0], dateIndex, args...)
+	}
+
+	tests := []struct {
+		name         string
+		isCockroach  bool
+		assertSchema require.ValueAssertionFunc
+	}{
+		{
+			name:         "postgres",
+			isCockroach:  false,
+			assertSchema: hasDateIndex,
+		},
+		{
+			name:         "cockroach",
+			isCockroach:  true,
+			assertSchema: hasNoDateIndex,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			schemas, _ := buildSchema(tt.isCockroach, testConfig)
+			tt.assertSchema(t, schemas)
+		})
 	}
 }

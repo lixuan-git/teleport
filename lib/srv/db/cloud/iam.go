@@ -1,36 +1,41 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package cloud
 
 import (
 	"context"
+	"errors"
+	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	"github.com/sirupsen/logrus"
 
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/api/utils/retryutils"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/cloud"
 	awslib "github.com/gravitational/teleport/lib/cloud/aws"
+	"github.com/gravitational/teleport/lib/cloud/awsconfig"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/srv/db/common/iam"
 )
@@ -40,7 +45,9 @@ type IAMConfig struct {
 	// Clock is used to control time.
 	Clock clockwork.Clock
 	// AccessPoint is a caching client connected to the Auth Server.
-	AccessPoint auth.DatabaseAccessPoint
+	AccessPoint authclient.DatabaseAccessPoint
+	// AWSConfigProvider provides [aws.Config] for AWS SDK service clients.
+	AWSConfigProvider awsconfig.Provider
 	// Clients is an interface for retrieving cloud clients.
 	Clients cloud.Clients
 	// HostID is the host identified where this agent is running.
@@ -48,6 +55,8 @@ type IAMConfig struct {
 	HostID string
 	// onProcessedTask is called after a task is processed.
 	onProcessedTask func(processedTask iamTask, processError error)
+	// awsClients is an SDK client provider.
+	awsClients awsClientProvider
 }
 
 // Check validates the IAM configurator config.
@@ -58,6 +67,9 @@ func (c *IAMConfig) Check() error {
 	if c.AccessPoint == nil {
 		return trace.BadParameter("missing AccessPoint")
 	}
+	if c.AWSConfigProvider == nil {
+		return trace.BadParameter("missing AWSConfigProvider")
+	}
 	if c.Clients == nil {
 		cloudClients, err := cloud.NewClients()
 		if err != nil {
@@ -67,6 +79,9 @@ func (c *IAMConfig) Check() error {
 	}
 	if c.HostID == "" {
 		return trace.BadParameter("missing HostID")
+	}
+	if c.awsClients == nil {
+		c.awsClients = defaultAWSClients{}
 	}
 	return nil
 }
@@ -88,8 +103,8 @@ type iamTask struct {
 // same policy. These tasks are processed in a background goroutine to avoid
 // blocking callers when acquiring the locks with retries.
 type IAM struct {
-	cfg IAMConfig
-	log logrus.FieldLogger
+	cfg    IAMConfig
+	logger *slog.Logger
 	// agentIdentity is the db agent's identity, as determined by
 	// shared config credential chain used to call AWS STS GetCallerIdentity.
 	// Use getAWSIdentity to get the correct identity for a database,
@@ -109,7 +124,7 @@ func NewIAM(ctx context.Context, config IAMConfig) (*IAM, error) {
 	}
 	return &IAM{
 		cfg:             config,
-		log:             logrus.WithField(trace.Component, "iam"),
+		logger:          slog.With(teleport.ComponentKey, "iam"),
 		tasks:           make(chan iamTask, defaultIAMTaskQueueSize),
 		iamPolicyStatus: sync.Map{},
 	}, nil
@@ -118,8 +133,8 @@ func NewIAM(ctx context.Context, config IAMConfig) (*IAM, error) {
 // Start starts the IAM configurator service.
 func (c *IAM) Start(ctx context.Context) error {
 	go func() {
-		c.log.Info("Started IAM configurator service.")
-		defer c.log.Info("Stopped IAM configurator service.")
+		c.logger.InfoContext(ctx, "Started IAM configurator service")
+		defer c.logger.InfoContext(ctx, "Stopped IAM configurator service")
 		for {
 			select {
 			case <-ctx.Done():
@@ -128,7 +143,10 @@ func (c *IAM) Start(ctx context.Context) error {
 			case task := <-c.tasks:
 				err := c.processTask(ctx, task)
 				if err != nil {
-					c.log.WithError(err).Errorf("Failed to auto-configure IAM for %v.", task.database)
+					c.logger.ErrorContext(ctx, "Failed to auto-configure IAM for database",
+						"error", err,
+						"database", task.database,
+					)
 				}
 				if c.cfg.onProcessedTask != nil {
 					c.cfg.onProcessedTask(task, err)
@@ -141,7 +159,7 @@ func (c *IAM) Start(ctx context.Context) error {
 
 // Setup sets up cloud IAM policies for the provided database.
 func (c *IAM) Setup(ctx context.Context, database types.Database) error {
-	if c.isSetupRequiredForDatabase(database) {
+	if c.isSetupRequiredForDatabase(ctx, database) {
 		c.iamPolicyStatus.Store(database.GetName(), types.IAMPolicyStatus_IAM_POLICY_STATUS_PENDING)
 		return c.addTask(iamTask{
 			isSetup:  true,
@@ -153,7 +171,7 @@ func (c *IAM) Setup(ctx context.Context, database types.Database) error {
 
 // Teardown tears down cloud IAM policies for the provided database.
 func (c *IAM) Teardown(ctx context.Context, database types.Database) error {
-	if c.isSetupRequiredForDatabase(database) {
+	if c.isSetupRequiredForDatabase(ctx, database) {
 		return c.addTask(iamTask{
 			isSetup:  false,
 			database: database,
@@ -163,8 +181,8 @@ func (c *IAM) Teardown(ctx context.Context, database types.Database) error {
 }
 
 // UpdateIAMStatus updates the IAMPolicyExists for the Database.
-func (c *IAM) UpdateIAMStatus(database types.Database) error {
-	if c.isSetupRequiredForDatabase(database) {
+func (c *IAM) UpdateIAMStatus(ctx context.Context, database types.Database) error {
+	if c.isSetupRequiredForDatabase(ctx, database) {
 		awsStatus := database.GetAWS()
 
 		iamPolicyStatus, ok := c.iamPolicyStatus.Load(database.GetName())
@@ -184,7 +202,7 @@ func (c *IAM) UpdateIAMStatus(database types.Database) error {
 }
 
 // isSetupRequiredForDatabase returns true if database type is supported.
-func (c *IAM) isSetupRequiredForDatabase(database types.Database) bool {
+func (c *IAM) isSetupRequiredForDatabase(ctx context.Context, database types.Database) bool {
 	switch database.GetType() {
 	case types.DatabaseTypeRDS,
 		types.DatabaseTypeRDSProxy,
@@ -193,8 +211,20 @@ func (c *IAM) isSetupRequiredForDatabase(database types.Database) bool {
 	case types.DatabaseTypeElastiCache:
 		ok, err := iam.CheckElastiCacheSupportsIAMAuth(database)
 		if err != nil {
-			c.log.WithError(err).Debugf("Assuming database %s supports IAM auth.",
-				database.GetName())
+			c.logger.DebugContext(ctx, "Assuming database supports IAM auth",
+				"error", err,
+				"database", database.GetName(),
+			)
+			return true
+		}
+		return ok
+	case types.DatabaseTypeMemoryDB:
+		ok, err := iam.CheckMemoryDBSupportsIAMAuth(database)
+		if err != nil {
+			c.logger.DebugContext(ctx, "Assuming database supports IAM auth",
+				"error", err,
+				"database", database.GetName(),
+			)
 			return true
 		}
 		return ok
@@ -214,10 +244,12 @@ func (c *IAM) getAWSConfigurator(ctx context.Context, database types.Database) (
 		return nil, trace.Wrap(err)
 	}
 	return newAWS(ctx, awsConfig{
-		clients:    c.cfg.Clients,
-		policyName: policyName,
-		identity:   identity,
-		database:   database,
+		awsConfigProvider: c.cfg.AWSConfigProvider,
+		clients:           c.cfg.Clients,
+		database:          database,
+		identity:          identity,
+		policyName:        policyName,
+		awsClients:        c.cfg.awsClients,
 	})
 }
 
@@ -237,7 +269,7 @@ func (c *IAM) getAWSIdentity(ctx context.Context, database types.Database) (awsl
 		return c.agentIdentity, nil
 	}
 	c.mu.RUnlock()
-	sts, err := c.cfg.Clients.GetAWSSTSClient(ctx, meta.Region)
+	sts, err := c.cfg.Clients.GetAWSSTSClient(ctx, meta.Region, cloud.WithAmbientCredentials())
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -275,8 +307,10 @@ func (c *IAM) processTask(ctx context.Context, task iamTask) error {
 	configurator, err := c.getAWSConfigurator(ctx, task.database)
 	if err != nil {
 		c.iamPolicyStatus.Store(task.database.GetName(), types.IAMPolicyStatus_IAM_POLICY_STATUS_FAILED)
-		if trace.Unwrap(err) == credentials.ErrNoValidProvidersFoundInChain {
-			c.log.Warnf("No AWS credentials provider. Skipping IAM task for database %v.", task.database.GetName())
+		if errors.Is(trace.Unwrap(err), credentials.ErrNoValidProvidersFoundInChain) {
+			c.logger.WarnContext(ctx, "No AWS credentials provider, Skipping IAM task for database",
+				"database", task.database.GetName(),
+			)
 			return nil
 		}
 		return trace.Wrap(err)
@@ -303,7 +337,7 @@ func (c *IAM) processTask(ctx context.Context, task iamTask) error {
 		Retry: retryutils.LinearConfig{
 			Step:   10 * time.Second,
 			Max:    2 * time.Minute,
-			Jitter: retryutils.NewHalfJitter(),
+			Jitter: retryutils.HalfJitter,
 		},
 	})
 	if err != nil {
@@ -314,7 +348,10 @@ func (c *IAM) processTask(ctx context.Context, task iamTask) error {
 	defer func() {
 		err := c.cfg.AccessPoint.CancelSemaphoreLease(ctx, *lease)
 		if err != nil {
-			c.log.WithError(err).Errorf("Failed to cancel lease: %v.", lease)
+			c.logger.ErrorContext(ctx, "Failed to cancel lease",
+				"error", err,
+				"lease", lease.LeaseID,
+			)
 		}
 	}()
 

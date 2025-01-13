@@ -1,34 +1,37 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package aggregating
 
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/api/utils/retryutils"
 	prehogv1 "github.com/gravitational/teleport/gen/proto/go/prehog/v1"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/services"
-	"github.com/gravitational/teleport/lib/utils"
 	"github.com/gravitational/teleport/lib/utils/interval"
 )
 
@@ -47,6 +50,7 @@ const (
 	alertGraceDuration = alertGraceHours * time.Hour
 	alertName          = "reporting-failed"
 	alertLink          = "https://goteleport.com/support/"
+	alertLinkText      = "Contact Support"
 )
 
 const (
@@ -63,8 +67,8 @@ var alertMessage = fmt.Sprintf("Teleport has failed to contact the usage reporti
 type SubmitterConfig struct {
 	// Backend is the backend to use to read reports and apply locks. Required.
 	Backend backend.Backend
-	// Log is the [logrus.FieldLogger] used for logging. Required.
-	Log logrus.FieldLogger
+	// Logger is the used for emitting log messages.
+	Logger *slog.Logger
 	// Status is used to create or clear cluster alerts on a failure. Required.
 	Status services.StatusInternal
 	// Submitter is used to submit usage reports. Required.
@@ -82,14 +86,14 @@ func (cfg *SubmitterConfig) CheckAndSetDefaults() error {
 	if cfg.Backend == nil {
 		return trace.BadParameter("missing Backend")
 	}
-	if cfg.Log == nil {
-		return trace.BadParameter("missing Log")
-	}
 	if cfg.Status == nil {
 		return trace.BadParameter("missing Status")
 	}
 	if cfg.Submitter == nil {
 		return trace.BadParameter("missing Submitter")
+	}
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
 	}
 	return nil
 }
@@ -100,9 +104,9 @@ func (cfg *SubmitterConfig) CheckAndSetDefaults() error {
 // CheckAndSetDefaults, and should probably be called in a goroutine.
 func RunSubmitter(ctx context.Context, cfg SubmitterConfig) {
 	iv := interval.New(interval.Config{
-		FirstDuration: utils.HalfJitter(2 * submitInterval),
+		FirstDuration: retryutils.HalfJitter(2 * submitInterval),
 		Duration:      submitInterval,
-		Jitter:        retryutils.NewSeventhJitter(),
+		Jitter:        retryutils.SeventhJitter,
 	})
 	defer iv.Stop()
 
@@ -120,28 +124,59 @@ func RunSubmitter(ctx context.Context, cfg SubmitterConfig) {
 func submitOnce(ctx context.Context, c SubmitterConfig) {
 	svc := reportService{c.Backend}
 
-	reports, err := svc.listUserActivityReports(ctx, submitBatchSize)
+	userActivityReports, err := svc.listUserActivityReports(ctx, submitBatchSize)
 	if err != nil {
-		c.Log.WithError(err).Error("Failed to load usage reports for submission.")
+		c.Logger.ErrorContext(ctx, "Failed to load usage reports for submission.", "error", err)
 		return
 	}
 
-	if len(reports) < 1 {
+	freeBatchSize := submitBatchSize - len(userActivityReports)
+	var resourcePresenceReports []*prehogv1.ResourcePresenceReport
+	if freeBatchSize > 0 {
+		resourcePresenceReports, err = svc.listResourcePresenceReports(ctx, freeBatchSize)
+		if err != nil {
+			c.Logger.ErrorContext(ctx, "Failed to load resource counts reports for submission.", "error", err)
+			return
+		}
+	}
+
+	totalReportCount := len(userActivityReports) + len(resourcePresenceReports)
+
+	if totalReportCount < 1 {
 		err := ClearAlert(ctx, c.Status)
 		if err == nil {
-			c.Log.Infof("Deleted cluster alert %v after successfully clearing usage report backlog.", alertName)
+			c.Logger.InfoContext(ctx, "Deleted cluster alert after successfully clearing usage report backlog.", "alert", alertName)
 		} else if !trace.IsNotFound(err) {
-			c.Log.WithError(err).Errorf("Failed to delete cluster alert %v.", alertName)
+			c.Logger.ErrorContext(ctx, "Failed to delete cluster alert", "alert", alertName, "error", err)
 		}
 		return
+	}
+
+	oldest := time.Now()
+	newest := time.Time{}
+	if len(userActivityReports) > 0 {
+		if t := userActivityReports[0].GetStartTime().AsTime(); t.Before(oldest) {
+			oldest = t
+		}
+		if t := userActivityReports[len(userActivityReports)-1].GetStartTime().AsTime(); t.After(newest) {
+			newest = t
+		}
+	}
+	if len(resourcePresenceReports) > 0 {
+		if t := resourcePresenceReports[0].GetStartTime().AsTime(); t.Before(oldest) {
+			oldest = t
+		}
+		if t := resourcePresenceReports[len(resourcePresenceReports)-1].GetStartTime().AsTime(); t.After(newest) {
+			newest = t
+		}
 	}
 
 	debugPayload := fmt.Sprintf("%v %q", time.Now().Round(0), c.HostID)
 	if err := svc.createUserActivityReportsLock(ctx, submitLockDuration, []byte(debugPayload)); err != nil {
 		if trace.IsAlreadyExists(err) {
-			c.Log.Debugf("Failed to acquire lock %v, already held.", userActivityReportsLock)
+			c.Logger.DebugContext(ctx, "Failed to acquire lock, already held.", "lock", userActivityReportsLock)
 		} else {
-			c.Log.WithError(err).Errorf("Failed to acquire lock %v.", userActivityReportsLock)
+			c.Logger.ErrorContext(ctx, "Failed to acquire lock.", "lock", userActivityReportsLock, "error", err)
 		}
 		return
 	}
@@ -150,16 +185,18 @@ func submitOnce(ctx context.Context, c SubmitterConfig) {
 	defer cancel()
 
 	batchUUID, err := c.Submitter(lockCtx, &prehogv1.SubmitUsageReportsRequest{
-		UserActivity: reports,
+		UserActivity:     userActivityReports,
+		ResourcePresence: resourcePresenceReports,
 	})
 	if err != nil {
-		c.Log.WithError(err).WithFields(logrus.Fields{
-			"reports":       len(reports),
-			"oldest_report": reports[0].GetStartTime().AsTime(),
-			"newest_report": reports[len(reports)-1].GetStartTime().AsTime(),
-		}).Error("Failed to send usage reports.")
+		c.Logger.ErrorContext(ctx, "Failed to send usage reports.",
+			"reports", totalReportCount,
+			"oldest_report", oldest,
+			"newest_report", newest,
+			"error", err,
+		)
 
-		if time.Since(reports[0].StartTime.AsTime()) <= alertGraceDuration {
+		if time.Since(oldest) <= alertGraceDuration {
 			return
 		}
 		alert, err := types.NewClusterAlert(
@@ -168,32 +205,39 @@ func submitOnce(ctx context.Context, c SubmitterConfig) {
 			types.WithAlertLabel(types.AlertOnLogin, "yes"),
 			types.WithAlertLabel(types.AlertPermitAll, "yes"),
 			types.WithAlertLabel(types.AlertLink, alertLink),
+			types.WithAlertLabel(types.AlertLinkText, alertLinkText),
 		)
 		if err != nil {
-			c.Log.WithError(err).Errorf("Failed to create cluster alert %v.", alertName)
+			c.Logger.ErrorContext(ctx, "Failed to create cluster alert", "alert", alertName, "error", err)
 			return
 		}
 		alert.Metadata.Description = debugPayload
 		if err := c.Status.UpsertClusterAlert(ctx, alert); err != nil {
-			c.Log.WithError(err).Errorf("Failed to upsert cluster alert %v.", alertName)
+			c.Logger.ErrorContext(ctx, "Failed to upsert cluster alert", "alert", alertName, "error", err)
 		}
 		return
 	}
 
-	c.Log.WithFields(logrus.Fields{
-		"batch_uuid":    batchUUID,
-		"reports":       len(reports),
-		"oldest_report": reports[0].GetStartTime().AsTime(),
-	}).Info("Successfully sent usage reports.")
+	c.Logger.InfoContext(ctx, "Successfully sent usage reports.",
+		"batch_uuid", batchUUID,
+		"reports", totalReportCount,
+		"oldest_report", oldest,
+		"newest_report", newest,
+	)
 
 	var lastErr error
-	for _, report := range reports {
+	for _, report := range userActivityReports {
 		if err := svc.deleteUserActivityReport(ctx, report); err != nil {
 			lastErr = err
 		}
 	}
+	for _, report := range resourcePresenceReports {
+		if err := svc.deleteResourcePresenceReport(ctx, report); err != nil {
+			lastErr = err
+		}
+	}
 	if lastErr != nil {
-		c.Log.WithField("last_error", lastErr).Warn("Failed to delete some usage reports after successful send.")
+		c.Logger.WarnContext(ctx, "Failed to delete some usage reports after successful send.", "last_error", lastErr)
 	}
 }
 

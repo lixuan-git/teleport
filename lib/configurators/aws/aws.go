@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package aws
 
@@ -18,29 +22,30 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"slices"
 	"strings"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/arn"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	awssession "github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/iam"
-	"github.com/aws/aws-sdk-go/service/iam/iamiface"
-	"github.com/aws/aws-sdk-go/service/kms"
-	"github.com/aws/aws-sdk-go/service/secretsmanager"
-	"github.com/aws/aws-sdk-go/service/ssm"
-	"github.com/aws/aws-sdk-go/service/ssm/ssmiface"
-	"github.com/aws/aws-sdk-go/service/sts"
-	"github.com/aws/aws-sdk-go/service/sts/stsiface"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/arn"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/iam"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
+	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/aws/smithy-go/tracing/smithyoteltracing"
 	"github.com/gravitational/trace"
-	"golang.org/x/exp/slices"
+	"go.opentelemetry.io/otel"
 
 	"github.com/gravitational/teleport/api/types"
 	apiutils "github.com/gravitational/teleport/api/utils"
 	apiawsutils "github.com/gravitational/teleport/api/utils/aws"
 	awslib "github.com/gravitational/teleport/lib/cloud/aws"
+	awsimds "github.com/gravitational/teleport/lib/cloud/imds/aws"
 	"github.com/gravitational/teleport/lib/configurators"
 	"github.com/gravitational/teleport/lib/defaults"
+	"github.com/gravitational/teleport/lib/modules"
 	"github.com/gravitational/teleport/lib/service/servicecfg"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/srv/db/secrets"
@@ -55,8 +60,6 @@ const (
 	databasePolicyDescription = "Used by Teleport database agents for accessing AWS-hosted databases."
 	// discoveryServicePolicyDescription description used on the policy created.
 	discoveryServicePolicyDescription = "Used by Teleport the discovery service to discover AWS-hosted services."
-	// boundarySuffix boundary policies will have this suffix.
-	boundarySuffix = "Boundary"
 	// policyTeleportTagKey key of the tag added to the policies created.
 	policyTeleportTagKey = "teleport"
 	// policyTeleportTagValue value of the tag added to the policies created.
@@ -79,11 +82,10 @@ type databaseActions struct {
 	metadata []string
 	// managedUsers is a list of actions used for managing database users.
 	managedUsers []string
-	// authBoundary is a list of actions for authorization that need to added
-	// to boundary policies.
-	authBoundary []string
+	// additionalSTSActions is a list of additional actions needed when assuming
+	// a role, e.g. passing session tags.
+	additionalSTSActions []string
 
-	requireIAMEdit        bool
 	requireSecretsManager bool
 }
 
@@ -99,9 +101,6 @@ func (a databaseActions) buildStatement(opt databaseActionsBuildOption) *awslib.
 		actions = append(actions, a.iamAuth...)
 		actions = append(actions, a.managedUsers...)
 	}
-	if opt.withAuthBoundary {
-		actions = append(actions, a.authBoundary...)
-	}
 	return &awslib.Statement{
 		Effect:    awslib.EffectAllow,
 		Actions:   apiutils.Deduplicate(actions),
@@ -110,13 +109,12 @@ func (a databaseActions) buildStatement(opt databaseActionsBuildOption) *awslib.
 }
 
 type databaseActionsBuildOption struct {
-	withDiscovery    bool
-	withMetadata     bool
-	withAuth         bool
-	withAuthBoundary bool
+	withDiscovery bool
+	withMetadata  bool
+	withAuth      bool
 }
 
-func makeDatabaseActionsBuildOption(flags configurators.BootstrapFlags, targetCfg targetConfig, boundary bool) databaseActionsBuildOption {
+func makeDatabaseActionsBuildOption(flags configurators.BootstrapFlags) databaseActionsBuildOption {
 	switch flags.Service {
 	case configurators.DiscoveryService:
 		return databaseActionsBuildOption{
@@ -125,9 +123,8 @@ func makeDatabaseActionsBuildOption(flags configurators.BootstrapFlags, targetCf
 
 	case configurators.DatabaseServiceByDiscoveryServiceConfig:
 		return databaseActionsBuildOption{
-			withDiscovery:    false,
-			withAuth:         true,
-			withAuthBoundary: boundary,
+			withDiscovery: false,
+			withAuth:      true,
 			// Discovered databases should be checked by URL validator which
 			// requires same permissions as the metadata service.
 			withMetadata: true,
@@ -135,10 +132,9 @@ func makeDatabaseActionsBuildOption(flags configurators.BootstrapFlags, targetCf
 
 	case configurators.DatabaseService:
 		return databaseActionsBuildOption{
-			withDiscovery:    true,
-			withMetadata:     true,
-			withAuth:         true,
-			withAuthBoundary: boundary,
+			withDiscovery: true,
+			withMetadata:  true,
+			withAuth:      true,
 		}
 
 	default:
@@ -164,48 +160,49 @@ var (
 		"kms:GenerateDataKey",
 		"kms:Decrypt",
 	}
-	// ec2Actions is a list of actions used for EC2 auto-discovery
-	ec2Actions = []string{
-		"ec2:DescribeInstances",
-		"ssm:GetCommandInvocation",
-		"ssm:SendCommand",
-	}
 	// stsActions is a list of actions used for assuming an AWS role.
 	stsActions = []string{
 		"sts:AssumeRole",
 	}
-	// rdsActions contains IAM actions for services.AWSMatcherRDS (RDS
+	// rdsActions contains IAM actions for types.AWSMatcherRDS (RDS
 	// instances and Aurora clusters).
 	rdsActions = databaseActions{
-		discovery:      []string{"rds:DescribeDBInstances", "rds:DescribeDBClusters"},
-		metadata:       []string{"rds:DescribeDBInstances", "rds:DescribeDBClusters"},
-		iamAuth:        []string{"rds:ModifyDBInstance", "rds:ModifyDBCluster"},
-		authBoundary:   []string{"rds-db:connect"},
-		requireIAMEdit: true,
+		discovery: []string{
+			"rds:DescribeDBInstances",
+			"rds:DescribeDBClusters",
+		},
+		metadata: []string{
+			"rds:DescribeDBInstances",
+			"rds:DescribeDBClusters",
+		},
+		iamAuth: []string{
+			"rds:ModifyDBInstance",
+			"rds:ModifyDBCluster",
+			"rds-db:connect",
+		},
 	}
-	// rdsProxyActions contains IAM actions for services.AWSMatcherRDSProxy.
+	// rdsProxyActions contains IAM actions for types.AWSMatcherRDSProxy.
 	rdsProxyActions = databaseActions{
 		discovery: []string{
 			"rds:DescribeDBProxies",
 			"rds:DescribeDBProxyEndpoints",
-			"rds:DescribeDBProxyTargets",
 			"rds:ListTagsForResource",
 		},
 		metadata: []string{
 			"rds:DescribeDBProxies",
 			"rds:DescribeDBProxyEndpoints",
 		},
-		authBoundary:   []string{"rds-db:connect"},
-		requireIAMEdit: true,
+		iamAuth: []string{
+			"rds-db:connect",
+		},
 	}
-	// redshiftActions contains IAM actions for services.AWSMatcherRedshift.
+	// redshiftActions contains IAM actions for types.AWSMatcherRedshift.
 	redshiftActions = databaseActions{
-		discovery:      []string{"redshift:DescribeClusters"},
-		metadata:       []string{"redshift:DescribeClusters"},
-		authBoundary:   []string{"redshift:GetClusterCredentials"},
-		requireIAMEdit: true,
+		discovery: []string{"redshift:DescribeClusters"},
+		metadata:  []string{"redshift:DescribeClusters"},
+		iamAuth:   []string{"redshift:GetClusterCredentials"},
 	}
-	// redshiftServerlessActions contains IAM actions for services.AWSMatcherRedshiftServerless.
+	// redshiftServerlessActions contains IAM actions for types.AWSMatcherRedshiftServerless.
 	redshiftServerlessActions = databaseActions{
 		discovery: []string{
 			"redshift-serverless:ListWorkgroups",
@@ -216,9 +213,8 @@ var (
 			"redshift-serverless:GetEndpointAccess",
 			"redshift-serverless:GetWorkgroup",
 		},
-		authBoundary: stsActions,
 	}
-	// elastiCacheActions contains IAM actions for services.AWSMatcherElastiCache.
+	// elastiCacheActions contains IAM actions for types.AWSMatcherElastiCache.
 	elastiCacheActions = databaseActions{
 		discovery: []string{
 			"elasticache:ListTagsForResource",
@@ -232,12 +228,14 @@ var (
 		managedUsers: []string{
 			"elasticache:DescribeUsers",
 			"elasticache:ModifyUser",
+			"elasticache:ListTagsForResource", // needed to find Teleport managed users
+		},
+		iamAuth: []string{
+			"elasticache:Connect",
 		},
 		requireSecretsManager: true,
-		authBoundary:          []string{"elasticache:Connect"},
-		requireIAMEdit:        true,
 	}
-	// memoryDBActions contains IAM actions for services.AWSMatcherMemoryDB.
+	// memoryDBActions contains IAM actions for types.AWSMatcherMemoryDB.
 	memoryDBActions = databaseActions{
 		discovery: []string{
 			"memorydb:ListTags",
@@ -250,18 +248,20 @@ var (
 		managedUsers: []string{
 			"memorydb:DescribeUsers",
 			"memorydb:UpdateUser",
+			"memorydb:ListTags", // needed to find Teleport managed users
+		},
+		iamAuth: []string{
+			"memorydb:Connect",
 		},
 		requireSecretsManager: true,
 	}
 	// awsKeyspacesActions contains IAM actions for static AWS Keyspaces databases.
-	awsKeyspacesActions = databaseActions{
-		authBoundary: stsActions,
-	}
+	awsKeyspacesActions = databaseActions{}
 	// dynamodbActions contains IAM actions for static AWS DynamoDB databases.
 	dynamodbActions = databaseActions{
-		authBoundary: stsActions,
+		additionalSTSActions: []string{"sts:TagSession"},
 	}
-	// opensearchActions contains IAM actions for services.AWSMatcherOpenSearch
+	// opensearchActions contains IAM actions for types.AWSMatcherOpenSearch
 	opensearchActions = databaseActions{
 		discovery: []string{
 			"es:ListDomainNames",
@@ -272,7 +272,11 @@ var (
 			// Used for url validation.
 			"es:DescribeDomains",
 		},
-		authBoundary: stsActions,
+	}
+	// docdbActions contains IAM actions for types.AWSMatcherDocumentDB.
+	docdbActions = databaseActions{
+		discovery: []string{"rds:DescribeDBClusters"},
+		metadata:  []string{"rds:DescribeDBClusters"},
 	}
 )
 
@@ -290,24 +294,78 @@ type ConfiguratorConfig struct {
 	Flags configurators.BootstrapFlags
 	// ServiceConfig Teleport database service config.
 	ServiceConfig *servicecfg.Config
-	// AWSSession current AWS session.
-	AWSSession *awssession.Session
-	// AWSSTSClient AWS STS client.
-	AWSSTSClient stsiface.STSAPI
-	// AWSIAMClient AWS IAM client.
-	AWSIAMClient iamiface.IAMAPI
-	// AWSSSMClient is a mapping of region -> ssm client
-	AWSSSMClients map[string]ssmiface.SSMAPI
 	// Policies instance of the `Policies` that the actions use.
 	Policies awslib.Policies
 	// Identity is the current AWS credentials chain identity.
 	Identity awslib.Identity
+
+	// awsCfg is the configuration used for AWS service clients.
+	awsCfg *aws.Config
+	// stsClient is an AWS STS client.
+	stsClient stsClient
+	// iamClient is an AWS IAM client.
+	iamClient iamClient
+	// ssmClients is a mapping of region -> AWS SSM client
+	ssmClients map[string]ssmClient
+}
+
+type stsClient interface {
+	GetCallerIdentity(ctx context.Context, params *sts.GetCallerIdentityInput, optFns ...func(*sts.Options)) (*sts.GetCallerIdentityOutput, error)
+}
+
+type iamClient interface {
+	GetRole(ctx context.Context, params *iam.GetRoleInput, optFns ...func(*iam.Options)) (*iam.GetRoleOutput, error)
+}
+
+type ssmClient interface {
+	CreateDocument(ctx context.Context, params *ssm.CreateDocumentInput, optFns ...func(*ssm.Options)) (*ssm.CreateDocumentOutput, error)
+}
+
+type localRegionGetter interface {
+	GetRegion(context.Context) (string, error)
+}
+
+func getLocalRegion(ctx context.Context, localRegionGetter localRegionGetter) (string, bool) {
+	if localRegionGetter == nil {
+		imdsClient, err := awsimds.NewInstanceMetadataClient(ctx)
+		if err != nil || !imdsClient.IsAvailable(ctx) {
+			return "", false
+		}
+		localRegionGetter = imdsClient
+	}
+
+	region, err := localRegionGetter.GetRegion(ctx)
+	if err != nil || region == "" {
+		return "", false
+	}
+	return region, true
+}
+
+func getFallbackRegion(ctx context.Context, w io.Writer, localRegionGetter localRegionGetter) string {
+	if localRegion, ok := getLocalRegion(ctx, localRegionGetter); ok {
+		fmt.Fprintf(w, "Using region %q from instance metadata.\n", localRegion)
+		return localRegion
+	}
+
+	// Fallback to us-east-1, which also supports fips.
+	fmt.Fprint(w, `
+Warning: No region found from the default AWS config or instance metadata. Defaulting to 'us-east-1'.
+To avoid seeing this warning, please provide a region in your AWS config or through the AWS_REGION environment variable.
+
+`)
+	return "us-east-1"
 }
 
 // CheckAndSetDefaults checks and set configuration default values.
 func (c *ConfiguratorConfig) CheckAndSetDefaults() error {
+	ctx := context.Background()
 	if c.ServiceConfig == nil {
 		return trace.BadParameter("config file is required")
+	}
+
+	useFIPSEndpoint := aws.FIPSEndpointStateUnset
+	if modules.GetModules().IsBoringBinary() {
+		useFIPSEndpoint = aws.FIPSEndpointStateEnabled
 	}
 
 	// When running the command in manual mode, we want to have zero dependency
@@ -317,54 +375,65 @@ func (c *ConfiguratorConfig) CheckAndSetDefaults() error {
 	if !c.Flags.Manual {
 		var err error
 
-		if c.AWSSession == nil {
-			c.AWSSession, err = awssession.NewSessionWithOptions(awssession.Options{
-				SharedConfigState: awssession.SharedConfigEnable,
+		if c.awsCfg == nil {
+			cfg, err := config.LoadDefaultConfig(ctx,
+				config.WithUseFIPSEndpoint(useFIPSEndpoint),
+			)
+			if err != nil {
+				return trace.Wrap(err)
+			}
+
+			if cfg.Region == "" {
+				cfg.Region = getFallbackRegion(ctx, os.Stdout, nil)
+			}
+			c.awsCfg = &cfg
+		}
+
+		if c.stsClient == nil {
+			c.stsClient = sts.NewFromConfig(*c.awsCfg, func(o *sts.Options) {
+				o.TracerProvider = smithyoteltracing.Adapt(otel.GetTracerProvider())
 			})
+		}
+		if c.iamClient == nil {
+			c.iamClient = iam.NewFromConfig(*c.awsCfg, func(o *iam.Options) {
+				o.TracerProvider = smithyoteltracing.Adapt(otel.GetTracerProvider())
+			})
+		}
+		if c.Identity == nil {
+			c.Identity, err = awslib.GetIdentityWithClientV2(context.Background(), c.stsClient)
 			if err != nil {
 				return trace.Wrap(err)
 			}
 		}
 
-		if c.AWSSTSClient == nil {
-			c.AWSSTSClient = sts.New(c.AWSSession)
-		}
-		if c.AWSIAMClient == nil {
-			c.AWSIAMClient = iam.New(c.AWSSession)
-		}
-		if c.Identity == nil {
-			c.Identity, err = awslib.GetIdentityWithClient(context.Background(), c.AWSSTSClient)
-			if err != nil {
-				return trace.Wrap(err)
-			}
-		}
-		if c.AWSSSMClients == nil {
-			c.AWSSSMClients = make(map[string]ssmiface.SSMAPI)
+		if c.ssmClients == nil {
+			c.ssmClients = make(map[string]ssmClient)
 			for _, matcher := range c.ServiceConfig.Discovery.AWSMatchers {
-				if !slices.Contains(matcher.Types, services.AWSMatcherEC2) {
+				if !slices.Contains(matcher.Types, types.AWSMatcherEC2) {
 					continue
 				}
 				for _, region := range matcher.Regions {
-					if _, ok := c.AWSSSMClients[region]; ok {
+					if _, ok := c.ssmClients[region]; ok {
 						continue
 					}
-					session, err := awssession.NewSessionWithOptions(awssession.Options{
-						Config: aws.Config{
-							Region: &region,
-						},
-						SharedConfigState: awssession.SharedConfigEnable,
-					})
-					if err != nil {
-						return trace.Wrap(err)
+					withRegion := func(o *ssm.Options) {
+						o.Region = region
 					}
-					c.AWSSSMClients[region] = ssm.New(session)
+					c.ssmClients[region] = ssm.NewFromConfig(*c.awsCfg, withRegion, func(o *ssm.Options) {
+						o.TracerProvider = smithyoteltracing.Adapt(otel.GetTracerProvider())
+					})
 				}
 			}
 
 		}
 
 		if c.Policies == nil {
-			c.Policies = awslib.NewPolicies(c.Identity.GetPartition(), c.Identity.GetAccountID(), iam.New(c.AWSSession))
+			partition := c.Identity.GetPartition()
+			accountID := c.Identity.GetAccountID()
+			iamClient := iam.NewFromConfig(*c.awsCfg, func(o *iam.Options) {
+				o.TracerProvider = smithyoteltracing.Adapt(otel.GetTracerProvider())
+			})
+			c.Policies = awslib.NewPolicies(partition, accountID, iamClient)
 		}
 	}
 
@@ -412,8 +481,6 @@ func (a *awsConfigurator) Actions() []configurators.ConfiguratorAction {
 type awsPolicyCreator struct {
 	// policies `Policies` used to upsert the policy document.
 	policies awslib.Policies
-	// isBoundary indicates if the policy created is a boundary or not.
-	isBoundary bool
 	// policy document that will be created on AWS.
 	policy *awslib.Policy
 	// formattedPolicy human-readable representation of the policy document.
@@ -440,19 +507,14 @@ func (a *awsPolicyCreator) Execute(ctx context.Context, actionCtx *configurators
 		return trace.Wrap(err)
 	}
 
-	if a.isBoundary {
-		actionCtx.AWSPolicyBoundaryArn = arn
-	} else {
-		actionCtx.AWSPolicyArn = arn
-	}
-
+	actionCtx.AWSPolicyArn = arn
 	return nil
 }
 
-// awsPoliciesAttacher attach policy and policy boundary to a target. Both
-// policies ARN are retrieved from the `Execute` `context.Context`.
+// awsPoliciesAttacher attaches a policy to a target. The policy ARN is
+// retrieved from the `Execute` `context.Context`.
 type awsPoliciesAttacher struct {
-	// policies `Policies` used to attach policy and policy boundary.
+	// policies `Policies` used to attach policy.
 	policies awslib.Policies
 	// target identity where the policy will be attached to.
 	target awslib.Identity
@@ -469,8 +531,8 @@ func (a *awsPoliciesAttacher) Details() string {
 	return ""
 }
 
-// Execute retrieves policy and policy boundary ARNs from
-// `ConfiguratorActionContext` and attach them to the `target`.
+// Execute retrieves the policy ARN from `ConfiguratorActionContext` and
+// attaches it to the `target`.
 func (a *awsPoliciesAttacher) Execute(ctx context.Context, actionCtx *configurators.ConfiguratorActionContext) error {
 	if a.policies == nil {
 		return trace.BadParameter("policy helper not initialized")
@@ -480,16 +542,7 @@ func (a *awsPoliciesAttacher) Execute(ctx context.Context, actionCtx *configurat
 		return trace.BadParameter("policy ARN not present")
 	}
 
-	if actionCtx.AWSPolicyBoundaryArn == "" {
-		return trace.BadParameter("policy boundary ARN not present")
-	}
-
 	err := a.policies.Attach(ctx, actionCtx.AWSPolicyArn, a.target)
-	if err != nil {
-		return trace.Wrap(err)
-	}
-
-	err = a.policies.AttachBoundary(ctx, actionCtx.AWSPolicyBoundaryArn, a.target)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -508,18 +561,13 @@ func buildDiscoveryActions(config ConfiguratorConfig, targetCfg targetConfig) ([
 		return nil, err
 	}
 
-	actions = append(actions, buildSSMDocumentCreators(config.AWSSSMClients, targetCfg, proxyAddr)...)
+	actions = append(actions, buildSSMDocumentCreators(config.ssmClients, targetCfg, proxyAddr)...)
 	return actions, nil
 }
 
 func buildCommonActions(config ConfiguratorConfig, targetCfg targetConfig) ([]configurators.ConfiguratorAction, error) {
 	// Generate policies.
-	policy, err := buildPolicyDocument(config.Flags, targetCfg, false)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	policyBoundary, err := buildPolicyDocument(config.Flags, targetCfg, true)
+	policy, err := buildPolicyDocument(config.Flags, targetCfg)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -527,7 +575,7 @@ func buildCommonActions(config ConfiguratorConfig, targetCfg targetConfig) ([]co
 	// If the policy has no statements means that the agent doesn't require
 	// any IAM permission. In this case, return without errors and with empty
 	// actions.
-	if len(policy.Document.Statements) == 0 {
+	if policy.Document.IsEmpty() {
 		return []configurators.ConfiguratorAction{}, nil
 	}
 
@@ -544,19 +592,7 @@ func buildCommonActions(config ConfiguratorConfig, targetCfg targetConfig) ([]co
 		formattedPolicy: formattedPolicy,
 	})
 
-	formattedPolicyBoundary, err := policyBoundary.Document.Marshal()
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	// Create IAM Policy boundary.
-	actions = append(actions, &awsPolicyCreator{
-		policies:        config.Policies,
-		policy:          policyBoundary,
-		formattedPolicy: formattedPolicyBoundary,
-		isBoundary:      true,
-	})
-
-	// Attach both policies to the target.
+	// Attach the policy to the target.
 	actions = append(actions, &awsPoliciesAttacher{policies: config.Policies, target: targetCfg.identity})
 	return actions, nil
 }
@@ -573,7 +609,7 @@ func buildActions(config ConfiguratorConfig) ([]configurators.ConfiguratorAction
 	}
 
 	// Define the target and target type.
-	target, err := policiesTarget(config.Flags, accountID, partitionID, config.Identity, config.AWSIAMClient)
+	target, err := policiesTarget(config.Flags, accountID, partitionID, config.Identity, config.iamClient)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -591,7 +627,7 @@ func buildActions(config ConfiguratorConfig) ([]configurators.ConfiguratorAction
 
 // policiesTarget defines which target and its type the policies will be
 // attached to.
-func policiesTarget(flags configurators.BootstrapFlags, accountID string, partitionID string, identity awslib.Identity, iamClient iamiface.IAMAPI) (awslib.Identity, error) {
+func policiesTarget(flags configurators.BootstrapFlags, accountID string, partitionID string, identity awslib.Identity, iamClient iamClient) (awslib.Identity, error) {
 	if flags.AttachToUser != "" {
 		userArn := flags.AttachToUser
 		if !arn.IsARN(flags.AttachToUser) {
@@ -645,18 +681,28 @@ func buildIAMARN(partitionID, accountID, resourceType, resource string) string {
 // which is necessary to attach policies to the identity.
 // Rather than returning errors about why it failed, this message suggests a
 // simple fix for the user to specify a role or user to attach policies to.
-const failedToResolveAssumeRoleARN = "Running with assumed-role credentials. Policies cannot be attached to an assumed-role. Provide the name or ARN of the IAM user or role to attach policies to."
+func failedToResolveAssumeRoleARN(roleIdentity string) string {
+	return fmt.Sprintf("running with assumed-role credentials for %s, but "+
+		"policies cannot be attached to an assumed-role; "+
+		"provide the name or ARN of an IAM role (--attach-to-role) or user (--attach-to-user) to attach policies to",
+		roleIdentity)
+}
 
 // getRoleARNForAssumedRole attempts to resolve assumed-role credentials to
 // the underlying role ARN using IAM API.
 // This is necessary since the assumed-role ARN does not include the role path,
 // so we cannot reliably reconstruct the role ARN from the assumed-role ARN.
-func getRoleARNForAssumedRole(iamClient iamiface.IAMAPI, identity awslib.Identity) (awslib.Identity, error) {
-	roleOutput, err := iamClient.GetRole(&iam.GetRoleInput{RoleName: aws.String(identity.GetName())})
-	if err != nil || roleOutput == nil || roleOutput.Role == nil || roleOutput.Role.Arn == nil {
+func getRoleARNForAssumedRole(iamClient iamClient, identity awslib.Identity) (awslib.Identity, error) {
+	failedToResolveAssumeRoleARN := failedToResolveAssumeRoleARN(identity.GetName())
+
+	out, err := iamClient.GetRole(context.Background(), &iam.GetRoleInput{
+		RoleName: aws.String(identity.GetName()),
+	})
+	if err != nil || out == nil || out.Role == nil || out.Role.Arn == nil {
 		return nil, trace.BadParameter(failedToResolveAssumeRoleARN)
 	}
-	roleIdentity, err := awslib.IdentityFromArn(*roleOutput.Role.Arn)
+
+	roleIdentity, err := awslib.IdentityFromArn(*out.Role.Arn)
 	if err != nil {
 		return nil, trace.BadParameter(failedToResolveAssumeRoleARN)
 	}
@@ -664,14 +710,10 @@ func getRoleARNForAssumedRole(iamClient iamiface.IAMAPI, identity awslib.Identit
 }
 
 // buildPolicyDocument builds the policy document.
-func buildPolicyDocument(flags configurators.BootstrapFlags, targetCfg targetConfig, boundary bool) (*awslib.Policy, error) {
+func buildPolicyDocument(flags configurators.BootstrapFlags, targetCfg targetConfig) (*awslib.Policy, error) {
 	policyDoc := awslib.NewPolicyDocument()
 	policyDescription := databasePolicyDescription
 	policyName := flags.PolicyName
-
-	if boundary {
-		policyName += boundarySuffix
-	}
 
 	if flags.Service.IsDiscovery() {
 		policyDescription = discoveryServicePolicyDescription
@@ -683,7 +725,7 @@ func buildPolicyDocument(flags configurators.BootstrapFlags, targetCfg targetCon
 
 	// Build statements for databases.
 	// TODO(greedy52) remove discovery permissions for static databases.
-	var requireSecretsManager, requireIAMEdit bool
+	var requireSecretsManager bool
 	var allActions []databaseActions
 	if hasRDSDatabases(flags, targetCfg) {
 		allActions = append(allActions, rdsActions)
@@ -712,17 +754,31 @@ func buildPolicyDocument(flags configurators.BootstrapFlags, targetCfg targetCon
 	if hasOpenSearchDatabases(flags, targetCfg) {
 		allActions = append(allActions, opensearchActions)
 	}
+	if hasDocumentDBDatabases(flags, targetCfg) {
+		allActions = append(allActions, docdbActions)
+	}
 
-	dbOption := makeDatabaseActionsBuildOption(flags, targetCfg, boundary)
+	dbOption := makeDatabaseActionsBuildOption(flags)
 	for _, dbActions := range allActions {
 		policyDoc.EnsureStatements(dbActions.buildStatement(dbOption))
 		if dbOption.withAuth {
 			requireSecretsManager = requireSecretsManager || dbActions.requireSecretsManager
-			requireIAMEdit = requireIAMEdit || dbActions.requireIAMEdit
 		}
+
+		// some databases require additional STS actions, e.g. sts:TagSession
+		// for DynamoDB.
+		stsAssumeRoleStatements, err := buildSTSAssumeRoleStatements(targetCfg, dbActions.additionalSTSActions...)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		policyDoc.EnsureStatements(stsAssumeRoleStatements...)
 	}
 
-	stsAssumeRoleStatements, err := buildSTSAssumeRoleStatements(flags, targetCfg, boundary)
+	// In some configurations there are no db action permissions, but we still
+	// need to attach STS permissions to assume roles, for example if every
+	// resource has an associated role to assume and the target identity is not
+	// any of those roles. This handles that case.
+	stsAssumeRoleStatements, err := buildSTSAssumeRoleStatements(targetCfg)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -731,15 +787,6 @@ func buildPolicyDocument(flags configurators.BootstrapFlags, targetCfg targetCon
 	// For databases that need to access SecretsManager (and KMS).
 	if requireSecretsManager {
 		policyDoc.EnsureStatements(buildSecretsManagerStatements(targetCfg.databases, targetCfg.identity)...)
-	}
-	// For databases that need to edit IAM user/role policy.
-	if requireIAMEdit {
-		targetStatements, err := buildIAMEditStatements(targetCfg.identity)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-
-		policyDoc.EnsureStatements(targetStatements...)
 	}
 
 	return awslib.NewPolicy(
@@ -770,17 +817,17 @@ func getProxyAddrFromConfig(cfg *servicecfg.Config, flags configurators.Bootstra
 	return "", trace.NotFound("proxy address not found, please provide --proxy, or set either teleport.proxy_server or proxy_service.public_addr in the teleport config")
 }
 
-func buildSSMDocumentCreators(ssm map[string]ssmiface.SSMAPI, targetCfg targetConfig, proxyAddr string) []configurators.ConfiguratorAction {
+func buildSSMDocumentCreators(ssm map[string]ssmClient, targetCfg targetConfig, proxyAddr string) []configurators.ConfiguratorAction {
 	var creators []configurators.ConfiguratorAction
 	for _, matcher := range targetCfg.awsMatchers {
-		if !slices.Contains(matcher.Types, services.AWSMatcherEC2) {
+		if !slices.Contains(matcher.Types, types.AWSMatcherEC2) {
 			continue
 		}
 		for _, region := range matcher.Regions {
 			ssmCreator := awsSSMDocumentCreator{
 				ssm:      ssm[region],
 				Name:     matcher.SSM.DocumentName,
-				Contents: EC2DiscoverySSMDocument(proxyAddr),
+				Contents: awslib.EC2DiscoverySSMDocument(proxyAddr),
 			}
 			creators = append(creators, &ssmCreator)
 		}
@@ -792,7 +839,7 @@ func isEC2AutoDiscoveryEnabled(flags configurators.BootstrapFlags, matchers []ty
 	if flags.ForceEC2Permissions {
 		return true
 	}
-	return isAutoDiscoveryEnabledForMatcher(services.AWSMatcherEC2, matchers)
+	return isAutoDiscoveryEnabledForMatcher(types.AWSMatcherEC2, matchers)
 }
 
 // hasRDSDatabases checks if the agent needs permission for
@@ -801,7 +848,7 @@ func hasRDSDatabases(flags configurators.BootstrapFlags, targetCfg targetConfig)
 	if flags.ForceRDSPermissions {
 		return true
 	}
-	return isAutoDiscoveryEnabledForMatcher(services.AWSMatcherRDS, targetCfg.awsMatchers) ||
+	return isAutoDiscoveryEnabledForMatcher(types.AWSMatcherRDS, targetCfg.awsMatchers) ||
 		findEndpointIs(targetCfg.databases, isRDSEndpoint)
 }
 
@@ -811,7 +858,7 @@ func hasRDSProxyDatabases(flags configurators.BootstrapFlags, targetCfg targetCo
 	if flags.ForceRDSProxyPermissions {
 		return true
 	}
-	return isAutoDiscoveryEnabledForMatcher(services.AWSMatcherRDSProxy, targetCfg.awsMatchers) ||
+	return isAutoDiscoveryEnabledForMatcher(types.AWSMatcherRDSProxy, targetCfg.awsMatchers) ||
 		findEndpointIs(targetCfg.databases, isRDSProxyEndpoint)
 }
 
@@ -821,7 +868,7 @@ func hasRedshiftDatabases(flags configurators.BootstrapFlags, targetCfg targetCo
 	if flags.ForceRedshiftPermissions {
 		return true
 	}
-	return isAutoDiscoveryEnabledForMatcher(services.AWSMatcherRedshift, targetCfg.awsMatchers) ||
+	return isAutoDiscoveryEnabledForMatcher(types.AWSMatcherRedshift, targetCfg.awsMatchers) ||
 		findEndpointIs(targetCfg.databases, apiawsutils.IsRedshiftEndpoint)
 }
 
@@ -831,7 +878,7 @@ func hasRedshiftServerlessDatabases(flags configurators.BootstrapFlags, targetCf
 	if flags.ForceRedshiftServerlessPermissions {
 		return true
 	}
-	return isAutoDiscoveryEnabledForMatcher(services.AWSMatcherRedshiftServerless, targetCfg.awsMatchers) ||
+	return isAutoDiscoveryEnabledForMatcher(types.AWSMatcherRedshiftServerless, targetCfg.awsMatchers) ||
 		findEndpointIs(targetCfg.databases, apiawsutils.IsRedshiftServerlessEndpoint)
 }
 
@@ -841,7 +888,7 @@ func hasElastiCacheDatabases(flags configurators.BootstrapFlags, targetCfg targe
 	if flags.ForceElastiCachePermissions {
 		return true
 	}
-	return isAutoDiscoveryEnabledForMatcher(services.AWSMatcherElastiCache, targetCfg.awsMatchers) ||
+	return isAutoDiscoveryEnabledForMatcher(types.AWSMatcherElastiCache, targetCfg.awsMatchers) ||
 		findEndpointIs(targetCfg.databases, apiawsutils.IsElastiCacheEndpoint)
 }
 
@@ -851,7 +898,7 @@ func hasMemoryDBDatabases(flags configurators.BootstrapFlags, targetCfg targetCo
 	if flags.ForceMemoryDBPermissions {
 		return true
 	}
-	return isAutoDiscoveryEnabledForMatcher(services.AWSMatcherMemoryDB, targetCfg.awsMatchers) ||
+	return isAutoDiscoveryEnabledForMatcher(types.AWSMatcherMemoryDB, targetCfg.awsMatchers) ||
 		findEndpointIs(targetCfg.databases, apiawsutils.IsMemoryDBEndpoint)
 }
 
@@ -861,10 +908,20 @@ func hasOpenSearchDatabases(flags configurators.BootstrapFlags, targetCfg target
 	if flags.ForceOpenSearchPermissions {
 		return true
 	}
-	return isAutoDiscoveryEnabledForMatcher(services.AWSMatcherOpenSearch, targetCfg.awsMatchers) ||
+	return isAutoDiscoveryEnabledForMatcher(types.AWSMatcherOpenSearch, targetCfg.awsMatchers) ||
 		findDatabaseIs(targetCfg.databases, func(db *servicecfg.Database) bool {
 			return db.Protocol == defaults.ProtocolOpenSearch
 		})
+}
+
+// hasDocumentDBDatabases checks if the agent needs permission for DocumentDB
+// databases.
+func hasDocumentDBDatabases(flags configurators.BootstrapFlags, targetCfg targetConfig) bool {
+	if flags.ForceDocumentDBPermissions {
+		return true
+	}
+	return isAutoDiscoveryEnabledForMatcher(types.AWSMatcherDocumentDB, targetCfg.awsMatchers) ||
+		findEndpointIs(targetCfg.databases, apiawsutils.IsDocumentDBEndpoint)
 }
 
 // hasAWSKeyspacesDatabases checks if the agent needs permission for AWS Keyspaces.
@@ -942,7 +999,7 @@ func findAWSMatcherIs(matchers []types.AWSMatcher, is func(*types.AWSMatcher) bo
 // AWS roles. Currently limited to just the AWS database matchers.
 func supportsAWSAssumeRole(matcher types.AWSMatcher) bool {
 	for _, matcherType := range matcher.Types {
-		if slices.Contains(services.SupportedAWSDatabaseMatchers, matcherType) {
+		if slices.Contains(types.SupportedAWSDatabaseMatchers, matcherType) {
 			return true
 		}
 	}
@@ -967,34 +1024,11 @@ func isRDSProxyEndpoint(uri string) bool {
 	return details.IsProxy()
 }
 
-// buildIAMEditStatements returns IAM statements necessary for the Teleport
-// agent to edit user/role permissions.
-func buildIAMEditStatements(target awslib.Identity) ([]*awslib.Statement, error) {
-	switch target.(type) {
-	case awslib.User, *awslib.User:
-		return []*awslib.Statement{
-			awslib.StatementForIAMEditUserPolicy(target.String()),
-		}, nil
-
-	case awslib.Role, *awslib.Role:
-		return []*awslib.Statement{
-			awslib.StatementForIAMEditRolePolicy(target.String()),
-		}, nil
-
-	default:
-		return nil, trace.BadParameter("policies target must be an user or role, received %T", target)
-	}
-}
-
 // buildEC2AutoDiscoveryStatements returns IAM statements necessary for
 // EC2 instance auto-discovery.
 func buildEC2AutoDiscoveryStatements() []*awslib.Statement {
 	return []*awslib.Statement{
-		{
-			Effect:    awslib.EffectAllow,
-			Actions:   ec2Actions,
-			Resources: []string{"*"},
-		},
+		awslib.StatementForEC2SSMAutoDiscover(),
 	}
 }
 
@@ -1037,7 +1071,7 @@ func buildSecretsManagerStatements(databases []*servicecfg.Database, target awsl
 			addedKMSKeyIDs[kmsKeyID] = true
 			kmsStatement.Resources = append(
 				kmsStatement.Resources,
-				buildARN(target, kms.ServiceName, "key/"+kmsKeyID),
+				buildARN(target, "kms", "key/"+kmsKeyID),
 			)
 		}
 	}
@@ -1053,20 +1087,13 @@ func buildSecretsManagerStatements(databases []*servicecfg.Database, target awsl
 
 // buildSTSAssumeRoleStatements returns AWS IAM statements necessary for
 // assuming AWS IAM roles.
-func buildSTSAssumeRoleStatements(flags configurators.BootstrapFlags, targetCfg targetConfig, boundary bool) ([]*awslib.Statement, error) {
+func buildSTSAssumeRoleStatements(targetCfg targetConfig, additionalSTSActions ...string) ([]*awslib.Statement, error) {
 	if len(targetCfg.assumesAWSRoles) == 0 {
 		return nil, nil
 	}
-	if boundary {
-		return []*awslib.Statement{{
-			Effect:    awslib.EffectAllow,
-			Actions:   stsActions,
-			Resources: []string{"*"},
-		}}, nil
-	}
 	return []*awslib.Statement{{
 		Effect:    awslib.EffectAllow,
-		Actions:   stsActions,
+		Actions:   append(stsActions, additionalSTSActions...),
 		Resources: targetCfg.assumesAWSRoles,
 	}}, nil
 }
@@ -1076,7 +1103,7 @@ func buildSTSAssumeRoleStatements(flags configurators.BootstrapFlags, targetCfg 
 func buildSecretsManagerARN(target awslib.Identity, keyPrefix string) string {
 	return buildARN(
 		target,
-		secretsmanager.ServiceName,
+		"secretsmanager",
 		fmt.Sprintf("secret:%s/*", strings.TrimSuffix(keyPrefix, "/")),
 	)
 }
@@ -1095,7 +1122,7 @@ func buildARN(target awslib.Identity, service, resource string) string {
 
 type awsSSMDocumentCreator struct {
 	Contents string
-	ssm      ssmiface.SSMAPI
+	ssm      ssmClient
 	Name     string
 }
 
@@ -1111,16 +1138,16 @@ func (a *awsSSMDocumentCreator) Details() string {
 
 // Execute upserts the policy and store its ARN in the action context.
 func (a *awsSSMDocumentCreator) Execute(ctx context.Context, actionCtx *configurators.ConfiguratorActionContext) error {
-	_, err := a.ssm.CreateDocumentWithContext(ctx, &ssm.CreateDocumentInput{
+	_, err := a.ssm.CreateDocument(ctx, &ssm.CreateDocumentInput{
 		Content:        aws.String(a.Contents),
 		Name:           aws.String(a.Name),
-		DocumentType:   aws.String(ssm.DocumentTypeCommand),
-		DocumentFormat: aws.String("YAML"),
+		DocumentType:   ssmtypes.DocumentTypeCommand,
+		DocumentFormat: ssmtypes.DocumentFormatYaml,
 	})
 
 	if err != nil {
-		var aErr awserr.Error
-		if errors.As(err, &aErr) && aErr.Code() == ssm.ErrCodeDocumentAlreadyExists {
+		var docAlreadyExistsError *ssmtypes.DocumentAlreadyExists
+		if errors.As(err, &docAlreadyExistsError) {
 			fmt.Printf("⚠️ Warning: SSM document %s already exists. Not overwriting.\n", a.Name)
 			return nil
 		}
@@ -1155,7 +1182,7 @@ func getTargetConfig(flags configurators.BootstrapFlags, cfg *servicecfg.Config,
 	awsMatchers := awsMatchersFromConfig(flags, cfg)
 	databases := databasesFromConfig(flags, cfg)
 	resourceMatchers := resourceMatchersFromConfig(flags, cfg)
-	targetIsAssumeRole := isTargetAWSAssumeRole(flags, awsMatchers, databases, resourceMatchers, target)
+	targetIsAssumeRole := isTargetAWSAssumeRole(awsMatchers, databases, resourceMatchers, target)
 	targetAssumesRoles := rolesForTarget(forcedRoles, awsMatchers, databases, resourceMatchers, targetIsAssumeRole)
 	err = checkStubRoleAssumingRolesFromConfig(forcedRoles, targetAssumesRoles, target)
 	if err != nil {
@@ -1237,7 +1264,7 @@ func resourceMatchersFromConfig(flags configurators.BootstrapFlags, cfg *service
 
 // isTargetAWSAssumeRole determines if the target identity exists in config or cli
 // flags as an AWS IAM role arn that will be assumed by the database agent.
-func isTargetAWSAssumeRole(flags configurators.BootstrapFlags, matchers []types.AWSMatcher, databases []*servicecfg.Database, resourceMatchers []services.ResourceMatcher, target awslib.Identity) bool {
+func isTargetAWSAssumeRole(matchers []types.AWSMatcher, databases []*servicecfg.Database, resourceMatchers []services.ResourceMatcher, target awslib.Identity) bool {
 	switch target.(type) {
 	case awslib.Role, *awslib.Role:
 	default:

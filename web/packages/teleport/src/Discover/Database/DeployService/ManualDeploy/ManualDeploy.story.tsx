@@ -1,36 +1,39 @@
 /**
- * Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React from 'react';
+import { http, HttpResponse } from 'msw';
 import { MemoryRouter } from 'react-router';
 
-import { Context as TeleportContext, ContextProvider } from 'teleport';
+import { ContextProvider, Context as TeleportContext } from 'teleport';
 import cfg from 'teleport/config';
-import { ResourceKind } from 'teleport/Discover/Shared';
-import { PingTeleportProvider } from 'teleport/Discover/Shared/PingTeleportContext';
-import { getUserContext } from 'teleport/mocks/contexts';
-import { FeaturesContextProvider } from 'teleport/FeaturesContext';
 import {
   DatabaseEngine,
   DatabaseLocation,
 } from 'teleport/Discover/SelectResource';
+import { ResourceKind } from 'teleport/Discover/Shared';
+import { PingTeleportProvider } from 'teleport/Discover/Shared/PingTeleportContext';
 import {
-  DiscoverProvider,
   DiscoverContextState,
+  DiscoverProvider,
 } from 'teleport/Discover/useDiscover';
+import { FeaturesContextProvider } from 'teleport/FeaturesContext';
+import { getUserContext } from 'teleport/mocks/contexts';
+import { INTERNAL_RESOURCE_ID_LABEL_KEY } from 'teleport/services/joinToken';
 
 import ManualDeploy from './ManualDeploy';
 
@@ -47,6 +50,15 @@ export const Init = () => {
     </Provider>
   );
 };
+Init.parameters = {
+  msw: {
+    handlers: [
+      http.post(cfg.api.discoveryJoinToken.createV2, () =>
+        HttpResponse.json(rawJoinToken)
+      ),
+    ],
+  },
+};
 
 export const InitWithLabels = () => {
   return (
@@ -61,6 +73,15 @@ export const InitWithLabels = () => {
       <ManualDeploy />
     </Provider>
   );
+};
+InitWithLabels.parameters = {
+  msw: {
+    handlers: [
+      http.post(cfg.api.discoveryJoinToken.createV2, () =>
+        HttpResponse.json({})
+      ),
+    ],
+  },
 };
 
 const Provider = props => {
@@ -123,3 +144,12 @@ function createTeleportContext() {
 
   return ctx;
 }
+
+const rawJoinToken = {
+  id: 'some-id',
+  roles: ['Node'],
+  method: 'iam',
+  suggestedLabels: [
+    { name: INTERNAL_RESOURCE_ID_LABEL_KEY, value: 'some-value' },
+  ],
+};

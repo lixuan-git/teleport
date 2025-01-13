@@ -1,42 +1,48 @@
 /**
- * Copyright 2023 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React, { useRef, useEffect } from 'react';
+import React, { useCallback, useEffect, useRef } from 'react';
 import styled from 'styled-components';
+
 import { Box, Flex } from 'design';
 
+import { KeyboardShortcutAction } from 'teleterm/services/config';
 import {
   SearchContextProvider,
   useSearchContext,
 } from 'teleterm/ui/Search/SearchContext';
-import { KeyboardShortcutAction } from 'teleterm/services/config';
 import {
   useKeyboardShortcutFormatters,
   useKeyboardShortcuts,
 } from 'teleterm/ui/services/keyboardShortcuts';
 
 import { useAppContext } from '../appContextProvider';
+import { useStoreSelector } from '../hooks/useStoreSelector';
 
 const OPEN_SEARCH_BAR_SHORTCUT_ACTION: KeyboardShortcutAction = 'openSearchBar';
 
 export function SearchBarConnected() {
-  const { workspacesService } = useAppContext();
-  workspacesService.useState();
+  const rootClusterUri = useStoreSelector(
+    'workspacesService',
+    useCallback(state => state.rootClusterUri, [])
+  );
 
-  if (!workspacesService.getRootClusterUri()) {
+  if (!rootClusterUri) {
     return null;
   }
 
@@ -48,7 +54,7 @@ export function SearchBarConnected() {
 }
 
 function SearchBar() {
-  const containerRef = useRef<HTMLElement>();
+  const containerRef = useRef<HTMLDivElement>();
   const { getAccelerator } = useKeyboardShortcutFormatters();
   const {
     activePicker,
@@ -77,8 +83,15 @@ function SearchBar() {
       return;
     }
 
-    const onClickOutside = e => {
-      if (!e.composedPath().includes(containerRef.current)) {
+    const onClickOutside = (e: MouseEvent) => {
+      if (
+        !(
+          e.composedPath().includes(containerRef.current) ||
+          // Prevents closing the search bar
+          // when the advanced search tooltip is opened.
+          document.querySelector('#predicate-documentation')
+        )
+      ) {
         close();
       }
     };
@@ -98,7 +111,7 @@ function SearchBar() {
   // clicking on a button outside of the search bar will trigger onBlur and will not trigger
   // onClickOutside.
   const closeIfAnotherElementReceivedFocus = makeEventListener(
-    (event: FocusEvent) => {
+    (event: React.FocusEvent) => {
       const elementReceivingFocus = event.relatedTarget;
 
       if (!(elementReceivingFocus instanceof Node)) {
@@ -140,7 +153,6 @@ function SearchBar() {
         position: relative;
         flex: 4;
         flex-shrink: 1;
-        min-width: calc(${props => props.theme.space[7]}px * 2);
         height: 100%;
         border: 1px ${props => props.theme.colors.buttons.border.border} solid;
         border-radius: ${props => props.theme.radii[2]}px;
@@ -185,7 +197,9 @@ function SearchBar() {
 const Input = styled.input`
   height: 38px;
   width: 100%;
-  min-width: calc(${props => props.theme.space[9]}px * 2);
+  // min-width causes the filters and the actual input text to be broken into
+  // two lines when there is no space
+  min-width: calc(${props => props.theme.space[8]}px * 2);
   background: transparent;
   color: inherit;
   box-sizing: border-box;
@@ -195,7 +209,7 @@ const Input = styled.input`
   border-radius: ${props => props.theme.radii[2]}px;
   padding-inline: ${props => props.theme.space[2]}px;
 
-  ::placeholder {
+  &::placeholder {
     color: ${props => props.theme.colors.text.slightlyMuted};
   }
 `;

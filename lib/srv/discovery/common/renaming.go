@@ -1,18 +1,20 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package common
 
@@ -22,7 +24,6 @@ import (
 	"strings"
 
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/services"
 )
 
 // ApplyAWSDatabaseNameSuffix applies the AWS Database Discovery name suffix to
@@ -76,13 +77,13 @@ func ApplyAzureDatabaseNameSuffix(db types.Database, matcherType string) {
 // By subtyping the matcher type, we can ensure these names do not collide.
 func getDBMatcherSubtype(matcherType string, db types.Database) string {
 	switch matcherType {
-	case services.AWSMatcherRDS:
+	case types.AWSMatcherRDS:
 		if db.GetAWS().RDS.InstanceID == "" {
 			// distinguish RDS instances from clusters by subtyping the RDS
 			// matcher as "rds-aurora".
 			return "aurora"
 		}
-	case services.AzureMatcherRedis:
+	case types.AzureMatcherRedis:
 		if db.GetAzure().Redis.ClusteringPolicy != "" {
 			// distinguish Redis databases from Redis Enterprise database by
 			// subtyping the redis matcher as "redis-enterprise".
@@ -103,7 +104,7 @@ func ApplyEKSNameSuffix(cluster types.KubeCluster) {
 	meta := cluster.GetAWSConfig()
 	suffix := makeAWSDiscoverySuffix(kubeClusterNamePartValidator,
 		cluster.GetName(),
-		services.AWSMatcherEKS,
+		types.AWSMatcherEKS,
 		"", // no EKS subtype
 		meta.Region,
 		meta.AccountID,
@@ -123,7 +124,7 @@ func ApplyAKSNameSuffix(cluster types.KubeCluster) {
 	region, _ := cluster.GetLabel(types.DiscoveryLabelRegion)
 	suffix := makeAzureDiscoverySuffix(kubeClusterNamePartValidator,
 		cluster.GetName(),
-		services.AzureMatcherKubernetes,
+		types.AzureMatcherKubernetes,
 		"", // no AKS subtype
 		region,
 		meta.ResourceGroup,
@@ -143,7 +144,7 @@ func ApplyGKENameSuffix(cluster types.KubeCluster) {
 	meta := cluster.GetGCPConfig()
 	suffix := makeGCPDiscoverySuffix(kubeClusterNamePartValidator,
 		cluster.GetName(),
-		services.GCPMatcherKubernetes,
+		types.GCPMatcherKubernetes,
 		"", // no GKE subtype
 		meta.Location,
 		meta.ProjectID,

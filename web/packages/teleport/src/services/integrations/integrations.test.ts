@@ -1,26 +1,32 @@
 /**
- * Copyright 2023 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import api from 'teleport/services/api';
 import cfg from 'teleport/config';
+import api from 'teleport/services/api';
 
 import { integrationService } from './integrations';
-import { IntegrationStatusCode } from './types';
+import { IntegrationAudience, IntegrationStatusCode } from './types';
 
-test('fetchIntegration() response (a integration)', async () => {
+beforeEach(() => {
+  jest.resetAllMocks();
+});
+
+test('fetch a single integration: fetchIntegration()', async () => {
   // test a valid response
   jest.spyOn(api, 'get').mockResolvedValue(awsOidcIntegration);
 
@@ -34,6 +40,7 @@ test('fetchIntegration() response (a integration)', async () => {
     resourceType: 'integration',
     spec: {
       roleArn: 'arn-123',
+      origin: undefined,
     },
     statusCode: IntegrationStatusCode.Running,
   });
@@ -49,14 +56,20 @@ test('fetchIntegration() response (a integration)', async () => {
     name: undefined,
     spec: {
       roleArn: undefined,
+      origin: undefined,
     },
   });
 });
 
-test('fetchIntegrations() response (list)', async () => {
+test('fetch integration list: fetchIntegrations()', async () => {
   // test a valid response
   jest.spyOn(api, 'get').mockResolvedValue({
-    items: [awsOidcIntegration, nonAwsOidcIntegration],
+    items: [
+      awsOidcIntegration,
+      awsOidcIntegrationWithAudience,
+      githubIntegration,
+      nonAwsOidcIntegration,
+    ],
     nextKey: 'some-key',
   });
 
@@ -71,7 +84,29 @@ test('fetchIntegrations() response (list)', async () => {
         resourceType: 'integration',
         spec: {
           roleArn: 'arn-123',
+          audience: undefined,
         },
+        statusCode: IntegrationStatusCode.Running,
+      },
+      {
+        kind: 'aws-oidc',
+        name: 'aws-oidc-integration2',
+        resourceType: 'integration',
+        spec: {
+          roleArn: 'arn-12345',
+          audience: 'aws-identity-center',
+        },
+        statusCode: IntegrationStatusCode.Running,
+      },
+      {
+        kind: 'github',
+        name: 'github-my-org',
+        resourceType: 'integration',
+        spec: {
+          roleArn: undefined,
+          audience: undefined,
+        },
+        details: 'GitHub Organization "my-org"',
         statusCode: IntegrationStatusCode.Running,
       },
       {
@@ -80,6 +115,7 @@ test('fetchIntegrations() response (list)', async () => {
         resourceType: 'integration',
         spec: {
           roleArn: undefined,
+          audience: undefined,
         },
         statusCode: IntegrationStatusCode.Running,
       },
@@ -119,6 +155,8 @@ test('fetchAwsDatabases response', async () => {
         accountId: 'account-id-1',
         resourceId: 'resource-id-1',
         vpcId: 'vpc-123',
+        subnets: [],
+        securityGroups: [],
       },
       {
         engine: 'mysql',
@@ -129,6 +167,8 @@ test('fetchAwsDatabases response', async () => {
         accountId: undefined,
         resourceId: undefined,
         vpcId: undefined,
+        subnets: [],
+        securityGroups: [],
       },
       {
         engine: 'mysql',
@@ -139,6 +179,8 @@ test('fetchAwsDatabases response', async () => {
         accountId: undefined,
         resourceId: undefined,
         vpcId: undefined,
+        subnets: [],
+        securityGroups: [],
       },
     ],
     nextToken: 'next-token',
@@ -156,6 +198,50 @@ test('fetchAwsDatabases response', async () => {
     databases: [],
     nextToken: undefined,
   });
+});
+
+test('enrollEksClusters without labels calls v1', async () => {
+  jest.spyOn(api, 'post').mockResolvedValue({});
+
+  await integrationService.enrollEksClusters('integration', {
+    region: 'us-east-1',
+    enableAppDiscovery: false,
+    clusterNames: ['cluster'],
+  });
+
+  expect(api.post).toHaveBeenCalledWith(
+    cfg.getEnrollEksClusterUrl('integration'),
+    {
+      clusterNames: ['cluster'],
+      enableAppDiscovery: false,
+      region: 'us-east-1',
+    },
+    null,
+    undefined
+  );
+});
+
+test('enrollEksClusters with labels calls v2', async () => {
+  jest.spyOn(api, 'post').mockResolvedValue({});
+
+  await integrationService.enrollEksClusters('integration', {
+    region: 'us-east-1',
+    enableAppDiscovery: false,
+    clusterNames: ['cluster'],
+    extraLabels: [{ name: 'env', value: 'staging' }],
+  });
+
+  expect(api.post).toHaveBeenCalledWith(
+    cfg.getEnrollEksClusterUrlV2('integration'),
+    {
+      clusterNames: ['cluster'],
+      enableAppDiscovery: false,
+      region: 'us-east-1',
+      extraLabels: [{ name: 'env', value: 'staging' }],
+    },
+    null,
+    undefined
+  );
 });
 
 describe('fetchAwsDatabases() request body formatting', () => {
@@ -196,6 +282,22 @@ const awsOidcIntegration = {
   name: 'aws-oidc-integration',
   subKind: 'aws-oidc',
   awsoidc: { roleArn: 'arn-123' },
+};
+
+const awsOidcIntegrationWithAudience = {
+  name: 'aws-oidc-integration2',
+  subKind: 'aws-oidc',
+  awsoidc: {
+    roleArn: 'arn-12345',
+    audience: IntegrationAudience.AwsIdentityCenter,
+  },
+};
+const githubIntegration = {
+  name: 'github-my-org',
+  subKind: 'github',
+  github: {
+    organization: 'my-org',
+  },
 };
 
 const mockAwsDbs = [

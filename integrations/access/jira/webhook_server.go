@@ -1,18 +1,20 @@
 /*
-Copyright 2020-2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package jira
 
@@ -43,9 +45,10 @@ const (
 )
 
 type WebhookIssue struct {
-	ID   string `json:"id"`
-	Self string `json:"self"`
-	Key  string `json:"key"`
+	ID     string      `json:"id"`
+	Self   string      `json:"self"`
+	Key    string      `json:"key"`
+	Fields IssueFields `json:"fields"`
 }
 
 type Webhook struct {
@@ -102,29 +105,31 @@ func (s *WebhookServer) processWebhook(rw http.ResponseWriter, r *http.Request, 
 	defer cancel()
 
 	httpRequestID := fmt.Sprintf("%v-%v", time.Now().Unix(), atomic.AddUint64(&s.counter, 1))
-	ctx, log := logger.WithField(ctx, "jira_http_id", httpRequestID)
+	ctx, log := logger.With(ctx, "jira_http_id", httpRequestID)
 
 	var webhook Webhook
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, jiraWebhookPayloadLimit+1))
 	if err != nil {
-		log.WithError(err).Error("Failed to read webhook payload")
+		log.ErrorContext(ctx, "Failed to read webhook payload", "error", err)
 		http.Error(rw, "", http.StatusInternalServerError)
 		return
 	}
 	if len(body) > jiraWebhookPayloadLimit {
-		log.Error("Received a webhook larger than %d bytes", jiraWebhookPayloadLimit)
+		log.ErrorContext(ctx, "Received a webhook with a payload that exceeded the limit",
+			"payload_size", len(body),
+			"payload_size_limit", jiraWebhookPayloadLimit,
+		)
 		http.Error(rw, "", http.StatusRequestEntityTooLarge)
 	}
 	if err = json.Unmarshal(body, &webhook); err != nil {
-		log.WithError(err).Error("Failed to parse webhook payload")
+		log.ErrorContext(ctx, "Failed to parse webhook payload", "error", err)
 		http.Error(rw, "", http.StatusBadRequest)
 		return
 	}
 
 	if err = s.onWebhook(ctx, webhook); err != nil {
-		log.WithError(err).Error("Failed to process webhook")
-		log.Debugf("%v", trace.DebugReport(err))
+		log.ErrorContext(ctx, "Failed to process webhook", "error", err)
 		var code int
 		switch {
 		case lib.IsCanceled(err) || lib.IsDeadline(err):

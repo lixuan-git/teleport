@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package db
 
@@ -33,6 +37,7 @@ import (
 	"github.com/gravitational/teleport/integration/helpers"
 	"github.com/gravitational/teleport/lib"
 	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/auth/testauthority"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/events"
@@ -59,7 +64,7 @@ type databaseClusterPack struct {
 	User             types.User
 	role             types.Role
 	dbProcess        *service.TeleportProcess
-	dbAuthClient     *auth.Client
+	dbAuthClient     *authclient.Client
 	PostgresService  servicecfg.Database
 	postgresAddr     string
 	postgres         *postgres.TestServer
@@ -248,7 +253,7 @@ func SetupDatabaseTest(t *testing.T, options ...TestOptionFunc) *DatabasePack {
 	tracer := utils.NewTracer(utils.ThisFunction()).Start()
 	t.Cleanup(func() { tracer.Stop() })
 	lib.SetInsecureDevMode(true)
-	log := utils.NewLoggerForTests()
+	log := utils.NewSlogLoggerForTests()
 
 	// Generate keypair.
 	privateKey, publicKey, err := testauthority.New().GenerateKeyPair()
@@ -267,7 +272,7 @@ func SetupDatabaseTest(t *testing.T, options ...TestOptionFunc) *DatabasePack {
 		NodeName:    opts.nodeName,
 		Priv:        privateKey,
 		Pub:         publicKey,
-		Log:         log,
+		Logger:      log,
 	}
 	rootCfg.Listeners = opts.listenerSetup(t, &rootCfg.Fds)
 	p.Root.Cluster = helpers.NewInstance(t, rootCfg)
@@ -279,7 +284,7 @@ func SetupDatabaseTest(t *testing.T, options ...TestOptionFunc) *DatabasePack {
 		NodeName:    opts.nodeName,
 		Priv:        privateKey,
 		Pub:         publicKey,
-		Log:         log,
+		Logger:      log,
 	}
 	leafCfg.Listeners = opts.listenerSetup(t, &leafCfg.Fds)
 	p.Leaf.Cluster = helpers.NewInstance(t, leafCfg)
@@ -358,7 +363,7 @@ func (p *DatabasePack) setupUsersAndRoles(t *testing.T) {
 
 	p.Root.role.SetDatabaseUsers(types.Allow, []string{types.Wildcard})
 	p.Root.role.SetDatabaseNames(types.Allow, []string{types.Wildcard})
-	err = p.Root.Cluster.Process.GetAuthServer().UpsertRole(context.Background(), p.Root.role)
+	p.Root.role, err = p.Root.Cluster.Process.GetAuthServer().UpsertRole(context.Background(), p.Root.role)
 	require.NoError(t, err)
 
 	p.Leaf.User, p.Leaf.role, err = auth.CreateUserAndRole(p.Root.Cluster.Process.GetAuthServer(), "leaf-user", nil, nil)
@@ -366,7 +371,7 @@ func (p *DatabasePack) setupUsersAndRoles(t *testing.T) {
 
 	p.Leaf.role.SetDatabaseUsers(types.Allow, []string{types.Wildcard})
 	p.Leaf.role.SetDatabaseNames(types.Allow, []string{types.Wildcard})
-	err = p.Leaf.Cluster.Process.GetAuthServer().UpsertRole(context.Background(), p.Leaf.role)
+	p.Leaf.role, err = p.Leaf.Cluster.Process.GetAuthServer().UpsertRole(context.Background(), p.Leaf.role)
 	require.NoError(t, err)
 }
 
@@ -390,15 +395,15 @@ func (p *DatabasePack) WaitForLeaf(t *testing.T) {
 			servers, err := accessPoint.GetDatabaseServers(ctx, apidefaults.Namespace)
 			if err != nil {
 				// Use root logger as we need a configured logger instance and the root cluster have one.
-				p.Root.Cluster.Log.WithError(err).Debugf("Leaf cluster access point is unavailable.")
+				p.Root.Cluster.Log.DebugContext(ctx, "Leaf cluster access point is unavailable", "error", err)
 				continue
 			}
 			if !containsDB(servers, p.Leaf.MysqlService.Name) {
-				p.Root.Cluster.Log.WithError(err).Debugf("Leaf db service %q is unavailable.", p.Leaf.MysqlService.Name)
+				p.Root.Cluster.Log.DebugContext(ctx, "Leaf db service is unavailable", "error", err, "db_service", p.Leaf.MysqlService.Name)
 				continue
 			}
 			if !containsDB(servers, p.Leaf.PostgresService.Name) {
-				p.Root.Cluster.Log.WithError(err).Debugf("Leaf db service %q is unavailable.", p.Leaf.PostgresService.Name)
+				p.Root.Cluster.Log.DebugContext(ctx, "Leaf db service is unavailable", "error", err, "db_service", p.Leaf.PostgresService.Name)
 				continue
 			}
 			return
@@ -421,7 +426,7 @@ type databaseAgentStartParams struct {
 
 // startRootDatabaseAgent starts a database agent with the provided
 // configuration on the root cluster.
-func (p *DatabasePack) startRootDatabaseAgent(t *testing.T, params databaseAgentStartParams) (*service.TeleportProcess, *auth.Client) {
+func (p *DatabasePack) startRootDatabaseAgent(t *testing.T, params databaseAgentStartParams) (*service.TeleportProcess, *authclient.Client) {
 	conf := servicecfg.MakeDefaultConfig()
 	conf.DataDir = t.TempDir()
 	conf.SetToken("static-token-value")

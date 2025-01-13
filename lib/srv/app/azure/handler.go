@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package azure
 
@@ -19,17 +23,16 @@ import (
 	"context"
 	"crypto"
 	"crypto/x509"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
-	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	"github.com/sirupsen/logrus"
 
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/api/utils/azure"
 	"github.com/gravitational/teleport/lib/defaults"
@@ -40,12 +43,15 @@ import (
 	"github.com/gravitational/teleport/lib/utils"
 )
 
+// ComponentKey is the Teleport component key for this handler.
+const ComponentKey = "azure:fwd"
+
 // HandlerConfig is the configuration for an Azure app-access handler.
 type HandlerConfig struct {
 	// RoundTripper is the underlying transport given to an oxy Forwarder.
 	RoundTripper http.RoundTripper
-	// Log is the Logger.
-	Log utils.FieldLoggerWithWriter
+	// Log is a logger for the handler.
+	Log *slog.Logger
 	// Clock is used to override time in tests.
 	Clock clockwork.Clock
 
@@ -54,7 +60,7 @@ type HandlerConfig struct {
 }
 
 // CheckAndSetDefaults validates the HandlerConfig.
-func (s *HandlerConfig) CheckAndSetDefaults() error {
+func (s *HandlerConfig) CheckAndSetDefaults(ctx context.Context) error {
 	if s.RoundTripper == nil {
 		tr, err := defaults.Transport()
 		if err != nil {
@@ -66,10 +72,10 @@ func (s *HandlerConfig) CheckAndSetDefaults() error {
 		s.Clock = clockwork.NewRealClock()
 	}
 	if s.Log == nil {
-		s.Log = logrus.WithField(trace.Component, "azure:fwd")
+		s.Log = slog.With(teleport.ComponentKey, ComponentKey)
 	}
 	if s.getAccessToken == nil {
-		s.getAccessToken = getAccessTokenManagedIdentity
+		s.getAccessToken = lazyGetAccessTokenFromDefaultCredentialProvider(s.Log)
 	}
 	return nil
 }
@@ -94,7 +100,7 @@ func NewAzureHandler(ctx context.Context, config HandlerConfig) (http.Handler, e
 
 // newAzureHandler creates a new instance of a handler for Azure requests. Used by NewAzureHandler and in tests.
 func newAzureHandler(ctx context.Context, config HandlerConfig) (*handler, error) {
-	if err := config.CheckAndSetDefaults(); err != nil {
+	if err := config.CheckAndSetDefaults(ctx); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
@@ -123,6 +129,9 @@ func newAzureHandler(ctx context.Context, config HandlerConfig) (*handler, error
 
 // RoundTrip handles incoming requests and forwards them to the proper API.
 func (s *handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.Body != nil {
+		req.Body = utils.MaxBytesReader(w, req.Body, teleport.MaxHTTPRequestSize)
+	}
 	if err := s.serveHTTP(w, req); err != nil {
 		s.formatForwardResponseError(w, req, err)
 		return
@@ -145,13 +154,13 @@ func (s *handler) serveHTTP(w http.ResponseWriter, req *http.Request) error {
 
 	if err := sessionCtx.Audit.OnRequest(req.Context(), sessionCtx, fwdRequest, status, nil); err != nil {
 		// log but don't return the error, because we already handed off request/response handling to the oxy forwarder.
-		s.Log.WithError(err).Warn("Failed to emit audit event.")
+		s.Log.WarnContext(req.Context(), "Failed to emit audit event.", "error", err)
 	}
 	return nil
 }
 
 func (s *handler) formatForwardResponseError(rw http.ResponseWriter, r *http.Request, err error) {
-	s.Log.WithError(err).Debugf("Failed to process request.")
+	s.Log.DebugContext(r.Context(), "Failed to process request.", "error", err)
 	common.SetTeleportAPIErrorHeader(rw, err)
 
 	// Convert trace error type to HTTP and write response.
@@ -208,7 +217,7 @@ func getPeerKey(certs []*x509.Certificate) (crypto.PublicKey, error) {
 func (s *handler) replaceAuthHeaders(r *http.Request, sessionCtx *common.SessionContext, reqCopy *http.Request) error {
 	auth := reqCopy.Header.Get("Authorization")
 	if auth == "" {
-		s.Log.Debugf("No Authorization header present, skipping replacement.")
+		s.Log.DebugContext(r.Context(), "No Authorization header present, skipping replacement.")
 		return nil
 	}
 
@@ -222,7 +231,11 @@ func (s *handler) replaceAuthHeaders(r *http.Request, sessionCtx *common.Session
 		return trace.Wrap(err, "failed to parse Authorization header")
 	}
 
-	s.Log.Debugf("Processing request, sessionId = %q, azureIdentity = %q, claims = %v", sessionCtx.Identity.RouteToApp.SessionID, sessionCtx.Identity.RouteToApp.AzureIdentity, claims)
+	s.Log.DebugContext(r.Context(), "Processing request.",
+		"session_id", sessionCtx.Identity.RouteToApp.SessionID,
+		"azure_identity", sessionCtx.Identity.RouteToApp.AzureIdentity,
+		"claims", claims,
+	)
 	token, err := s.getToken(r.Context(), sessionCtx.Identity.RouteToApp.AzureIdentity, claims.Resource)
 	if err != nil {
 		return trace.Wrap(err)
@@ -246,7 +259,6 @@ func (s *handler) parseAuthHeader(token string, pubKey crypto.PublicKey) (*jwt.A
 	key, err := jwt.New(&jwt.Config{
 		Clock:       s.Clock,
 		PublicKey:   pubKey,
-		Algorithm:   defaults.ApplicationTokenAlgorithm,
 		ClusterName: types.TeleportAzureMSIEndpoint,
 	})
 	if err != nil {
@@ -256,20 +268,6 @@ func (s *handler) parseAuthHeader(token string, pubKey crypto.PublicKey) (*jwt.A
 }
 
 type getAccessTokenFunc func(ctx context.Context, managedIdentity string, scope string) (*azcore.AccessToken, error)
-
-func getAccessTokenManagedIdentity(ctx context.Context, managedIdentity string, scope string) (*azcore.AccessToken, error) {
-	identityCredential, err := azidentity.NewManagedIdentityCredential(&azidentity.ManagedIdentityCredentialOptions{ID: azidentity.ResourceID(managedIdentity)})
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	opts := policy.TokenRequestOptions{Scopes: []string{scope}}
-	token, err := identityCredential.GetToken(ctx, opts)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return &token, nil
-}
 
 type cacheKey struct {
 	managedIdentity string
@@ -281,11 +279,11 @@ const getTokenTimeout = time.Second * 5
 func (s *handler) getToken(ctx context.Context, managedIdentity string, scope string) (*azcore.AccessToken, error) {
 	key := cacheKey{managedIdentity, scope}
 
-	cancelCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	var tokenResult *azcore.AccessToken
-	var errorResult error
+	type result struct {
+		token *azcore.AccessToken
+		err   error
+	}
+	resultChan := make(chan result, 1)
 
 	// call Clock.After() before FnCacheGet gets called in a different go-routine.
 	// this ensures there is no race condition in the timeout tests, as
@@ -293,16 +291,21 @@ func (s *handler) getToken(ctx context.Context, managedIdentity string, scope st
 	timeoutChan := s.Clock.After(getTokenTimeout)
 
 	go func() {
-		tokenResult, errorResult = utils.FnCacheGet(cancelCtx, s.tokenCache, key, func(ctx context.Context) (*azcore.AccessToken, error) {
+		token, err := utils.FnCacheGet(ctx, s.tokenCache, key, func(ctx context.Context) (*azcore.AccessToken, error) {
 			return s.getAccessToken(ctx, managedIdentity, scope)
 		})
-		cancel()
+		resultChan <- result{
+			token: token,
+			err:   err,
+		}
 	}()
 
 	select {
 	case <-timeoutChan:
 		return nil, trace.Wrap(context.DeadlineExceeded, "timeout waiting for access token for %v", getTokenTimeout)
-	case <-cancelCtx.Done():
-		return tokenResult, errorResult
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case result := <-resultChan:
+		return result.token, trace.Wrap(result.err)
 	}
 }

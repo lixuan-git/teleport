@@ -1,33 +1,35 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package alpnproxy
 
 import (
+	"context"
 	"encoding/xml"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	v4 "github.com/aws/aws-sdk-go/aws/signer/v4"
-	"github.com/aws/aws-sdk-go/private/protocol"
-	"github.com/aws/aws-sdk-go/service/sts"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
+	ststypes "github.com/aws/aws-sdk-go-v2/service/sts/types"
 	"github.com/stretchr/testify/require"
 
 	awsutils "github.com/gravitational/teleport/lib/utils/aws"
@@ -37,19 +39,20 @@ func TestAWSAccessMiddleware(t *testing.T) {
 	t.Parallel()
 
 	assumedRoleARN := "arn:aws:sts::123456789012:assumed-role/role-name/role-session-name"
-	localProxyCred := credentials.NewStaticCredentials("local-proxy", "local-proxy-secret", "")
-	assumedRoleCred := credentials.NewStaticCredentials("assumed-role", "assumed-role-secret", "assumed-role-token")
-
-	stsRequestByLocalProxyCred := httptest.NewRequest(http.MethodPost, "http://sts.us-east-2.amazonaws.com", nil)
-	v4.NewSigner(localProxyCred).Sign(stsRequestByLocalProxyCred, nil, "sts", "us-west-1", time.Now())
-
-	requestByAssumedRole := httptest.NewRequest(http.MethodGet, "http://s3.amazonaws.com", nil)
-	v4.NewSigner(assumedRoleCred).Sign(requestByAssumedRole, nil, "s3", "us-west-1", time.Now())
+	localProxyCred := credentials.NewStaticCredentialsProvider("local-proxy", "local-proxy-secret", "")
+	assumedRoleCred := credentials.NewStaticCredentialsProvider("assumed-role", "assumed-role-secret", "assumed-role-token")
 
 	m := &AWSAccessMiddleware{
-		AWSCredentials: localProxyCred,
+		AWSCredentialsProvider: credentials.NewStaticCredentialsProvider("local-proxy", "local-proxy-secret", ""),
 	}
 	require.NoError(t, m.CheckAndSetDefaults())
+
+	stsRequestByLocalProxyCred := httptest.NewRequest(http.MethodPost, "http://sts.us-east-2.amazonaws.com", nil)
+
+	awsutils.NewSignerV2(localProxyCred, "sts").Sign(stsRequestByLocalProxyCred, nil, "sts", "us-west-1", time.Now())
+
+	requestByAssumedRole := httptest.NewRequest(http.MethodGet, "http://s3.amazonaws.com", nil)
+	awsutils.NewSignerV2(assumedRoleCred, "s3").Sign(requestByAssumedRole, nil, "s3", "us-west-1", time.Now())
 
 	t.Run("request no authorization", func(t *testing.T) {
 		recorder := httptest.NewRecorder()
@@ -96,10 +99,10 @@ func TestAWSAccessMiddleware(t *testing.T) {
 	})
 }
 
-func assumeRoleResponse(t *testing.T, roleARN string, cred *credentials.Credentials) *http.Response {
+func assumeRoleResponse(t *testing.T, roleARN string, provider aws.CredentialsProvider) *http.Response {
 	t.Helper()
 
-	credValue, err := cred.Get()
+	credValue, err := provider.Retrieve(context.Background())
 	require.NoError(t, err)
 
 	body, err := awsutils.MarshalXML(
@@ -109,18 +112,18 @@ func assumeRoleResponse(t *testing.T, roleARN string, cred *credentials.Credenti
 		},
 		map[string]any{
 			"AssumeRoleResult": sts.AssumeRoleOutput{
-				AssumedRoleUser: &sts.AssumedRoleUser{
+				AssumedRoleUser: &ststypes.AssumedRoleUser{
 					Arn: aws.String(roleARN),
 				},
-				Credentials: &sts.Credentials{
+				Credentials: &ststypes.Credentials{
 					AccessKeyId:     aws.String(credValue.AccessKeyID),
 					SecretAccessKey: aws.String(credValue.SecretAccessKey),
 					SessionToken:    aws.String(credValue.SessionToken),
 				},
 			},
-			"ResponseMetadata": protocol.ResponseMetadata{
-				StatusCode: http.StatusOK,
-				RequestID:  "22222222-3333-3333-3333-333333333333",
+			"ResponseMetadata": map[string]any{
+				"StatusCode": http.StatusOK,
+				"RequestID":  "22222222-3333-3333-3333-333333333333",
 			},
 		},
 	)
@@ -140,9 +143,9 @@ func getCallerIdentityResponse(t *testing.T, roleARN string) *http.Response {
 			"GetCallerIdentityResult": sts.GetCallerIdentityOutput{
 				Arn: aws.String(roleARN),
 			},
-			"ResponseMetadata": protocol.ResponseMetadata{
-				StatusCode: http.StatusOK,
-				RequestID:  "22222222-3333-3333-3333-333333333333",
+			"ResponseMetadata": map[string]any{
+				"StatusCode": http.StatusOK,
+				"RequestID":  "22222222-3333-3333-3333-333333333333",
 			},
 		},
 	)

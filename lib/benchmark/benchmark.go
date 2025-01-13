@@ -1,17 +1,20 @@
 /*
-Copyright 2020 Gravitational, Inc.
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 // Package benchmark package provides tools to run progressive or independent benchmarks against teleport services.
 package benchmark
@@ -21,15 +24,16 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/HdrHistogram/hdrhistogram-go"
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport/lib/client"
 	"github.com/gravitational/teleport/lib/observability/tracing"
@@ -83,7 +87,7 @@ type Result struct {
 // Run is used to run the benchmarks, it is given a generator, command to run,
 // a host, host login, and proxy. If host login or proxy is an empty string, it will
 // use the default login
-func Run(ctx context.Context, lg *Linear, host, login, proxy string, suite BenchmarkSuite) ([]Result, error) {
+func Run(ctx context.Context, lg *Linear, host, login, proxy string, suite Suite) ([]Result, error) {
 	lg.config = &Config{}
 	if err := validateConfig(lg); err != nil {
 		return nil, trace.Wrap(err)
@@ -98,7 +102,7 @@ func Run(ctx context.Context, lg *Linear, host, login, proxy string, suite Bench
 		signal.Notify(exitSignals, syscall.SIGTERM, syscall.SIGINT)
 		defer signal.Stop(exitSignals)
 		sig := <-exitSignals
-		logrus.Debugf("signal: %v", sig)
+		slog.DebugContext(ctx, "terminating benchmark due to signal", "signal", sig)
 		cancel()
 	}()
 	var results []Result
@@ -127,7 +131,7 @@ func Run(ctx context.Context, lg *Linear, host, login, proxy string, suite Bench
 }
 
 // ExportLatencyProfile exports the latency profile and returns the path as a string if no errors
-func ExportLatencyProfile(path string, h *hdrhistogram.Histogram, ticks int32, valueScale float64) (string, error) {
+func ExportLatencyProfile(ctx context.Context, path string, h *hdrhistogram.Histogram, ticks int32, valueScale float64) (string, error) {
 	timeStamp := time.Now().Format("2006-01-02_15:04:05")
 	suffix := fmt.Sprintf("latency_profile_%s.txt", timeStamp)
 	if path != "." {
@@ -143,7 +147,7 @@ func ExportLatencyProfile(path string, h *hdrhistogram.Histogram, ticks int32, v
 
 	if _, err := h.PercentilesPrint(fo, ticks, valueScale); err != nil {
 		if err := fo.Close(); err != nil {
-			logrus.WithError(err).Warningf("failed to close file")
+			slog.WarnContext(ctx, "failed to close latency profile file", "error", err)
 		}
 		return "", trace.Wrap(err)
 	}
@@ -157,29 +161,41 @@ func ExportLatencyProfile(path string, h *hdrhistogram.Histogram, ticks int32, v
 // WorkloadFunc is a function that executes a single benchmark call.
 type WorkloadFunc func(context.Context) error
 
-// BenchmarkSuite is an interface that defines a benchmark suite.
-type BenchmarkSuite interface {
+// Suite is an interface that defines a benchmark suite.
+type Suite interface {
 	// BenchBuilder returns a function that executes a single benchmark call.
 	// The returned function is called in a loop until the context is canceled.
 	BenchBuilder(context.Context, *client.TeleportClient) (WorkloadFunc, error)
 }
 
+// configOverrider is implemented by a [Suite] that automatically
+// overrides some configuration parameters.
+type configOverrider interface {
+	ConfigOverride(ctx context.Context, tc *client.TeleportClient, cfg *Config) error
+}
+
 // Benchmark connects to remote server and executes requests in parallel according
-// to benchmark spec. It returns benchmark result when completed.
+// to benchmark spec. It returns a benchmark result when completed.
 // This is a blocking function that can be canceled via context argument.
-func (c *Config) Benchmark(ctx context.Context, tc *client.TeleportClient, suite BenchmarkSuite) (Result, error) {
+func (c *Config) Benchmark(ctx context.Context, tc *client.TeleportClient, suite Suite) (Result, error) {
 	if suite == nil {
 		return Result{}, trace.BadParameter("missing benchmark suite")
 	}
 
-	workload, err := suite.BenchBuilder(ctx, tc)
-	if err != nil {
-		return Result{}, trace.Wrap(err)
+	if cfg, ok := suite.(configOverrider); ok {
+		if err := cfg.ConfigOverride(ctx, tc, c); err != nil {
+			return Result{}, trace.Wrap(err)
+		}
 	}
 
 	tc.Stdout = io.Discard
 	tc.Stderr = io.Discard
 	tc.Stdin = &bytes.Buffer{}
+
+	workload, err := suite.BenchBuilder(ctx, tc)
+	if err != nil {
+		return Result{}, trace.Wrap(err)
+	}
 
 	var delay time.Duration
 	ctx, cancel := context.WithCancel(ctx)
@@ -188,6 +204,7 @@ func (c *Config) Benchmark(ctx context.Context, tc *client.TeleportClient, suite
 	requestsC := make(chan benchMeasure)
 	resultC := make(chan benchMeasure)
 
+	var wg sync.WaitGroup
 	go func() {
 		interval := time.Duration(1 / float64(c.Rate) * float64(time.Second))
 		ticker := time.NewTicker(interval)
@@ -203,13 +220,20 @@ func (c *Config) Benchmark(ctx context.Context, tc *client.TeleportClient, suite
 				measure := benchMeasure{
 					ResponseStart: t,
 				}
-				go work(ctx, measure, resultC, workload)
+
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					work(ctx, measure, resultC, workload)
+				}()
 			case <-ctx.Done():
 				close(requestsC)
 				return
 			}
 		}
 	}()
+
+	defer wg.Wait()
 
 	var result Result
 	result.Histogram = hdrhistogram.New(minValue, maxValue, significantFigures)
@@ -235,9 +259,8 @@ func (c *Config) Benchmark(ctx context.Context, tc *client.TeleportClient, suite
 			result.Duration = time.Since(start)
 			return result, nil
 		case <-statusTicker.C:
-			logrus.Infof("working... current observation count: %d", result.RequestsOriginated)
+			slog.InfoContext(ctx, "working...", "current_observation_count", result.RequestsOriginated)
 		}
-
 	}
 }
 

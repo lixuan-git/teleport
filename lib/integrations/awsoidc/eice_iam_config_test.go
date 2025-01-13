@@ -1,30 +1,35 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package awsoidc
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/service/iam"
-	iamTypes "github.com/aws/aws-sdk-go-v2/service/iam/types"
+	iamtypes "github.com/aws/aws-sdk-go-v2/service/iam/types"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/slices"
+
+	"github.com/gravitational/teleport/lib/utils/testutils/golden"
 )
 
 func TestEICEIAMConfigReqDefaults(t *testing.T) {
@@ -32,6 +37,8 @@ func TestEICEIAMConfigReqDefaults(t *testing.T) {
 		return EICEIAMConfigureRequest{
 			Region:          "us-east-1",
 			IntegrationRole: "integrationrole",
+			AccountID:       "123456789012",
+			AutoConfirm:     true,
 		}
 	}
 
@@ -46,9 +53,11 @@ func TestEICEIAMConfigReqDefaults(t *testing.T) {
 			req:      baseReq,
 			errCheck: require.NoError,
 			expected: EICEIAMConfigureRequest{
+				AccountID:                 "123456789012",
 				Region:                    "us-east-1",
 				IntegrationRole:           "integrationrole",
 				IntegrationRoleEICEPolicy: "EC2InstanceConnectEndpoint",
+				AutoConfirm:               true,
 			},
 		},
 		{
@@ -68,6 +77,21 @@ func TestEICEIAMConfigReqDefaults(t *testing.T) {
 				return req
 			},
 			errCheck: badParameterCheck,
+		},
+		{
+			name: "missing account id is ok",
+			req: func() EICEIAMConfigureRequest {
+				req := baseReq()
+				req.AccountID = ""
+				return req
+			},
+			errCheck: require.NoError,
+			expected: EICEIAMConfigureRequest{
+				Region:                    "us-east-1",
+				IntegrationRole:           "integrationrole",
+				IntegrationRoleEICEPolicy: "EC2InstanceConnectEndpoint",
+				AutoConfirm:               true,
+			},
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -89,11 +113,14 @@ func TestEICEIAMConfig(t *testing.T) {
 		return EICEIAMConfigureRequest{
 			Region:          "us-east-1",
 			IntegrationRole: "integrationrole",
+			AccountID:       "123456789012",
+			AutoConfirm:     true,
 		}
 	}
 
 	for _, tt := range []struct {
 		name              string
+		mockAccountID     string
 		mockExistingRoles []string
 		req               func() EICEIAMConfigureRequest
 		errCheck          require.ErrorAssertionFunc
@@ -101,19 +128,29 @@ func TestEICEIAMConfig(t *testing.T) {
 		{
 			name:              "valid",
 			req:               baseReq,
+			mockAccountID:     "123456789012",
 			mockExistingRoles: []string{"integrationrole"},
 			errCheck:          require.NoError,
 		},
 		{
 			name:              "integration role does not exist",
+			mockAccountID:     "123456789012",
 			mockExistingRoles: []string{},
 			req:               baseReq,
-			errCheck:          notFounCheck,
+			errCheck:          notFoundCheck,
+		},
+		{
+			name:              "account does not match expected account",
+			req:               baseReq,
+			mockAccountID:     "222222222222",
+			mockExistingRoles: []string{"integrationrole"},
+			errCheck:          badParameterCheck,
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			clt := mockEICEIAMConfigClient{
-				existingRoles: tt.mockExistingRoles,
+				CallerIdentityGetter: mockSTSClient{accountID: tt.mockAccountID},
+				existingRoles:        tt.mockExistingRoles,
 			}
 
 			err := ConfigureEICEIAM(ctx, &clt, tt.req())
@@ -122,7 +159,31 @@ func TestEICEIAMConfig(t *testing.T) {
 	}
 }
 
+func TestEICEIAMConfigOutput(t *testing.T) {
+	ctx := context.Background()
+	var buf bytes.Buffer
+	req := EICEIAMConfigureRequest{
+		Region:          "us-east-1",
+		IntegrationRole: "integrationrole",
+		AccountID:       "123456789012",
+		AutoConfirm:     true,
+		stdout:          &buf,
+	}
+
+	clt := mockEICEIAMConfigClient{
+		CallerIdentityGetter: mockSTSClient{accountID: req.AccountID},
+		existingRoles:        []string{req.IntegrationRole},
+	}
+
+	require.NoError(t, ConfigureEICEIAM(ctx, &clt, req))
+	if golden.ShouldSet() {
+		golden.Set(t, buf.Bytes())
+	}
+	require.Equal(t, string(golden.Get(t)), buf.String())
+}
+
 type mockEICEIAMConfigClient struct {
+	CallerIdentityGetter
 	existingRoles []string
 }
 
@@ -130,7 +191,7 @@ type mockEICEIAMConfigClient struct {
 func (m *mockEICEIAMConfigClient) PutRolePolicy(ctx context.Context, params *iam.PutRolePolicyInput, optFns ...func(*iam.Options)) (*iam.PutRolePolicyOutput, error) {
 	if !slices.Contains(m.existingRoles, *params.RoleName) {
 		noSuchEntityMessage := fmt.Sprintf("role %q does not exist.", *params.RoleName)
-		return nil, &iamTypes.NoSuchEntityException{
+		return nil, &iamtypes.NoSuchEntityException{
 			Message: &noSuchEntityMessage,
 		}
 	}

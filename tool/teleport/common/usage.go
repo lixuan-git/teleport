@@ -1,16 +1,20 @@
-// Copyright 2021 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package common
 
@@ -43,16 +47,16 @@ const (
     --uri="http://localhost:8080" \
     --labels=group=dev
   Same as the above, but the app server runs with "group=dev" label which only
-  allows access to users with the role "group=dev".`
+  allows access to users with the application label "group: dev" in an assigned role.`
 
 	dbUsageExamples = `
 > teleport db start --token=xyz --auth-server=proxy.example.com:3080 \
   --name="example-db" \
   --protocol="postgres" \
   --uri="localhost:5432"
-Starts a database server that proxies PostgreSQL database "example-db" running
-at localhost:5432. The database must be configured with Teleport CA and key
-pair issued by "tctl auth sign --format=db".
+  Starts a database server that proxies PostgreSQL database "example-db" running
+  at localhost:5432. The database must be configured with Teleport CA and key
+  pair issued by "tctl auth sign --format=db".
 
 > teleport db start --token=xyz --auth-server=proxy.example.com:3080 \
   --name="aurora-db" \
@@ -60,8 +64,9 @@ pair issued by "tctl auth sign --format=db".
   --uri="example.cluster-abcdefghij.us-west-1.rds.amazonaws.com:3306" \
   --aws-region=us-west-1 \
   --labels=env=aws
-Starts a database server that proxies Aurora MySQL database running in AWS
-region us-west-1 which only allows access to users with the role "env=aws".`
+  Starts a database server that proxies Aurora MySQL database running in AWS
+  region us-west-1 which only allows access to users with the database label
+  "env: aws" in an assigned role.`
 
 	systemdInstallExamples = `
   > teleport install systemd
@@ -112,6 +117,21 @@ Examples:
   to using that label in addition to its name.
 %v
 %v`, appUsageExamples, dbUsageExamples)
+
+	collectProfileUsageExamples = `Examples:
+> teleport debug profile > pprof.tar.gz
+  Collect default profiles and stores the resulting tarball in a file.
+
+> teleport debug profile | tar xzv -C pprof/
+  Collects default profiles, decompress the results into pprof/ directory.
+
+> teleport debug profile heap,goroutine > pprof.tar.gz
+  Collects heap and goroutine profiles. Stores the results in a file.
+
+> teleport debug profile -s 0 goroutine > pprof.tar.gz
+  Collects a snapshot of goroutine profile. Stores the results in a file.
+  Note: Only allocs,block,goroutine,heap,mutex,threadcreate,trace,cmdline
+        supports snapshots.`
 )
 
 const (

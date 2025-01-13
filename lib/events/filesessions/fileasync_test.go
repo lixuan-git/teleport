@@ -1,19 +1,20 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package filesessions
 
@@ -30,7 +31,6 @@ import (
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 
 	apievents "github.com/gravitational/teleport/api/types/events"
@@ -48,7 +48,7 @@ func TestUploadOK(t *testing.T) {
 	p.clock.BlockUntil(1)
 
 	fileStreamer, err := NewStreamer(p.scanDir)
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	inEvents := eventstest.GenerateTestSession(eventstest.SessionParams{PrintEvents: 1024})
 	sid := inEvents[0].(events.SessionMetadataGetter).GetSessionID()
@@ -63,7 +63,7 @@ func TestUploadOK(t *testing.T) {
 	select {
 	case event = <-p.memEventsC:
 		require.Equal(t, event.SessionID, sid)
-		require.Nil(t, event.Error)
+		require.NoError(t, event.Error)
 	case <-p.ctx.Done():
 		t.Fatalf("Timeout waiting for async upload, try `go test -v` to get more logs for details")
 	}
@@ -86,7 +86,7 @@ func TestUploadParallel(t *testing.T) {
 
 	for i := 0; i < 5; i++ {
 		fileStreamer, err := NewStreamer(p.scanDir)
-		require.Nil(t, err)
+		require.NoError(t, err)
 
 		sessionEvents := eventstest.GenerateTestSession(eventstest.SessionParams{PrintEvents: 1024})
 		sid := sessionEvents[0].(events.SessionMetadataGetter).GetSessionID()
@@ -105,10 +105,9 @@ func TestUploadParallel(t *testing.T) {
 		var found bool
 		select {
 		case event = <-p.memEventsC:
-			require.Nil(t, event.Error)
+			require.NoError(t, event.Error)
 			sessionEvents, found = sessions[event.SessionID]
-			require.Equal(t, found, true,
-				"session %q is not expected, possible duplicate event", event.SessionID)
+			require.True(t, found, "session %q is not expected, possible duplicate event", event.SessionID)
 		case <-p.ctx.Done():
 			t.Fatalf("Timeout waiting for async upload, try `go test -v` to get more logs for details")
 		}
@@ -138,6 +137,7 @@ func TestMovesCorruptedUploads(t *testing.T) {
 	sessionID := session.NewID()
 	uploadPath := filepath.Join(scanDir, sessionID.String()+".tar")
 	errorPath := filepath.Join(scanDir, sessionID.String()+".error")
+	badFilePath := filepath.Join(scanDir, "not-a-uuid.tar")
 
 	// create a "corrupted" upload and error file in the scan dir
 	b := make([]byte, 4096)
@@ -145,10 +145,15 @@ func TestMovesCorruptedUploads(t *testing.T) {
 	require.NoError(t, os.WriteFile(uploadPath, b, 0o600))
 	require.NoError(t, uploader.writeSessionError(sessionID, errors.New("this is a corrupted upload")))
 
+	// create a file with an invalid name (not a session ID)
+	badFile, err := os.Create(badFilePath)
+	require.NoError(t, err)
+	require.NoError(t, badFile.Close())
+
 	stats, err := uploader.Scan(context.Background())
 	require.NoError(t, err)
-	require.Equal(t, 1, stats.Scanned)
-	require.Equal(t, 1, stats.Corrupted)
+	require.Equal(t, 2, stats.Scanned)
+	require.Equal(t, 2, stats.Corrupted)
 	require.Equal(t, 0, stats.Started)
 
 	require.NoFileExists(t, uploadPath)
@@ -157,11 +162,13 @@ func TestMovesCorruptedUploads(t *testing.T) {
 	require.FileExists(t, filepath.Join(corruptedDir, filepath.Base(uploadPath)))
 	require.FileExists(t, filepath.Join(corruptedDir, filepath.Base(errorPath)))
 
-	// run a second scan to verify that the file is no longer processed
+	// run a second scan to verify that:
+	// 1. the corrupted file is no longer processed
+	// 2. the file with the bad name was still flagged as corrupted
 	stats, err = uploader.Scan(context.Background())
 	require.NoError(t, err)
-	require.Equal(t, 0, stats.Scanned)
-	require.Equal(t, 0, stats.Corrupted)
+	require.Equal(t, 1, stats.Scanned)
+	require.Equal(t, 1, stats.Corrupted)
 	require.Equal(t, 0, stats.Started)
 }
 
@@ -195,19 +202,19 @@ func TestUploadResume(t *testing.T) {
 					OnRecordEvent: func(ctx context.Context, sid session.ID, pe apievents.PreparedSessionEvent) error {
 						event := pe.GetAuditEvent()
 						if event.GetIndex() > 600 && terminateConnection.CompareAndSwap(1, 0) == true {
-							log.Debugf("Terminating connection at event %v", event.GetIndex())
+							t.Logf("Terminating connection at event %v", event.GetIndex())
 							return trace.ConnectionProblem(nil, "connection terminated")
 						}
 						return nil
 					},
 					OnResumeAuditStream: func(ctx context.Context, sid session.ID, uploadID string, streamer events.Streamer) (apievents.Stream, error) {
 						stream, err := streamer.ResumeAuditStream(ctx, sid, uploadID)
-						require.Nil(t, err)
+						require.NoError(t, err)
 						streamResumed.Add(1)
 						return stream, nil
 					},
 				})
-				require.Nil(t, err)
+				require.NoError(t, err)
 				return resumeTestTuple{
 					streamer: callbackStreamer,
 					verify: func(t *testing.T, tc resumeTestCase) {
@@ -227,19 +234,19 @@ func TestUploadResume(t *testing.T) {
 					OnRecordEvent: func(ctx context.Context, sid session.ID, pe apievents.PreparedSessionEvent) error {
 						event := pe.GetAuditEvent()
 						if event.GetIndex() > 600 && terminateConnection.Add(1) <= 10 {
-							log.Debugf("Terminating connection #%v at event %v", terminateConnection.Load(), event.GetIndex())
+							t.Logf("Terminating connection #%v at event %v", terminateConnection.Load(), event.GetIndex())
 							return trace.ConnectionProblem(nil, "connection terminated")
 						}
 						return nil
 					},
 					OnResumeAuditStream: func(ctx context.Context, sid session.ID, uploadID string, streamer events.Streamer) (apievents.Stream, error) {
 						stream, err := streamer.ResumeAuditStream(ctx, sid, uploadID)
-						require.Nil(t, err)
+						require.NoError(t, err)
 						streamResumed.Add(1)
 						return stream, nil
 					},
 				})
-				require.Nil(t, err)
+				require.NoError(t, err)
 				return resumeTestTuple{
 					streamer: callbackStreamer,
 					verify: func(t *testing.T, tc resumeTestCase) {
@@ -260,14 +267,14 @@ func TestUploadResume(t *testing.T) {
 					OnRecordEvent: func(ctx context.Context, sid session.ID, pe apievents.PreparedSessionEvent) error {
 						event := pe.GetAuditEvent()
 						if event.GetIndex() > 600 && terminateConnection.CompareAndSwap(1, 0) == true {
-							log.Debugf("Terminating connection at event %v", event.GetIndex())
+							t.Logf("Terminating connection at event %v", event.GetIndex())
 							return trace.ConnectionProblem(nil, "connection terminated")
 						}
 						return nil
 					},
 					OnCreateAuditStream: func(ctx context.Context, sid session.ID, streamer events.Streamer) (apievents.Stream, error) {
 						stream, err := streamer.CreateAuditStream(ctx, sid)
-						require.Nil(t, err)
+						require.NoError(t, err)
 						streamCreated.Add(1)
 						return stream, nil
 					},
@@ -275,7 +282,7 @@ func TestUploadResume(t *testing.T) {
 						return nil, trace.NotFound("stream not found")
 					},
 				})
-				require.Nil(t, err)
+				require.NoError(t, err)
 				return resumeTestTuple{
 					streamer: callbackStreamer,
 					verify: func(t *testing.T, tc resumeTestCase) {
@@ -289,7 +296,7 @@ func TestUploadResume(t *testing.T) {
 			retries: 1,
 			onRetry: func(t *testing.T, attempt int, uploader *Uploader) {
 				files, err := os.ReadDir(uploader.cfg.ScanDir)
-				require.Nil(t, err)
+				require.NoError(t, err)
 				checkpointsDeleted := 0
 				for i := range files {
 					fi := files[i]
@@ -298,8 +305,8 @@ func TestUploadResume(t *testing.T) {
 					}
 					if filepath.Ext(fi.Name()) == checkpointExt {
 						err := os.Remove(filepath.Join(uploader.cfg.ScanDir, fi.Name()))
-						require.Nil(t, err)
-						log.Debugf("Deleted checkpoint file: %v.", fi.Name())
+						require.NoError(t, err)
+						t.Logf("Deleted checkpoint file: %v.", fi.Name())
 						checkpointsDeleted++
 					}
 				}
@@ -314,25 +321,25 @@ func TestUploadResume(t *testing.T) {
 					OnRecordEvent: func(ctx context.Context, sid session.ID, pe apievents.PreparedSessionEvent) error {
 						event := pe.GetAuditEvent()
 						if event.GetIndex() > 600 && terminateConnection.CompareAndSwap(1, 0) == true {
-							log.Debugf("Terminating connection at event %v", event.GetIndex())
+							t.Logf("Terminating connection at event %v", event.GetIndex())
 							return trace.ConnectionProblem(nil, "connection terminated")
 						}
 						return nil
 					},
 					OnCreateAuditStream: func(ctx context.Context, sid session.ID, streamer events.Streamer) (apievents.Stream, error) {
 						stream, err := streamer.CreateAuditStream(ctx, sid)
-						require.Nil(t, err)
+						require.NoError(t, err)
 						streamCreated.Add(1)
 						return stream, nil
 					},
 					OnResumeAuditStream: func(ctx context.Context, sid session.ID, uploadID string, streamer events.Streamer) (apievents.Stream, error) {
 						stream, err := streamer.ResumeAuditStream(ctx, sid, uploadID)
-						require.Nil(t, err)
+						require.NoError(t, err)
 						streamResumed.Add(1)
 						return stream, nil
 					},
 				})
-				require.Nil(t, err)
+				require.NoError(t, err)
 				return resumeTestTuple{
 					streamer: callbackStreamer,
 					verify: func(t *testing.T, tc resumeTestCase) {
@@ -363,7 +370,7 @@ func TestUploadBackoff(t *testing.T) {
 				event := pe.GetAuditEvent()
 				terminateAt := terminateConnectionAt.Load()
 				if terminateAt > 0 && event.GetIndex() >= terminateAt {
-					log.Debugf("Terminating connection at event %v", event.GetIndex())
+					t.Logf("Terminating connection at event %v", event.GetIndex())
 					return trace.ConnectionProblem(nil, "connection terminated at event index %v", terminateAt)
 				}
 				return nil
@@ -425,7 +432,7 @@ func TestUploadBackoff(t *testing.T) {
 	// Make sure that durations between retries are increasing
 	for i, diff := range diffs {
 		if i > 0 {
-			require.True(t, diff > diffs[i-1], "Expected next retry to take longer, got %v vs %v", diffs[i-1], diff)
+			require.Greater(t, diff, diffs[i-1], "Expected next retry to take longer, got %v vs %v", diffs[i-1], diff)
 		}
 	}
 
@@ -483,16 +490,17 @@ func TestUploadBadSession(t *testing.T) {
 // uploaderPack reduces boilerplate required
 // to create a test
 type uploaderPack struct {
-	scanPeriod  time.Duration
-	clock       clockwork.FakeClock
-	eventsC     chan events.UploadEvent
-	memEventsC  chan events.UploadEvent
-	memUploader *eventstest.MemoryUploader
-	streamer    events.Streamer
-	scanDir     string
-	uploader    *Uploader
-	ctx         context.Context
-	cancel      context.CancelFunc
+	scanPeriod       time.Duration
+	initialScanDelay time.Duration
+	clock            clockwork.FakeClock
+	eventsC          chan events.UploadEvent
+	memEventsC       chan events.UploadEvent
+	memUploader      *eventstest.MemoryUploader
+	streamer         events.Streamer
+	scanDir          string
+	uploader         *Uploader
+	ctx              context.Context
+	cancel           context.CancelFunc
 }
 
 func (u *uploaderPack) Close(t *testing.T) {
@@ -505,13 +513,14 @@ func newUploaderPack(t *testing.T, wrapStreamer wrapStreamerFn) uploaderPack {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	pack := uploaderPack{
-		clock:      clockwork.NewFakeClock(),
-		eventsC:    make(chan events.UploadEvent, 100),
-		memEventsC: make(chan events.UploadEvent, 100),
-		ctx:        ctx,
-		cancel:     cancel,
-		scanDir:    scanDir,
-		scanPeriod: 10 * time.Second,
+		clock:            clockwork.NewFakeClock(),
+		eventsC:          make(chan events.UploadEvent, 100),
+		memEventsC:       make(chan events.UploadEvent, 100),
+		ctx:              ctx,
+		cancel:           cancel,
+		scanDir:          scanDir,
+		scanPeriod:       10 * time.Second,
+		initialScanDelay: 10 * time.Millisecond,
 	}
 	pack.memUploader = eventstest.NewMemoryUploader(pack.memEventsC)
 
@@ -527,12 +536,13 @@ func newUploaderPack(t *testing.T, wrapStreamer wrapStreamerFn) uploaderPack {
 	}
 
 	uploader, err := NewUploader(UploaderConfig{
-		ScanDir:      pack.scanDir,
-		CorruptedDir: corruptedDir,
-		ScanPeriod:   pack.scanPeriod,
-		Streamer:     pack.streamer,
-		Clock:        pack.clock,
-		EventsC:      pack.eventsC,
+		ScanDir:          pack.scanDir,
+		CorruptedDir:     corruptedDir,
+		InitialScanDelay: pack.initialScanDelay,
+		ScanPeriod:       pack.scanPeriod,
+		Streamer:         pack.streamer,
+		Clock:            pack.clock,
+		EventsC:          pack.eventsC,
 	})
 	require.NoError(t, err)
 	pack.uploader = uploader
@@ -544,7 +554,7 @@ type wrapStreamerFn func(streamer events.Streamer) (events.Streamer, error)
 
 // runResume runs resume scenario based on the test case specification
 func runResume(t *testing.T, testCase resumeTestCase) {
-	log.Debugf("Running test %q.", testCase.name)
+	t.Logf("Running test %q.", testCase.name)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -555,7 +565,7 @@ func runResume(t *testing.T, testCase resumeTestCase) {
 		Uploader:       memUploader,
 		MinUploadBytes: 1024,
 	})
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	test := testCase.newTest(streamer)
 
@@ -564,14 +574,15 @@ func runResume(t *testing.T, testCase resumeTestCase) {
 
 	scanPeriod := 10 * time.Second
 	uploader, err := NewUploader(UploaderConfig{
-		EventsC:      eventsC,
-		ScanDir:      scanDir,
-		CorruptedDir: corruptedDir,
-		ScanPeriod:   scanPeriod,
-		Streamer:     test.streamer,
-		Clock:        clock,
+		EventsC:          eventsC,
+		ScanDir:          scanDir,
+		CorruptedDir:     corruptedDir,
+		InitialScanDelay: 10 * time.Millisecond,
+		ScanPeriod:       scanPeriod,
+		Streamer:         test.streamer,
+		Clock:            clock,
 	})
-	require.Nil(t, err)
+	require.NoError(t, err)
 	go uploader.Serve(ctx)
 	// wait until uploader blocks on the clock
 	clock.BlockUntil(1)
@@ -579,7 +590,7 @@ func runResume(t *testing.T, testCase resumeTestCase) {
 	defer uploader.Close()
 
 	fileStreamer, err := NewStreamer(scanDir)
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	inEvents := eventstest.GenerateTestSession(eventstest.SessionParams{PrintEvents: 1024})
 	sid := inEvents[0].(events.SessionMetadataGetter).GetSessionID()
@@ -615,7 +626,7 @@ func runResume(t *testing.T, testCase resumeTestCase) {
 		case event = <-eventsC:
 			require.Equal(t, event.SessionID, sid)
 			if i == testCase.retries-1 {
-				require.Nil(t, event.Error)
+				require.NoError(t, event.Error)
 			} else {
 				require.IsType(t, trace.ConnectionProblem(nil, "connection problem"), event.Error)
 			}
@@ -638,19 +649,21 @@ func emitStream(ctx context.Context, t *testing.T, streamer events.Streamer, inE
 	sid := inEvents[0].(events.SessionMetadataGetter).GetSessionID()
 
 	stream, err := streamer.CreateAuditStream(ctx, session.ID(sid))
-	require.Nil(t, err)
+	require.NoError(t, err)
 	for _, event := range inEvents {
 		err := stream.RecordEvent(ctx, eventstest.PrepareEvent(event))
-		require.Nil(t, err)
+		require.NoError(t, err)
 	}
 	err = stream.Complete(ctx)
-	require.Nil(t, err)
+	require.NoError(t, err)
 }
 
 // readStream reads and decodes the audit stream from uploadID
 func readStream(ctx context.Context, t *testing.T, uploadID string, uploader *eventstest.MemoryUploader) []apievents.AuditEvent {
+	t.Helper()
+
 	parts, err := uploader.GetParts(uploadID)
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	var outEvents []apievents.AuditEvent
 	var reader *events.ProtoReader
@@ -659,10 +672,11 @@ func readStream(ctx context.Context, t *testing.T, uploadID string, uploader *ev
 			reader = events.NewProtoReader(bytes.NewReader(part))
 		} else {
 			err := reader.Reset(bytes.NewReader(part))
-			require.Nil(t, err)
+			require.NoError(t, err)
 		}
 		out, err := reader.ReadAll(ctx)
-		require.Nil(t, err, "part crash %#v", part)
+		require.NoError(t, err, "part crash %#v", part)
+
 		outEvents = append(outEvents, out...)
 	}
 	return outEvents

@@ -1,25 +1,27 @@
 /**
- * Copyright 2023 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React from 'react';
-import { Box, Label as Pill, Text } from 'design';
+import { Box, Mark, Label as Pill } from 'design';
 import * as Icons from 'design/Icon';
+import { P } from 'design/Text/Text';
 
+import { LabelsCreater, TextIcon } from 'teleport/Discover/Shared';
 import { ResourceLabel } from 'teleport/services/agents';
-import { LabelsCreater, Mark, TextIcon } from 'teleport/Discover/Shared';
 import { Regions } from 'teleport/services/integrations';
 
 // serviceDeployedMethod is a flag to determine if user opted to
@@ -48,22 +50,21 @@ export const Labels = ({
   const hasDbLabels = dbLabels.length > 0;
   return (
     <Box mb={2}>
-      <Text bold>Optionally Define Matcher Labels</Text>
       {!hasDbLabels && (
-        <Text typography="subtitle1" mb={2}>
+        <P mb={2}>
           Since no labels were defined for the registered database from the
           previous step, the matcher labels are defaulted to wildcards which
           will allow this database service to match any database.
-        </Text>
+        </P>
       )}
       {hasDbLabels && (
         <>
-          <Text typography="subtitle1" mb={2}>
+          <P>
             The default wildcard label allows this database service to match any
             database. If you're unsure about how label matching works in
             Teleport, leave this for now.
-          </Text>
-          <Text typography="subtitle1" mb={2}>
+          </P>
+          <P mb={2}>
             Alternatively, you can define narrower labels for identifying the
             databases you register
             {region ? (
@@ -77,7 +78,7 @@ export const Labels = ({
             In order to identify the database you registered in the previous
             step, the labels you define here must match with one of its existing
             labels:
-          </Text>
+          </P>
           <Box mb={3}>
             {dbLabels.map((label, index) => {
               const labelText = `${label.name}: ${label.value}`;

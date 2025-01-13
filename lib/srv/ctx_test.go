@@ -1,29 +1,29 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package srv
 
 import (
-	"bytes"
-	"os/user"
+	"context"
 	"testing"
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/google/go-cmp/cmp"
-	"github.com/gravitational/trace"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh"
 	"google.golang.org/protobuf/testing/protocmp"
@@ -32,20 +32,9 @@ import (
 	"github.com/gravitational/teleport/api/types"
 	apievents "github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/lib/services"
+	rsession "github.com/gravitational/teleport/lib/session"
+	"github.com/gravitational/teleport/lib/sshutils"
 )
-
-// TestDecodeChildError ensures that child error message marshaling
-// and unmarshaling returns the original values.
-func TestDecodeChildError(t *testing.T) {
-	var buf bytes.Buffer
-	require.NoError(t, DecodeChildError(&buf))
-
-	targetErr := trace.NotFound(user.UnknownUserError("test").Error())
-
-	writeChildError(&buf, targetErr)
-
-	require.ErrorIs(t, DecodeChildError(&buf), targetErr)
-}
 
 func TestCheckSFTPAllowed(t *testing.T) {
 	srv := newMockServer(t)
@@ -198,6 +187,7 @@ func TestIdentityContext_GetUserMetadata(t *testing.T) {
 				Login:          "alpaca1",
 				Impersonator:   "llama",
 				AccessRequests: []string{"access-req1", "access-req2"},
+				UserKind:       apievents.UserKind_USER_KIND_HUMAN,
 			},
 		},
 		{
@@ -223,6 +213,23 @@ func TestIdentityContext_GetUserMetadata(t *testing.T) {
 					AssetTag:     "assettag1",
 					CredentialId: "credentialid1",
 				},
+				UserKind: apievents.UserKind_USER_KIND_HUMAN,
+			},
+		},
+		{
+			name: "bot metadata",
+			idCtx: IdentityContext{
+				TeleportUser:  "bot-alpaca",
+				Login:         "alpaca1",
+				BotName:       "alpaca",
+				BotInstanceID: "123-123-123",
+			},
+			want: apievents.UserMetadata{
+				User:          "bot-alpaca",
+				Login:         "alpaca1",
+				UserKind:      apievents.UserKind_USER_KIND_BOT,
+				BotName:       "alpaca",
+				BotInstanceID: "123-123-123",
 			},
 		},
 	}
@@ -270,8 +277,8 @@ func TestComputeLockTargets(t *testing.T) {
 		want := []types.LockTarget{
 			{User: identityCtx.TeleportUser},
 			{Login: identityCtx.Login},
-			{Node: serverID},
-			{Node: serverID + "." + clusterName},
+			{Node: serverID, ServerID: serverID},
+			{Node: serverID + "." + clusterName, ServerID: serverID + "." + clusterName},
 			{MFADevice: mfaDevice},
 			{Device: trustedDevice},
 		}
@@ -297,4 +304,76 @@ type fixedRolesChecker struct {
 
 func (c *fixedRolesChecker) RoleNames() []string {
 	return c.roleNames
+}
+
+func TestCreateOrJoinSession(t *testing.T) {
+	t.Parallel()
+
+	srv := newMockServer(t)
+	registry, err := NewSessionRegistry(SessionRegistryConfig{
+		clock:                 srv.clock,
+		Srv:                   srv,
+		SessionTrackerService: srv.auth,
+	})
+	require.NoError(t, err)
+
+	runningSessionID := rsession.NewID()
+	sess, _, err := newSession(context.Background(), runningSessionID, registry, newTestServerContext(t, srv, nil), newMockSSHChannel(), sessionTypeInteractive)
+	require.NoError(t, err)
+	registry.sessions[runningSessionID] = sess
+
+	tests := []struct {
+		name              string
+		sessionID         string
+		wantSameSessionID bool
+	}{
+		{
+			name:              "no session ID",
+			wantSameSessionID: false,
+		},
+		// TODO(capnspacehook): Check that an error is returned in v17
+		{
+			name:              "new session ID",
+			sessionID:         string(rsession.NewID()),
+			wantSameSessionID: false,
+		},
+		{
+			name:              "existing session ID",
+			sessionID:         runningSessionID.String(),
+			wantSameSessionID: true,
+		},
+		{
+			name:              "existing session ID in Windows format",
+			sessionID:         "{" + runningSessionID.String() + "}",
+			wantSameSessionID: true,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			parsedSessionID := new(rsession.ID)
+			var err error
+			if tt.sessionID != "" {
+				parsedSessionID, err = rsession.ParseID(tt.sessionID)
+				require.NoError(t, err)
+			}
+
+			ctx := newTestServerContext(t, srv, nil)
+			if tt.sessionID != "" {
+				ctx.SetEnv(sshutils.SessionEnvVar, tt.sessionID)
+			}
+
+			err = ctx.CreateOrJoinSession(context.Background(), registry)
+			require.NoError(t, err)
+			require.False(t, ctx.sessionID.IsZero())
+			if tt.wantSameSessionID {
+				require.Equal(t, parsedSessionID.String(), ctx.sessionID.String())
+			} else {
+				require.NotEqual(t, parsedSessionID.String(), ctx.sessionID.String())
+			}
+		})
+	}
 }

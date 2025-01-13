@@ -1,45 +1,53 @@
-/*
-Copyright 2019 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import { unique } from 'teleterm/ui/utils/uid';
+import type { Shell } from 'teleterm/mainProcess/shell';
+import type { RuntimeSettings } from 'teleterm/mainProcess/types';
+import * as uri from 'teleterm/ui/uri';
 import {
   DocumentUri,
-  ServerUri,
-  paths,
-  routing,
-  RootClusterUri,
   KubeUri,
+  paths,
+  RootClusterUri,
+  routing,
+  ServerUri,
 } from 'teleterm/ui/uri';
+import { unique } from 'teleterm/ui/utils/uid';
 
 import {
   CreateAccessRequestDocumentOpts,
-  CreateClusterDocumentOpts,
   CreateGatewayDocumentOpts,
   CreateTshKubeDocumentOptions,
   Document,
   DocumentAccessRequests,
+  DocumentAuthorizeWebSession,
   DocumentCluster,
+  DocumentClusterQueryParams,
   DocumentConnectMyComputer,
   DocumentGateway,
-  DocumentGatewayKube,
   DocumentGatewayCliClient,
+  DocumentGatewayKube,
   DocumentOrigin,
+  DocumentPtySession,
   DocumentTshKube,
   DocumentTshNode,
   DocumentTshNodeWithServerId,
+  WebSessionRequest,
 } from './types';
 
 export class DocumentsService {
@@ -76,15 +84,12 @@ export class DocumentsService {
     };
   }
 
-  createClusterDocument(opts: CreateClusterDocumentOpts): DocumentCluster {
-    const uri = routing.getDocUri({ docId: unique() });
-    const clusterName = routing.parseClusterName(opts.clusterUri);
-    return {
-      uri,
-      clusterUri: opts.clusterUri,
-      title: clusterName,
-      kind: 'doc.cluster',
-    };
+  /** @deprecated Use createClusterDocument function instead of the method on DocumentsService. */
+  createClusterDocument(opts: {
+    clusterUri: uri.ClusterUri;
+    queryParams?: DocumentClusterQueryParams;
+  }): DocumentCluster {
+    return createClusterDocument(opts);
   }
 
   /**
@@ -150,7 +155,7 @@ export class DocumentsService {
       origin,
     } = opts;
     const uri = routing.getDocUri({ docId: unique() });
-    const title = `${targetUser}@${targetName}`;
+    const title = targetUser ? `${targetUser}@${targetName}` : targetName;
 
     return {
       uri,
@@ -163,6 +168,7 @@ export class DocumentsService {
       title,
       port,
       origin,
+      status: '',
     };
   }
 
@@ -212,6 +218,22 @@ export class DocumentsService {
       targetUri,
       title: `${params.kubeId}`,
       origin,
+      status: '',
+    };
+  }
+
+  createAuthorizeWebSessionDocument(params: {
+    rootClusterUri: string;
+    webSessionRequest: WebSessionRequest;
+  }): DocumentAuthorizeWebSession {
+    const uri = routing.getDocUri({ docId: unique() });
+
+    return {
+      uri,
+      kind: 'doc.authorize_web_session',
+      title: 'Authorize Web Session',
+      rootClusterUri: params.rootClusterUri,
+      webSessionRequest: params.webSessionRequest,
     };
   }
 
@@ -232,6 +254,7 @@ export class DocumentsService {
       kind: 'doc.connect_my_computer' as const,
       title: 'Connect My Computer',
       rootClusterUri: opts.rootClusterUri,
+      status: '',
     };
     this.add(doc);
     this.open(doc.uri);
@@ -246,6 +269,8 @@ export class DocumentsService {
         return {
           ...activeDocument,
           uri: routing.getDocUri({ docId: unique() }),
+          // Do not inherit the shell of this document when opening a new one, use default.
+          shellId: undefined,
           ...opts,
         };
       } else {
@@ -339,11 +364,62 @@ export class DocumentsService {
     });
   }
 
-  update(uri: string, partialDoc: Partial<Document>) {
+  /**
+   * Updates the document by URI.
+   * @param uri - document URI.
+   * @param updated - a new document object or an update function.
+   */
+  update(
+    uri: DocumentUri,
+    updated: Partial<Document> | ((draft: Document) => void)
+  ) {
     this.setState(draft => {
       const toUpdate = draft.documents.find(doc => doc.uri === uri);
-      Object.assign(toUpdate, partialDoc);
+      if (typeof updated === 'function') {
+        updated(toUpdate);
+      } else {
+        Object.assign(toUpdate, updated);
+      }
     });
+  }
+
+  refreshPtyTitle(
+    uri: DocumentUri,
+    {
+      shell,
+      cwd,
+      clusterName,
+      runtimeSettings,
+    }: {
+      shell: Shell;
+      cwd: string;
+      clusterName: string;
+      runtimeSettings: Pick<RuntimeSettings, 'platform' | 'defaultOsShellId'>;
+    }
+  ): void {
+    const doc = this.getDocument(uri);
+    if (!doc) {
+      throw Error(`Document ${uri} does not exist`);
+    }
+    const omitShellName =
+      (runtimeSettings.platform === 'linux' ||
+        runtimeSettings.platform === 'darwin') &&
+      shell.id === runtimeSettings.defaultOsShellId;
+    const shellBinName = !omitShellName && shell.binName;
+    if (doc.kind === 'doc.terminal_shell') {
+      this.update(doc.uri, {
+        cwd,
+        title: [shellBinName, cwd, clusterName].filter(Boolean).join(' · '),
+      });
+      return;
+    }
+
+    if (doc.kind === 'doc.gateway_kube') {
+      const { params } = routing.parseKubeUri(doc.targetUri);
+      this.update(doc.uri, {
+        title: [params.kubeId, shellBinName].filter(Boolean).join(' · '),
+      });
+    }
   }
 
   replace(uri: DocumentUri, document: Document): void {
@@ -356,6 +432,15 @@ export class DocumentsService {
     }
     this.add(document, documentToClose ? documentToCloseIndex : undefined);
     this.open(document.uri);
+  }
+
+  reopenPtyInShell<T extends DocumentPtySession | DocumentGatewayKube>(
+    document: T,
+    shell: Shell
+  ): void {
+    // We assign a new URI to render a new document.
+    const newDocument: T = { ...document, shellId: shell.id, uri: unique() };
+    this.replace(document.uri, newDocument);
   }
 
   filter(uri: string) {
@@ -414,4 +499,28 @@ export class DocumentsService {
       draft.documents.splice(newIndex, 0, doc);
     });
   }
+}
+
+export function createClusterDocument(opts: {
+  clusterUri: uri.ClusterUri;
+  queryParams?: DocumentClusterQueryParams;
+}): DocumentCluster {
+  const uri = routing.getDocUri({ docId: unique() });
+  const clusterName = routing.parseClusterName(opts.clusterUri);
+  return {
+    uri,
+    clusterUri: opts.clusterUri,
+    title: clusterName,
+    kind: 'doc.cluster',
+    queryParams: opts.queryParams || getDefaultDocumentClusterQueryParams(),
+  };
+}
+
+export function getDefaultDocumentClusterQueryParams(): DocumentClusterQueryParams {
+  return {
+    resourceKinds: [],
+    search: '',
+    sort: { fieldName: 'name', dir: 'ASC' },
+    advancedSearchEnabled: false,
+  };
 }

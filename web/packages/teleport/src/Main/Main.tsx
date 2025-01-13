@@ -1,66 +1,64 @@
-/*
-Copyright 2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 import React, {
+  createContext,
   ReactNode,
   Suspense,
+  useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useState,
 } from 'react';
+import { matchPath, useHistory } from 'react-router';
 import styled from 'styled-components';
-import { Indicator } from 'design';
-import { Failed } from 'design/CardError';
 
+import { Box, Flex, Indicator } from 'design';
+import { Failed } from 'design/CardError';
+import Dialog from 'design/Dialog';
 import useAttempt from 'shared/hooks/useAttemptNext';
 
-import { matchPath, useHistory } from 'react-router';
-
-import Dialog from 'design/Dialog';
-
-import { Redirect, Route, Switch } from 'teleport/components/Router';
-import { CatchError } from 'teleport/components/CatchError';
-import cfg from 'teleport/config';
-import useTeleport from 'teleport/useTeleport';
-import { TopBar } from 'teleport/TopBar';
 import { BannerList } from 'teleport/components/BannerList';
-import localStorage from 'teleport/services/localStorage';
-
-import { ClusterAlert, LINK_LABEL } from 'teleport/services/alerts/alerts';
-
-import { Navigation } from 'teleport/Navigation';
-
+import type { BannerType } from 'teleport/components/BannerList/BannerList';
 import { useAlerts } from 'teleport/components/BannerList/useAlerts';
-
+import { CatchError } from 'teleport/components/CatchError';
+import { Redirect, Route, Switch } from 'teleport/components/Router';
+import cfg from 'teleport/config';
 import { FeaturesContextProvider, useFeatures } from 'teleport/FeaturesContext';
-
+import { Navigation } from 'teleport/Navigation';
+import { Navigation as SideNavigation } from 'teleport/Navigation/SideNavigation/Navigation';
 import {
-  getFirstRouteForCategory,
-  NavigationProps,
-} from 'teleport/Navigation/Navigation';
-
-import { NavigationCategory } from 'teleport/Navigation/categories';
-
+  ClusterAlert,
+  LINK_DESTINATION_LABEL,
+  LINK_TEXT_LABEL,
+} from 'teleport/services/alerts/alerts';
+import { storageService } from 'teleport/services/storageService';
+import { TopBar } from 'teleport/TopBar';
+import { TopBarProps } from 'teleport/TopBar/TopBar';
+import { TopBar as TopBarSideNav } from 'teleport/TopBar/TopBarSideNav';
+import type { LockedFeatures, TeleportFeature } from 'teleport/types';
+import { useUser } from 'teleport/User/UserContext';
+import useTeleport from 'teleport/useTeleport';
 import { QuestionnaireProps } from 'teleport/Welcome/NewCredentials';
 
 import { MainContainer } from './MainContainer';
 import { OnboardDiscover } from './OnboardDiscover';
-
-import type { BannerType } from 'teleport/components/BannerList/BannerList';
-import type { LockedFeatures, TeleportFeature } from 'teleport/types';
 
 export interface MainProps {
   initialAlerts?: ClusterAlert[];
@@ -68,7 +66,8 @@ export interface MainProps {
   features: TeleportFeature[];
   billingBanners?: ReactNode[];
   Questionnaire?: (props: QuestionnaireProps) => React.ReactElement;
-  navigationProps?: NavigationProps;
+  topBarProps?: TopBarProps;
+  inviteCollaboratorsFeedback?: ReactNode;
 }
 
 export function Main(props: MainProps) {
@@ -77,13 +76,22 @@ export function Main(props: MainProps) {
 
   const { attempt, setAttempt, run } = useAttempt('processing');
 
+  const { preferences } = useUser();
+
+  const isTopBarView = storageService.getIsTopBarView();
+  const TopBarComponent =
+    //TODO(rudream): Add sidenav dashboard view.
+    isTopBarView || cfg.isDashboard ? TopBar : TopBarSideNav;
+  const NavigationComponent =
+    isTopBarView || cfg.isDashboard ? Navigation : SideNavigation;
+
   useEffect(() => {
     if (ctx.storeUser.state) {
       setAttempt({ status: 'success' });
       return;
     }
 
-    run(() => ctx.init());
+    run(() => ctx.init(preferences));
   }, []);
 
   const featureFlags = ctx.getFeatureFlags();
@@ -95,10 +103,26 @@ export function Main(props: MainProps) {
 
   const { alerts, dismissAlert } = useAlerts(props.initialAlerts);
 
-  const [showOnboardDiscover, setShowOnboardDiscover] = useState(true);
+  // if there is a redirectUrl, do not show the onboarding popup - it'll get in the way of the redirected page
+  const [showOnboardDiscover, setShowOnboardDiscover] = useState(
+    !ctx.redirectUrl
+  );
   const [showOnboardSurvey, setShowOnboardSurvey] = useState<boolean>(
     !!props.Questionnaire
   );
+
+  useEffect(() => {
+    if (
+      matchPath(history.location.pathname, {
+        path: ctx.redirectUrl,
+        exact: true,
+      })
+    ) {
+      // hide the onboarding popup if we're on the redirectUrl, just in case
+      setShowOnboardDiscover(false);
+      ctx.redirectUrl = null;
+    }
+  }, [ctx, history.location.pathname]);
 
   if (attempt.status === 'failed') {
     return <Failed message={attempt.statusText} />;
@@ -123,18 +147,21 @@ export function Main(props: MainProps) {
   }
 
   function updateOnboardDiscover() {
-    const discover = localStorage.getOnboardDiscover();
-    localStorage.setOnboardDiscover({ ...discover, notified: true });
+    const discover = storageService.getOnboardDiscover();
+    storageService.setOnboardDiscover({ ...discover, notified: true });
   }
 
   // redirect to the default feature when hitting the root /web URL
   if (
     matchPath(history.location.pathname, { path: cfg.routes.root, exact: true })
   ) {
-    const indexRoute = getFirstRouteForCategory(
-      features,
-      NavigationCategory.Resources
-    );
+    if (ctx.redirectUrl) {
+      return <Redirect to={ctx.redirectUrl} />;
+    }
+
+    const indexRoute = cfg.isDashboard
+      ? cfg.routes.downloadCenter
+      : cfg.getUnifiedResourcesRoute(cfg.proxyCluster);
 
     return <Redirect to={indexRoute} />;
   }
@@ -151,38 +178,49 @@ export function Main(props: MainProps) {
     return 'danger';
   };
 
-  const banners: BannerType[] = alerts.map(alert => ({
-    message: alert.spec.message,
-    severity: mapSeverity(alert.spec.severity),
-    link: alert.metadata.labels[LINK_LABEL],
-    id: alert.metadata.name,
-  }));
+  const banners: BannerType[] = alerts.map(
+    (alert): BannerType => ({
+      message: alert.spec.message,
+      severity: mapSeverity(alert.spec.severity),
+      linkDestination: alert.metadata.labels[LINK_DESTINATION_LABEL],
+      linkText: alert.metadata.labels[LINK_TEXT_LABEL],
+      id: alert.metadata.name,
+    })
+  );
 
-  const onboard = localStorage.getOnboardDiscover();
+  const onboard = storageService.getOnboardDiscover();
   const requiresOnboarding =
     onboard && !onboard.hasResource && !onboard.notified;
+  const displayOnboardDiscover = requiresOnboarding && showOnboardDiscover;
 
   return (
     <FeaturesContextProvider value={features}>
-      <BannerList
-        banners={banners}
-        customBanners={props.customBanners}
-        billingBanners={featureFlags.billing && props.billingBanners}
-        onBannerDismiss={dismissAlert}
-      >
+      <TopBarComponent
+        CustomLogo={
+          props.topBarProps?.showPoweredByLogo
+            ? props.topBarProps.CustomLogo
+            : null
+        }
+      />
+      <Wrapper>
         <MainContainer>
-          <Navigation {...props.navigationProps} />
-          <HorizontalSplit>
+          <NavigationComponent />
+          <ContentWrapper>
             <ContentMinWidth>
+              <BannerList
+                banners={banners}
+                customBanners={props.customBanners}
+                billingBanners={featureFlags.billing && props.billingBanners}
+                onBannerDismiss={dismissAlert}
+              />
               <Suspense fallback={null}>
-                <TopBar />
                 <FeatureRoutes lockedFeatures={ctx.lockedFeatures} />
               </Suspense>
             </ContentMinWidth>
-          </HorizontalSplit>
+          </ContentWrapper>
         </MainContainer>
-      </BannerList>
-      {requiresOnboarding && showOnboardDiscover && (
+      </Wrapper>
+      {displayOnboardDiscover && (
         <OnboardDiscover onClose={handleOnClose} onOnboard={handleOnboard} />
       )}
       {showOnboardSurvey && (
@@ -193,6 +231,7 @@ export function Main(props: MainProps) {
           />
         </Dialog>
       )}
+      {props.inviteCollaboratorsFeedback}
     </FeaturesContextProvider>
   );
 }
@@ -260,18 +299,71 @@ function FeatureRoutes({ lockedFeatures }: { lockedFeatures: LockedFeatures }) {
   return <Switch>{routes}</Switch>;
 }
 
-export const ContentMinWidth = styled.div`
-  min-width: calc(1250px - var(--sidebar-width));
-`;
+// This context allows children components to disable this min-width in case they want to be able to shrink smaller.
+type MinWidthContextState = {
+  setEnforceMinWidth: (enforceMinWidth: boolean) => void;
+};
 
-export const HorizontalSplit = styled.div`
+const ContentMinWidthContext = createContext<MinWidthContextState>(null);
+
+/**
+ * @deprecated Use useNoMinWidth instead.
+ */
+export const useContentMinWidthContext = () =>
+  useContext(ContentMinWidthContext);
+
+export const useNoMinWidth = () => {
+  const { setEnforceMinWidth } = useContext(ContentMinWidthContext);
+
+  useLayoutEffect(() => {
+    setEnforceMinWidth(false);
+
+    return () => {
+      setEnforceMinWidth(true);
+    };
+  }, []);
+};
+
+export const ContentMinWidth = ({ children }: { children: ReactNode }) => {
+  const [enforceMinWidth, setEnforceMinWidth] = useState(true);
+
+  return (
+    <ContentMinWidthContext.Provider value={{ setEnforceMinWidth }}>
+      <div
+        css={`
+          display: flex;
+          flex-direction: column;
+          flex: 1;
+          ${enforceMinWidth ? 'min-width: 1000px;' : ''}
+          min-height: 0;
+        `}
+      >
+        {children}
+      </div>
+    </ContentMinWidthContext.Provider>
+  );
+};
+
+export const ContentWrapper = styled.div`
   display: flex;
   flex-direction: column;
   flex: 1;
   overflow-x: auto;
+  max-width: 100%;
 `;
 
-export const StyledIndicator = styled(HorizontalSplit)`
+export const StyledIndicator = styled(Flex)`
   align-items: center;
   justify-content: center;
+  position: absolute;
+  overflow: hidden;
+  top: 50%;
+  left: 50%;
+`;
+
+const Wrapper = styled(Box)`
+  display: flex;
+  height: 100vh;
+  flex-direction: column;
+  max-width: 100vw;
 `;

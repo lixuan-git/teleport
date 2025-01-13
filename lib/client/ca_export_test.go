@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package client
 
@@ -24,14 +26,22 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 
+	"github.com/gravitational/teleport/api/client/proto"
+	integrationpb "github.com/gravitational/teleport/api/gen/proto/go/teleport/integration/v1"
+	"github.com/gravitational/teleport/api/mfa"
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/api/utils/keys"
 	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
+	"github.com/gravitational/teleport/lib/fixtures"
 )
 
 type mockAuthClient struct {
-	auth.ClientI
-	server *auth.Server
+	authclient.ClientI
+	server             *auth.Server
+	integrationsClient mockIntegrationsClient
 }
 
 func (m *mockAuthClient) GetDomainName(ctx context.Context) (string, error) {
@@ -44,6 +54,26 @@ func (m *mockAuthClient) GetCertAuthorities(ctx context.Context, caType types.Ce
 
 func (m *mockAuthClient) GetCertAuthority(ctx context.Context, id types.CertAuthID, loadKeys bool) (types.CertAuthority, error) {
 	return m.server.GetCertAuthority(ctx, id, loadKeys)
+}
+
+func (m *mockAuthClient) PerformMFACeremony(ctx context.Context, challengeRequest *proto.CreateAuthenticateChallengeRequest, promptOpts ...mfa.PromptOpt) (*proto.MFAAuthenticateResponse, error) {
+	// return MFA not required to gracefully skip the MFA prompt.
+	return nil, &mfa.ErrMFANotRequired
+}
+
+func (m *mockAuthClient) IntegrationsClient() integrationpb.IntegrationServiceClient {
+	return &m.integrationsClient
+}
+
+type mockIntegrationsClient struct {
+	integrationpb.IntegrationServiceClient
+	caKeySet *types.CAKeySet
+}
+
+func (m *mockIntegrationsClient) ExportIntegrationCertAuthorities(ctx context.Context, in *integrationpb.ExportIntegrationCertAuthoritiesRequest, opts ...grpc.CallOption) (*integrationpb.ExportIntegrationCertAuthoritiesResponse, error) {
+	return &integrationpb.ExportIntegrationCertAuthoritiesResponse{
+		CertAuthorities: m.caKeySet,
+	}, nil
 }
 
 func TestExportAuthorities(t *testing.T) {
@@ -72,21 +102,25 @@ func TestExportAuthorities(t *testing.T) {
 	}
 
 	validatePrivateKeyPEMFunc := func(t *testing.T, s string) {
-		pemBlock, rest := pem.Decode([]byte(s))
-		require.NotNil(t, pemBlock, "pem.Decode failed")
-		require.Empty(t, rest)
-
-		require.Equal(t, "RSA PRIVATE KEY", pemBlock.Type, "unexpected private key type")
-
-		privKey, err := x509.ParsePKCS1PrivateKey(pemBlock.Bytes)
-		require.NoError(t, err, "x509.ParsePKCS1PrivateKey failed")
-		require.NotNil(t, privKey, "x509.ParsePKCS1PrivateKey returned a nil certificate")
+		key, err := keys.ParsePrivateKey([]byte(s))
+		require.NoError(t, err)
+		require.NotNil(t, key.Signer, "ParsePrivateKey returned a nil key")
 	}
 
-	validatePrivateKeyDERFunc := func(t *testing.T, s string) {
+	// TestAuthServer uses ECDSA for all CAs except db, db_client, saml_idp, oidc_idp.
+	validateRSAPrivateKeyDERFunc := func(t *testing.T, s string) {
 		privKey, err := x509.ParsePKCS1PrivateKey([]byte(s))
 		require.NoError(t, err, "x509.ParsePKCS1PrivateKey failed")
-		require.NotNil(t, privKey, "x509.ParsePKCS1PrivateKey returned a nil certificate")
+		require.NotNil(t, privKey, "x509.ParsePKCS1PrivateKey returned a nil key")
+	}
+	validateECDSAPrivateKeyDERFunc := func(t *testing.T, s string) {
+		privKey, err := x509.ParsePKCS8PrivateKey([]byte(s))
+		require.NoError(t, err, "x509.ParsePKCS8PrivateKey failed")
+		require.NotNil(t, privKey, "x509.ParsePKCS8PrivateKey returned a nil key")
+	}
+
+	validateGitHubCAFunc := func(t *testing.T, s string) {
+		require.Contains(t, s, fixtures.SSHCAPublicKey)
 	}
 
 	for _, exportSecrets := range []bool{false, true} {
@@ -104,8 +138,8 @@ func TestExportAuthorities(t *testing.T) {
 				},
 				errorCheck: require.NoError,
 				assertNoSecrets: func(t *testing.T, output string) {
-					require.Contains(t, output, "@cert-authority localcluster,*.localcluster ssh-rsa")
-					require.Contains(t, output, "cert-authority ssh-rsa")
+					require.Contains(t, output, "@cert-authority localcluster,*.localcluster ecdsa-sha2-nistp256")
+					require.Contains(t, output, "cert-authority ecdsa-sha2-nistp256")
 				},
 				assertSecrets: func(t *testing.T, output string) {},
 			},
@@ -116,7 +150,7 @@ func TestExportAuthorities(t *testing.T) {
 				},
 				errorCheck: require.NoError,
 				assertNoSecrets: func(t *testing.T, output string) {
-					require.Contains(t, output, "cert-authority ssh-rsa")
+					require.Contains(t, output, "cert-authority ecdsa-sha2-nistp256")
 				},
 				assertSecrets: validatePrivateKeyPEMFunc,
 			},
@@ -127,7 +161,7 @@ func TestExportAuthorities(t *testing.T) {
 				},
 				errorCheck: require.NoError,
 				assertNoSecrets: func(t *testing.T, output string) {
-					require.Contains(t, output, "@cert-authority localcluster,*.localcluster ssh-rsa")
+					require.Contains(t, output, "@cert-authority localcluster,*.localcluster ecdsa-sha2-nistp256")
 				},
 				assertSecrets: validatePrivateKeyPEMFunc,
 			},
@@ -147,7 +181,7 @@ func TestExportAuthorities(t *testing.T) {
 				},
 				errorCheck:      require.NoError,
 				assertNoSecrets: validateTLSCertificateDERFunc,
-				assertSecrets:   validatePrivateKeyDERFunc,
+				assertSecrets:   validateECDSAPrivateKeyDERFunc,
 			},
 			{
 				name: "invalid",
@@ -196,9 +230,18 @@ func TestExportAuthorities(t *testing.T) {
 				assertNoSecrets: func(t *testing.T, output string) {
 					// compat version (using 1.0) returns cert-authority to be used in the server
 					// even when asking for ssh authorized hosts / known hosts
-					require.Contains(t, output, "@cert-authority localcluster,*.localcluster ssh-rsa")
+					require.Contains(t, output, "@cert-authority localcluster,*.localcluster ecdsa-sha2-nistp256")
 				},
 				assertSecrets: validatePrivateKeyPEMFunc,
+			},
+			{
+				name: "db",
+				req: ExportAuthoritiesRequest{
+					AuthType: "db",
+				},
+				errorCheck:      require.NoError,
+				assertNoSecrets: validateTLSCertificatePEMFunc,
+				assertSecrets:   validatePrivateKeyPEMFunc,
 			},
 			{
 				name: "db-der",
@@ -207,12 +250,53 @@ func TestExportAuthorities(t *testing.T) {
 				},
 				errorCheck:      require.NoError,
 				assertNoSecrets: validateTLSCertificateDERFunc,
-				assertSecrets:   validatePrivateKeyDERFunc,
+				assertSecrets:   validateRSAPrivateKeyDERFunc,
+			},
+			{
+				name: "db-client",
+				req: ExportAuthoritiesRequest{
+					AuthType: "db-client",
+				},
+				errorCheck:      require.NoError,
+				assertNoSecrets: validateTLSCertificatePEMFunc,
+				assertSecrets:   validatePrivateKeyPEMFunc,
+			},
+			{
+				name: "db-client-der",
+				req: ExportAuthoritiesRequest{
+					AuthType: "db-client-der",
+				},
+				errorCheck:      require.NoError,
+				assertNoSecrets: validateTLSCertificateDERFunc,
+				assertSecrets:   validateRSAPrivateKeyDERFunc,
+			},
+			{
+				name: "github missing integration",
+				req: ExportAuthoritiesRequest{
+					AuthType: "github",
+				},
+				errorCheck: require.Error,
+			},
+			{
+				name: "github",
+				req: ExportAuthoritiesRequest{
+					AuthType:    "github",
+					Integration: "my-github",
+				},
+				errorCheck:      require.NoError,
+				assertNoSecrets: validateGitHubCAFunc,
 			},
 		} {
 			t.Run(fmt.Sprintf("%s_exportSecrets_%v", tt.name, exportSecrets), func(t *testing.T) {
 				mockedClient := &mockAuthClient{
 					server: testAuth.AuthServer,
+					integrationsClient: mockIntegrationsClient{
+						caKeySet: &types.CAKeySet{
+							SSH: []*types.SSHKeyPair{{
+								PublicKey: []byte(fixtures.SSHCAPublicKey),
+							}},
+						},
+					},
 				}
 				var (
 					err      error
@@ -224,6 +308,10 @@ func TestExportAuthorities(t *testing.T) {
 				if exportSecrets {
 					exportFunc = ExportAuthoritiesSecrets
 					checkFunc = tt.assertSecrets
+				}
+
+				if checkFunc == nil {
+					t.Skip("assert func not provided")
 				}
 
 				exported, err = exportFunc(ctx, mockedClient, tt.req)

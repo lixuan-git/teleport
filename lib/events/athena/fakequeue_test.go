@@ -1,16 +1,20 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package athena
 
@@ -19,10 +23,8 @@ import (
 	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/sns"
-	snsTypes "github.com/aws/aws-sdk-go-v2/service/sns/types"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
-	sqsTypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
+	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	"github.com/google/uuid"
 )
 
@@ -38,27 +40,27 @@ type fakeQueue struct {
 }
 
 type fakeQueueMessage struct {
-	payload    string
-	attributes map[string]snsTypes.MessageAttributeValue
+	payload string
+	s3Based bool
 }
 
 func newFakeQueue() *fakeQueue {
 	return &fakeQueue{}
 }
 
-func (f *fakeQueue) Publish(ctx context.Context, params *sns.PublishInput, optFns ...func(*sns.Options)) (*sns.PublishOutput, error) {
+func (f *fakeQueue) Publish(ctx context.Context, base64Body string, s3Based bool) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if len(f.publishErrors) > 0 {
 		err := f.publishErrors[0]
 		f.publishErrors = f.publishErrors[1:]
-		return nil, err
+		return err
 	}
 	f.msgs = append(f.msgs, fakeQueueMessage{
-		payload:    *params.Message,
-		attributes: params.MessageAttributes,
+		payload: base64Body,
+		s3Based: s3Based,
 	})
-	return nil, nil
+	return nil
 }
 
 func (f *fakeQueue) ReceiveMessage(ctx context.Context, params *sqs.ReceiveMessageInput, optFns ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
@@ -66,31 +68,33 @@ func (f *fakeQueue) ReceiveMessage(ctx context.Context, params *sqs.ReceiveMessa
 	if len(msgs) == 0 {
 		return &sqs.ReceiveMessageOutput{}, nil
 	}
-	out := make([]sqsTypes.Message, 0, 10)
+	out := make([]sqstypes.Message, 0, len(msgs))
 	for _, msg := range msgs {
-		out = append(out, sqsTypes.Message{
-			Body:              aws.String(msg.payload),
-			MessageAttributes: snsToSqsAttributes(msg.attributes),
+		var messageAttributes map[string]sqstypes.MessageAttributeValue
+		if msg.s3Based {
+			messageAttributes = map[string]sqstypes.MessageAttributeValue{
+				payloadTypeAttr: {
+					DataType:    aws.String("String"),
+					StringValue: aws.String(payloadTypeS3Based),
+				},
+			}
+		} else {
+			messageAttributes = map[string]sqstypes.MessageAttributeValue{
+				payloadTypeAttr: {
+					DataType:    aws.String("String"),
+					StringValue: aws.String(payloadTypeRawProtoEvent),
+				},
+			}
+		}
+		out = append(out, sqstypes.Message{
+			Body:              &msg.payload,
+			MessageAttributes: messageAttributes,
 			ReceiptHandle:     aws.String(uuid.NewString()),
 		})
 	}
 	return &sqs.ReceiveMessageOutput{
 		Messages: out,
 	}, nil
-}
-
-func snsToSqsAttributes(in map[string]snsTypes.MessageAttributeValue) map[string]sqsTypes.MessageAttributeValue {
-	if in == nil {
-		return nil
-	}
-	out := map[string]sqsTypes.MessageAttributeValue{}
-	for k, v := range in {
-		out[k] = sqsTypes.MessageAttributeValue{
-			DataType:    v.DataType,
-			StringValue: v.StringValue,
-		}
-	}
-	return out
 }
 
 func (f *fakeQueue) dequeue() []fakeQueueMessage {

@@ -1,26 +1,28 @@
-/*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+/** Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package events
 
 import (
+	"context"
 	"encoding/json"
+	"log/slog"
 
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport/api/types/events"
 	apiutils "github.com/gravitational/teleport/api/utils"
@@ -74,9 +76,7 @@ func FromEventFields(fields EventFields) (events.AuditEvent, error) {
 	case UserCreateEvent:
 		e = &events.UserCreate{}
 	case UserUpdatedEvent:
-		// note: user.update is a custom code applied on top of the same data as the user.create event
-		//       and they are thus functionally identical. There exists no direct gRPC version of user.update.
-		e = &events.UserCreate{}
+		e = &events.UserUpdate{}
 	case UserPasswordChangeEvent:
 		e = &events.UserPasswordChange{}
 	case AccessRequestCreateEvent:
@@ -121,6 +121,8 @@ func FromEventFields(fields EventFields) (events.AuditEvent, error) {
 		e = &events.SessionNetwork{}
 	case RoleCreatedEvent:
 		e = &events.RoleCreate{}
+	case RoleUpdatedEvent:
+		e = &events.RoleUpdate{}
 	case RoleDeletedEvent:
 		e = &events.RoleDelete{}
 	case TrustedClusterCreateEvent:
@@ -129,20 +131,26 @@ func FromEventFields(fields EventFields) (events.AuditEvent, error) {
 		e = &events.TrustedClusterDelete{}
 	case TrustedClusterTokenCreateEvent:
 		//nolint:staticcheck // We still need to support viewing the deprecated event
-		//type for backwards compatibility.
+		// type for backwards compatibility.
 		e = &events.TrustedClusterTokenCreate{}
 	case ProvisionTokenCreateEvent:
 		e = &events.ProvisionTokenCreate{}
 	case GithubConnectorCreatedEvent:
 		e = &events.GithubConnectorCreate{}
+	case GithubConnectorUpdatedEvent:
+		e = &events.GithubConnectorUpdate{}
 	case GithubConnectorDeletedEvent:
 		e = &events.GithubConnectorDelete{}
 	case OIDCConnectorCreatedEvent:
 		e = &events.OIDCConnectorCreate{}
+	case OIDCConnectorUpdatedEvent:
+		e = &events.OIDCConnectorUpdate{}
 	case OIDCConnectorDeletedEvent:
 		e = &events.OIDCConnectorDelete{}
 	case SAMLConnectorCreatedEvent:
 		e = &events.SAMLConnectorCreate{}
+	case SAMLConnectorUpdatedEvent:
+		e = &events.SAMLConnectorUpdate{}
 	case SAMLConnectorDeletedEvent:
 		e = &events.SAMLConnectorDelete{}
 	case SessionRejectedEvent:
@@ -175,8 +183,16 @@ func FromEventFields(fields EventFields) (events.AuditEvent, error) {
 		e = &events.DatabaseSessionEnd{}
 	case DatabaseSessionQueryEvent, DatabaseSessionQueryFailedEvent:
 		e = &events.DatabaseSessionQuery{}
+	case DatabaseSessionCommandResultEvent:
+		e = &events.DatabaseSessionCommandResult{}
 	case DatabaseSessionMalformedPacketEvent:
 		e = &events.DatabaseSessionMalformedPacket{}
+	case DatabaseSessionPermissionsUpdateEvent:
+		e = &events.DatabasePermissionUpdate{}
+	case DatabaseSessionUserCreateEvent:
+		e = &events.DatabaseUserCreate{}
+	case DatabaseSessionUserDeactivateEvent:
+		e = &events.DatabaseUserDeactivate{}
 	case DatabaseSessionPostgresParseEvent:
 		e = &events.PostgresParse{}
 	case DatabaseSessionPostgresBindEvent:
@@ -231,9 +247,14 @@ func FromEventFields(fields EventFields) (events.AuditEvent, error) {
 		e = &events.MFADeviceDelete{}
 	case DeviceEvent: // Kept for backwards compatibility.
 		e = &events.DeviceEvent{}
-	case DeviceCreateEvent, DeviceDeleteEvent, DeviceUpdateEvent,
-		DeviceEnrollEvent, DeviceAuthenticateEvent,
-		DeviceEnrollTokenCreateEvent:
+	case DeviceCreateEvent,
+		DeviceDeleteEvent,
+		DeviceUpdateEvent,
+		DeviceEnrollEvent,
+		DeviceAuthenticateEvent,
+		DeviceEnrollTokenCreateEvent,
+		DeviceWebTokenCreateEvent,
+		DeviceAuthenticateConfirmEvent:
 		e = &events.DeviceEvent2{}
 	case LockCreatedEvent:
 		e = &events.LockCreate{}
@@ -251,6 +272,8 @@ func FromEventFields(fields EventFields) (events.AuditEvent, error) {
 		e = &events.WindowsDesktopSessionStart{}
 	case WindowsDesktopSessionEndEvent:
 		e = &events.WindowsDesktopSessionEnd{}
+	case DesktopRecordingEvent:
+		e = &events.DesktopRecording{}
 	case DesktopClipboardSendEvent:
 		e = &events.DesktopClipboardSend{}
 	case DesktopClipboardReceiveEvent:
@@ -259,6 +282,8 @@ func FromEventFields(fields EventFields) (events.AuditEvent, error) {
 		e = &events.SessionConnect{}
 	case AccessRequestDeleteEvent:
 		e = &events.AccessRequestDelete{}
+	case AccessRequestExpireEvent:
+		e = &events.AccessRequestExpire{}
 	case CertificateCreateEvent:
 		e = &events.CertificateCreate{}
 	case RenewableCertificateGenerationMismatchEvent:
@@ -287,6 +312,12 @@ func FromEventFields(fields EventFields) (events.AuditEvent, error) {
 		e = &events.BotJoin{}
 	case InstanceJoinEvent:
 		e = &events.InstanceJoin{}
+	case BotCreateEvent:
+		e = &events.BotCreate{}
+	case BotUpdateEvent:
+		e = &events.BotUpdate{}
+	case BotDeleteEvent:
+		e = &events.BotDelete{}
 	case LoginRuleCreateEvent:
 		e = &events.LoginRuleCreate{}
 	case LoginRuleDeleteEvent:
@@ -311,6 +342,12 @@ func FromEventFields(fields EventFields) (events.AuditEvent, error) {
 		e = &events.OktaAssignmentResult{}
 	case OktaAssignmentCleanupEvent:
 		e = &events.OktaAssignmentResult{}
+	case OktaUserSyncEvent:
+		e = &events.OktaUserSync{}
+	case OktaAccessListSyncEvent:
+		e = &events.OktaAccessListSync{}
+	case AccessGraphAccessPathChangedEvent:
+		e = &events.AccessPathChanged{}
 	case AccessListCreateEvent:
 		e = &events.AccessListCreate{}
 	case AccessListUpdateEvent:
@@ -327,21 +364,123 @@ func FromEventFields(fields EventFields) (events.AuditEvent, error) {
 		e = &events.AccessListMemberDelete{}
 	case AccessListMemberDeleteAllForAccessListEvent:
 		e = &events.AccessListMemberDeleteAllForAccessList{}
+	case UserLoginAccessListInvalidEvent:
+		e = &events.UserLoginAccessListInvalid{}
+	case SecReportsAuditQueryRunEvent:
+		e = &events.AuditQueryRun{}
+	case SecReportsReportRunEvent:
+		e = &events.SecurityReportRun{}
+	case ExternalAuditStorageEnableEvent:
+		e = &events.ExternalAuditStorageEnable{}
+	case ExternalAuditStorageDisableEvent:
+		e = &events.ExternalAuditStorageDisable{}
+	case CreateMFAAuthChallengeEvent:
+		e = &events.CreateMFAAuthChallenge{}
+	case ValidateMFAAuthResponseEvent:
+		e = &events.ValidateMFAAuthResponse{}
+	case SPIFFESVIDIssuedEvent:
+		e = &events.SPIFFESVIDIssued{}
+	case AuthPreferenceUpdateEvent:
+		e = &events.AuthPreferenceUpdate{}
+	case ClusterNetworkingConfigUpdateEvent:
+		e = &events.ClusterNetworkingConfigUpdate{}
+	case SessionRecordingConfigUpdateEvent:
+		e = &events.SessionRecordingConfigUpdate{}
+	case AccessGraphSettingsUpdateEvent:
+		e = &events.AccessGraphSettingsUpdate{}
+	case DatabaseSessionSpannerRPCEvent:
+		e = &events.SpannerRPC{}
 	case UnknownEvent:
 		e = &events.Unknown{}
 
-	// Cassandra events.
-	case CassandraBatchEventCode:
+	case DatabaseSessionCassandraBatchEvent:
 		e = &events.CassandraBatch{}
-	case CassandraRegisterEventCode:
+	case DatabaseSessionCassandraRegisterEvent:
 		e = &events.CassandraRegister{}
-	case CassandraPrepareEventCode:
+	case DatabaseSessionCassandraPrepareEvent:
 		e = &events.CassandraPrepare{}
-	case CassandraExecuteEventCode:
+	case DatabaseSessionCassandraExecuteEvent:
 		e = &events.CassandraExecute{}
 
+	case DiscoveryConfigCreateEvent:
+		e = &events.DiscoveryConfigCreate{}
+	case DiscoveryConfigUpdateEvent:
+		e = &events.DiscoveryConfigUpdate{}
+	case DiscoveryConfigDeleteEvent:
+		e = &events.DiscoveryConfigDelete{}
+	case DiscoveryConfigDeleteAllEvent:
+		e = &events.DiscoveryConfigDeleteAll{}
+
+	case SPIFFEFederationCreateEvent:
+		e = &events.SPIFFEFederationCreate{}
+	case SPIFFEFederationDeleteEvent:
+		e = &events.SPIFFEFederationDelete{}
+	case IntegrationCreateEvent:
+		e = &events.IntegrationCreate{}
+	case IntegrationUpdateEvent:
+		e = &events.IntegrationUpdate{}
+	case IntegrationDeleteEvent:
+		e = &events.IntegrationDelete{}
+
+	case PluginCreateEvent:
+		e = &events.PluginCreate{}
+	case PluginUpdateEvent:
+		e = &events.PluginUpdate{}
+	case PluginDeleteEvent:
+		e = &events.PluginDelete{}
+
+	case StaticHostUserCreateEvent:
+		e = &events.StaticHostUserCreate{}
+	case StaticHostUserUpdateEvent:
+		e = &events.StaticHostUserUpdate{}
+	case StaticHostUserDeleteEvent:
+		e = &events.StaticHostUserDelete{}
+
+	case CrownJewelCreateEvent:
+		e = &events.CrownJewelCreate{}
+	case CrownJewelUpdateEvent:
+		e = &events.CrownJewelUpdate{}
+	case CrownJewelDeleteEvent:
+		e = &events.CrownJewelDelete{}
+
+	case UserTaskCreateEvent:
+		e = &events.UserTaskCreate{}
+	case UserTaskUpdateEvent:
+		e = &events.UserTaskUpdate{}
+	case UserTaskDeleteEvent:
+		e = &events.UserTaskDelete{}
+
+	case SFTPSummaryEvent:
+		e = &events.SFTPSummary{}
+
+	case AutoUpdateConfigCreateEvent:
+		e = &events.AutoUpdateConfigCreate{}
+	case AutoUpdateConfigUpdateEvent:
+		e = &events.AutoUpdateConfigUpdate{}
+	case AutoUpdateConfigDeleteEvent:
+		e = &events.AutoUpdateConfigDelete{}
+
+	case AutoUpdateVersionCreateEvent:
+		e = &events.AutoUpdateVersionCreate{}
+	case AutoUpdateVersionUpdateEvent:
+		e = &events.AutoUpdateVersionUpdate{}
+	case AutoUpdateVersionDeleteEvent:
+		e = &events.AutoUpdateVersionDelete{}
+
+	case ContactCreateEvent:
+		e = &events.ContactCreate{}
+	case ContactDeleteEvent:
+		e = &events.ContactDelete{}
+
+	case WorkloadIdentityCreateEvent:
+		e = &events.WorkloadIdentityCreate{}
+	case WorkloadIdentityUpdateEvent:
+		e = &events.WorkloadIdentityUpdate{}
+	case WorkloadIdentityDeleteEvent:
+		e = &events.WorkloadIdentityDelete{}
+
 	default:
-		log.Errorf("Attempted to convert dynamic event of unknown type %q into protobuf event.", eventType)
+		slog.ErrorContext(context.Background(), "Attempted to convert dynamic event of unknown type into protobuf event.", "event_type", eventType)
 		unknown := &events.Unknown{}
 		if err := utils.FastUnmarshal(data, unknown); err != nil {
 			return nil, trace.Wrap(err)

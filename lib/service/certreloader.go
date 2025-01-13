@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package service
 
@@ -20,11 +22,11 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/lib/service/servicecfg"
@@ -42,7 +44,7 @@ type CertReloaderConfig struct {
 // CertReloader periodically reloads a list of cert key-pair paths.
 // This allows new certificates to be used without a full reload of Teleport.
 type CertReloader struct {
-	*log.Entry
+	logger *slog.Logger
 	// cfg is the certificate reloader configuration.
 	cfg CertReloaderConfig
 
@@ -55,17 +57,15 @@ type CertReloader struct {
 // NewCertReloader initializes a new certificate reloader.
 func NewCertReloader(cfg CertReloaderConfig) *CertReloader {
 	return &CertReloader{
-		Entry: log.WithFields(log.Fields{
-			trace.Component: teleport.Component(teleport.ComponentProxy, "certreloader"),
-		}),
-		cfg: cfg,
+		logger: slog.With(teleport.ComponentKey, teleport.Component(teleport.ComponentProxy, "certreloader")),
+		cfg:    cfg,
 	}
 }
 
 // Run tries to load certificates and then spawns the certificate reloader.
 func (c *CertReloader) Run(ctx context.Context) error {
 	// Synchronously load initially configured certificates.
-	if err := c.loadCertificates(); err != nil {
+	if err := c.loadCertificates(ctx); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -76,9 +76,9 @@ func (c *CertReloader) Run(ctx context.Context) error {
 
 	// Spawn the certificate reloader.
 	go func() {
-		c.Infof("Starting periodic reloading of certificate key pairs every %s.", c.cfg.KeyPairsReloadInterval)
+		c.logger.InfoContext(ctx, "Starting periodic reloading of certificate key pairs", "reload_interval", c.cfg.KeyPairsReloadInterval)
 		defer func() {
-			c.Info("Stopped periodic reloading of certificate key pairs.")
+			c.logger.InfoContext(ctx, "Stopped periodic reloading of certificate key pairs")
 		}()
 
 		t := time.NewTicker(c.cfg.KeyPairsReloadInterval)
@@ -86,8 +86,8 @@ func (c *CertReloader) Run(ctx context.Context) error {
 		for {
 			select {
 			case <-t.C:
-				if err := c.loadCertificates(); err != nil {
-					c.WithError(err).Warn("Failed to load certificates")
+				if err := c.loadCertificates(ctx); err != nil {
+					c.logger.WarnContext(ctx, "Failed to load certificates", "error", err)
 				}
 			case <-ctx.Done():
 				return
@@ -100,10 +100,13 @@ func (c *CertReloader) Run(ctx context.Context) error {
 // loadCertificates loads certificate keys pairs.
 // It returns an error if any of the certificate key pairs fails to load.
 // If any of the key pairs fails to load, none of the certificates are updated.
-func (c *CertReloader) loadCertificates() error {
+func (c *CertReloader) loadCertificates(ctx context.Context) error {
 	certs := make([]tls.Certificate, 0, len(c.cfg.KeyPairs))
 	for _, pair := range c.cfg.KeyPairs {
-		c.Debugf("Loading TLS certificate %v and key %v.", pair.Certificate, pair.PrivateKey)
+		c.logger.DebugContext(ctx, "Loading TLS certificate",
+			"public_key", pair.Certificate,
+			"private_key", pair.PrivateKey,
+		)
 
 		certificate, err := tls.LoadX509KeyPair(pair.Certificate, pair.PrivateKey)
 		if err != nil {

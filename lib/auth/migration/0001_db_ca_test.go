@@ -1,16 +1,20 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package migration
 
@@ -177,7 +181,6 @@ func TestDBAuthorityUp(t *testing.T) {
 	cases := []struct {
 		name         string
 		fakeTrust    *fakeTrust
-		fakePresence fakePresence
 		assertion    require.ErrorAssertionFunc
 		validateFunc func(t *testing.T, created []types.CertAuthority)
 	}{
@@ -190,8 +193,6 @@ func TestDBAuthorityUp(t *testing.T) {
 					leaf1DB:   fakeCA,
 					leaf2Host: fakeCA,
 				},
-			},
-			fakePresence: fakePresence{
 				clusters: []types.TrustedCluster{
 					&types.TrustedClusterV2{
 						Kind:     types.KindTrustedCluster,
@@ -223,8 +224,6 @@ func TestDBAuthorityUp(t *testing.T) {
 					leaf2DB: fakeCA,
 					leaf1DB: fakeCA,
 				},
-			},
-			fakePresence: fakePresence{
 				clusters: []types.TrustedCluster{
 					&types.TrustedClusterV2{
 						Kind:     types.KindTrustedCluster,
@@ -251,7 +250,6 @@ func TestDBAuthorityUp(t *testing.T) {
 			b, err := memory.New(memory.Config{EventsOff: true})
 			require.NoError(t, err)
 
-			test.fakePresence.Presence = local.NewPresenceService(b)
 			test.fakeTrust.Trust = local.NewCAService(b)
 
 			migration := createDBAuthority{
@@ -267,9 +265,6 @@ func TestDBAuthorityUp(t *testing.T) {
 						ClusterConfiguration: svc,
 						clusterName:          clusterName("root"),
 					}, nil
-				},
-				presenceServiceFn: func(b backend.Backend) services.Presence {
-					return test.fakePresence
 				},
 			}
 
@@ -288,22 +283,14 @@ func (f fakeConfig) GetClusterName(opts ...services.MarshalOption) (types.Cluste
 	return f.clusterName, nil
 }
 
-type fakePresence struct {
-	services.Presence
-	clusters []types.TrustedCluster
-}
-
-func (f fakePresence) GetTrustedClusters(ctx context.Context) ([]types.TrustedCluster, error) {
-	return f.clusters, nil
-}
-
 type fakeTrust struct {
 	services.Trust
 
 	authorities map[types.CertAuthID]types.CertAuthority
 
-	mu      sync.Mutex
-	created []types.CertAuthority
+	clusters []types.TrustedCluster
+	mu       sync.Mutex
+	created  []types.CertAuthority
 }
 
 func (f *fakeTrust) casCreated() []types.CertAuthority {
@@ -331,4 +318,8 @@ func (f *fakeTrust) GetCertAuthority(ctx context.Context, id types.CertAuthID, l
 	}
 
 	return ca, nil
+}
+
+func (f *fakeTrust) GetTrustedClusters(ctx context.Context) ([]types.TrustedCluster, error) {
+	return f.clusters, nil
 }

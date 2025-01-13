@@ -2,20 +2,22 @@
 // +build linux
 
 /*
-Copyright 2015-2018 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package srv
 
@@ -24,6 +26,7 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
 	"strconv"
 	"syscall"
 	"testing"
@@ -31,25 +34,53 @@ import (
 
 	"github.com/gravitational/trace"
 	"github.com/stretchr/testify/require"
+
+	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/lib/utils/host"
 )
 
 func TestOSCommandPrep(t *testing.T) {
+	utils.RequireRoot(t)
+
 	srv := newMockServer(t)
 	scx := newExecServerContext(t, srv)
 
-	usr, err := user.Current()
+	// because CheckHomeDir now inspects access to the home directory as the actual user after a rexec,
+	// we need to setup a real, non-root user with a valid home directory in order for this test to
+	// exercise the correct paths
+	tempHome := t.TempDir()
+	require.NoError(t, os.Chmod(filepath.Dir(tempHome), 0777))
+
+	username := "test-os-command-prep"
+	scx.Identity.Login = username
+	_, err := host.UserAdd(username, nil, host.UserOpts{
+		Home: tempHome,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		// change homedir back so user deletion doesn't fail
+		changeHomeDir(t, username, tempHome)
+		_, err := host.UserDel(username)
+		require.NoError(t, err)
+	})
+
+	usr, err := user.Lookup(username)
 	require.NoError(t, err)
 
+	uid, err := strconv.Atoi(usr.Uid)
+	require.NoError(t, err)
+
+	require.NoError(t, os.Chown(tempHome, uid, -1))
 	expectedEnv := []string{
 		"LANG=en_US.UTF-8",
-		getDefaultEnvPath(strconv.Itoa(os.Geteuid()), defaultLoginDefsPath),
+		getDefaultEnvPath(usr.Uid, defaultLoginDefsPath),
 		fmt.Sprintf("HOME=%s", usr.HomeDir),
-		fmt.Sprintf("USER=%s", usr.Username),
+		fmt.Sprintf("USER=%s", username),
 		"SHELL=/bin/sh",
 		"SSH_CLIENT=10.0.0.5 4817 3022",
 		"SSH_CONNECTION=10.0.0.5 4817 127.0.0.1 3022",
 		"TERM=xterm",
-		fmt.Sprintf("SSH_TTY=%v", scx.session.term.TTY().Name()),
+		fmt.Sprintf("SSH_TTY=%v", scx.session.term.TTYName()),
 		"SSH_SESSION_ID=xxx",
 		"SSH_TELEPORT_HOST_UUID=testID",
 		"SSH_TELEPORT_CLUSTER_NAME=localhost",
@@ -60,7 +91,7 @@ func TestOSCommandPrep(t *testing.T) {
 	execCmd, err := scx.ExecCommand()
 	require.NoError(t, err)
 
-	cmd, err := buildCommand(execCmd, usr, nil, nil, nil)
+	cmd, err := buildCommand(execCmd, usr, nil, nil)
 	require.NoError(t, err)
 
 	require.NotNil(t, cmd)
@@ -75,7 +106,7 @@ func TestOSCommandPrep(t *testing.T) {
 	execCmd, err = scx.ExecCommand()
 	require.NoError(t, err)
 
-	cmd, err = buildCommand(execCmd, usr, nil, nil, nil)
+	cmd, err = buildCommand(execCmd, usr, nil, nil)
 	require.NoError(t, err)
 
 	require.NotNil(t, cmd)
@@ -90,27 +121,41 @@ func TestOSCommandPrep(t *testing.T) {
 	execCmd, err = scx.ExecCommand()
 	require.NoError(t, err)
 
-	cmd, err = buildCommand(execCmd, usr, nil, nil, nil)
+	cmd, err = buildCommand(execCmd, usr, nil, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, "/bin/sh", cmd.Path)
 	require.Equal(t, []string{"/bin/sh", "-c", "top"}, cmd.Args)
 	require.Equal(t, syscall.SIGKILL, cmd.SysProcAttr.Pdeathsig)
 
-	if os.Geteuid() != 0 {
-		t.Skip("skipping portion of test which must run as root")
-	}
-
 	// Missing home directory - HOME should still be set to the given
-	// home dir, but the command should set it's CWD to root instead.
+	// home dir, but the command should set its CWD to root instead.
+	changeHomeDir(t, username, "/wrong/place")
 	usr.HomeDir = "/wrong/place"
 	root := string(os.PathSeparator)
 	expectedEnv[2] = "HOME=/wrong/place"
-	cmd, err = buildCommand(execCmd, usr, nil, nil, nil)
+	cmd, err = buildCommand(execCmd, usr, nil, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, root, cmd.Dir)
 	require.Equal(t, expectedEnv, cmd.Env)
+}
+
+func TestConfigureCommand(t *testing.T) {
+	srv := newMockServer(t)
+	scx := newExecServerContext(t, srv)
+
+	unexpectedKey := "FOO"
+	unexpectedValue := "BAR"
+	// environment values in the server context should not be forwarded
+	scx.SetEnv(unexpectedKey, unexpectedValue)
+
+	cmd, err := ConfigureCommand(scx)
+	require.NoError(t, err)
+
+	require.NotNil(t, cmd)
+	require.Equal(t, "/proc/self/exe", cmd.Path)
+	require.NotContains(t, cmd.Env, unexpectedKey+"="+unexpectedValue)
 }
 
 // TestContinue tests if the process hangs if a continue signal is not sent

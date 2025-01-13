@@ -1,24 +1,25 @@
-/*
-Copyright 2023 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import { getContrastRatio } from '../utils/colorManipulator';
-import { lightBlue, blueGrey, yellow } from '../palette';
-import typography, { fontSizes, fontWeights } from '../typography';
 import { fonts } from '../fonts';
-
+import { blueGrey, lightBlue, yellow } from '../palette';
+import typography, { fontSizes, fontWeights } from '../typography';
+import { getContrastRatio } from '../utils/colorManipulator';
 import { SharedColors, SharedStyles } from './types';
 
 // TODO(bl-nero): use a CSS var for sidebar width and make the breakpoints work
@@ -27,16 +28,24 @@ const sidebarWidth = 256;
 
 // Styles that are shared by all themes.
 export const sharedStyles: SharedStyles = {
+  sidebarWidth,
   boxShadow: [
     '0px 2px 1px -1px rgba(0, 0, 0, 0.2), 0px 1px 1px rgba(0, 0, 0, 0.14), 0px 1px 3px rgba(0, 0, 0, 0.12)',
     '0px 5px 5px -3px rgba(0, 0, 0, 0.2), 0px 8px 10px 1px rgba(0, 0, 0, 0.14), 0px 3px 14px 2px rgba(0, 0, 0, 0.12)',
     '0px 3px 5px -1px rgba(0, 0, 0, 0.2), 0px 6px 10px rgba(0, 0, 0, 0.14), 0px 1px 18px rgba(0, 0, 0, 0.12)',
+    '0px 1px 10px 0px rgba(0, 0, 0, 0.12), 0px 4px 5px 0px rgba(0, 0, 0, 0.14), 0px 2px 4px -1px rgba(0, 0, 0, 0.20)',
   ],
   breakpoints: {
+    // TODO (avatus): remove mobile/tablet/desktop breakpoints in favor of screensize descriptions
     mobile: 400 + sidebarWidth,
     tablet: 800 + sidebarWidth,
     desktop: 1200 + sidebarWidth,
+    // use these from now on
+    small: 600,
+    medium: 1024,
+    large: 1280,
   },
+  topBarHeight: [44, 56, 72],
   space: [0, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80],
   borders: [
     0,
@@ -52,7 +61,8 @@ export const sharedStyles: SharedStyles = {
   fonts: fonts,
   fontWeights,
   fontSizes,
-  radii: [0, 2, 4, 8, 16, 9999, '100%'],
+  // TODO(rudream): Clean up radii order in sharedStyles.
+  radii: [0, 2, 4, 8, 16, 9999, '100%', 24],
   regular: fontWeights.regular,
   bold: fontWeights.bold,
 };
@@ -61,6 +71,7 @@ export const sharedStyles: SharedStyles = {
 export const sharedColors: SharedColors = {
   dark: '#000000',
   light: '#FFFFFF',
+  interactionHandle: '#FFFFFF',
   grey: {
     ...blueGrey,
   },
@@ -71,12 +82,9 @@ export const sharedColors: SharedColors = {
   info: lightBlue[600],
 };
 
-export function getContrastText(background) {
+export function getContrastText(background: string) {
   // Use the same logic as
   // Bootstrap: https://github.com/twbs/bootstrap/blob/1d6e3710dd447de1a200f29e8fa521f8a0908f70/scss/_functions.scss#L59
   // and material-components-web https://github.com/material-components/material-components-web/blob/ac46b8863c4dab9fc22c4c662dc6bd1b65dd652f/packages/mdc-theme/_functions.scss#L54
-  const contrastText =
-    getContrastRatio(background, '#FFFFFF') >= 3 ? '#FFFFFF' : '#000000';
-
-  return contrastText;
+  return getContrastRatio(background, '#FFFFFF') >= 3 ? '#FFFFFF' : '#000000';
 }

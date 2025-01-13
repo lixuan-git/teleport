@@ -1,33 +1,54 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 import { z } from 'zod';
 
-import { Platform } from 'teleterm/mainProcess/types';
+import { Platform, RuntimeSettings } from 'teleterm/mainProcess/types';
 
 import { createKeyboardShortcutSchema } from './keyboardShortcutSchema';
+
+// When adding a new config property, add it to the docs too
+// (teleport-connect.mdx#configuration).
 
 export type AppConfigSchema = ReturnType<typeof createAppConfigSchema>;
 export type AppConfig = z.infer<AppConfigSchema>;
 
-export const createAppConfigSchema = (platform: Platform) => {
-  const defaultKeymap = getDefaultKeymap(platform);
-  const defaultTerminalFont = getDefaultTerminalFont(platform);
+/** ID of the custom shell. When it is set, the shell path should be read from `terminal.customShell`. */
+export const CUSTOM_SHELL_ID = 'custom' as const;
 
-  const shortcutSchema = createKeyboardShortcutSchema(platform);
+/**
+ * List of properties that can be modified from the renderer process.
+ * The motivation for adding this was to make it impossible to change
+ * `terminal.customShell` from the renderer.
+ */
+export const CONFIG_MODIFIABLE_FROM_RENDERER: (keyof AppConfig)[] = [
+  'usageReporting.enabled',
+];
+
+export const createAppConfigSchema = (settings: RuntimeSettings) => {
+  const defaultKeymap = getDefaultKeymap(settings.platform);
+  const defaultTerminalFont = getDefaultTerminalFont(settings.platform);
+  const availableShellIdsWithCustom = [
+    ...settings.availableShells.map(({ id }) => id),
+    CUSTOM_SHELL_ID,
+  ];
+
+  const shortcutSchema = createKeyboardShortcutSchema(settings.platform);
 
   // `keymap.` prefix is used in `initUi.ts` in a predicate function.
   return z.object({
@@ -52,6 +73,43 @@ export const createAppConfigSchema = (platform: Platform) => {
       .max(256)
       .default(15)
       .describe('Font size for the terminal.'),
+    'terminal.windowsBackend': z
+      .enum(['auto', 'winpty'])
+      .default('auto')
+      .describe(
+        '`auto` uses modern ConPTY system if available, which requires Windows 10 (19H1) or above. Set to `winpty` to use winpty even if ConPTY is available.'
+      ),
+    'terminal.shell': z
+      .string()
+      .default(settings.defaultOsShellId)
+      .describe(
+        'A default terminal shell. Can be set to `custom` to take the shell path from `terminal.customShell`. It is best to configure it through UI (right click on a terminal tab > Default Shell).'
+      )
+      .refine(
+        configuredShell =>
+          availableShellIdsWithCustom.some(
+            shellId => shellId === configuredShell
+          ),
+        configuredShell => ({
+          message: `Cannot find the shell "${configuredShell}". Available options are: ${availableShellIdsWithCustom.join(', ')}. Using platform default.`,
+        })
+      ),
+    'terminal.customShell': z
+      .string()
+      .default('')
+      .describe(
+        'Path to the custom shell that is used when `terminal.shell` is set to `custom`. It is best to configure it through UI (right click on a terminal tab > Custom Shell…).'
+      ),
+    'terminal.rightClick': z
+      .enum(['paste', 'copyPaste', 'menu'])
+      .default(settings.platform === 'win32' ? 'copyPaste' : 'menu')
+      .describe(
+        '`paste` pastes clipboard content, `copyPaste` copies if text is selected, otherwise pastes, `menu` shows context menu.'
+      ),
+    'terminal.copyOnSelect': z
+      .boolean()
+      .default(false)
+      .describe('Automatically copies selected text to the clipboard.'),
     'usageReporting.enabled': z
       .boolean()
       .default(false)
@@ -92,6 +150,19 @@ export const createAppConfigSchema = (platform: Platform) => {
     'keymap.newTerminalTab': shortcutSchema
       .default(defaultKeymap['newTerminalTab'])
       .describe(getShortcutDesc('open a new terminal tab')),
+    // Even if this is set to a non-default copy shortcut for a given platform,
+    // the default shortcut will still work (for example, Command+C on Macs).
+    'keymap.terminalCopy': shortcutSchema
+      .default(defaultKeymap['terminalCopy'])
+      .describe(getShortcutDesc('copy text in the terminal')),
+    // Even if this is set to a non-default paste shortcut for a given platform,
+    // the default shortcut will still work (for example, Command+V on Macs).
+    'keymap.terminalPaste': shortcutSchema
+      .default(defaultKeymap['terminalPaste'])
+      .describe(getShortcutDesc('paste text in the terminal')),
+    'keymap.terminalSearch': shortcutSchema
+      .default(defaultKeymap['terminalSearch'])
+      .describe(getShortcutDesc('search for text in the terminal')),
     'keymap.previousTab': shortcutSchema
       .default(defaultKeymap['previousTab'])
       .describe(getShortcutDesc('go to the previous tab')),
@@ -110,15 +181,30 @@ export const createAppConfigSchema = (platform: Platform) => {
     'keymap.openSearchBar': shortcutSchema
       .default(defaultKeymap['openSearchBar'])
       .describe(getShortcutDesc('open the search bar')),
-    'feature.connectMyComputer': z
-      .boolean()
-      .default(false)
-      .describe('Enables sharing the computer.'),
     'headless.skipConfirm': z
       .boolean()
       .default(false)
       .describe(
         'Skips the confirmation prompt for headless login approval and instead prompts for WebAuthn immediately.'
+      ),
+    'ssh.noResume': z
+      .boolean()
+      .default(false)
+      .describe('Disables SSH connection resumption.'),
+    'ssh.forwardAgent': z
+      .boolean()
+      .default(false)
+      .describe(
+        "Enables agent forwarding when connecting to SSH nodes. It's the equivalent of the forward-agent flag in tsh ssh."
+      ),
+    'sshAgent.addKeysToAgent': z
+      .enum(['auto', 'no', 'yes', 'only'])
+      .default('auto')
+      .describe(
+        'Controls how keys are added to a local SSH agent. ' +
+          "'auto' adds the keys only if the agent supports SSH certificates, " +
+          "'no' never attempts to add them, 'yes' always attempts to add them, " +
+          "'only' always attempts to add the keys to the agent but it does not save them on disk."
       ),
   });
 };
@@ -141,7 +227,10 @@ export type KeyboardShortcutAction =
   | 'openSearchBar'
   | 'openConnections'
   | 'openClusters'
-  | 'openProfiles';
+  | 'openProfiles'
+  | 'terminalCopy'
+  | 'terminalPaste'
+  | 'terminalSearch';
 
 const getDefaultKeymap = (
   platform: Platform
@@ -158,15 +247,18 @@ const getDefaultKeymap = (
         tab7: 'Ctrl+7',
         tab8: 'Ctrl+8',
         tab9: 'Ctrl+9',
-        closeTab: 'Ctrl+W',
-        newTab: 'Ctrl+T',
-        newTerminalTab: 'Ctrl+Shift+T',
+        closeTab: 'Ctrl+Shift+W',
+        newTab: 'Ctrl+Shift+T',
+        newTerminalTab: 'Ctrl+Shift+`',
         previousTab: 'Ctrl+Shift+Tab',
         nextTab: 'Ctrl+Tab',
-        openSearchBar: 'Ctrl+K',
-        openConnections: 'Ctrl+P',
-        openClusters: 'Ctrl+E',
-        openProfiles: 'Ctrl+I',
+        openSearchBar: 'Ctrl+Shift+K',
+        openConnections: 'Ctrl+Shift+P',
+        openClusters: 'Ctrl+Shift+E',
+        openProfiles: 'Ctrl+Shift+I',
+        terminalCopy: 'Ctrl+Shift+C',
+        terminalPaste: 'Ctrl+Shift+V',
+        terminalSearch: 'Ctrl+Shift+F',
       };
     case 'linux':
       return {
@@ -179,15 +271,18 @@ const getDefaultKeymap = (
         tab7: 'Alt+7',
         tab8: 'Alt+8',
         tab9: 'Alt+9',
-        closeTab: 'Ctrl+W',
-        newTab: 'Ctrl+T',
-        newTerminalTab: 'Ctrl+Shift+T',
+        closeTab: 'Ctrl+Shift+W',
+        newTab: 'Ctrl+Shift+T',
+        newTerminalTab: 'Ctrl+Shift+`',
         previousTab: 'Ctrl+Shift+Tab',
         nextTab: 'Ctrl+Tab',
-        openSearchBar: 'Ctrl+K',
-        openConnections: 'Ctrl+P',
-        openClusters: 'Ctrl+E',
-        openProfiles: 'Ctrl+I',
+        openSearchBar: 'Ctrl+Shift+K',
+        openConnections: 'Ctrl+Shift+P',
+        openClusters: 'Ctrl+Shift+E',
+        openProfiles: 'Ctrl+Shift+I',
+        terminalCopy: 'Ctrl+Shift+C',
+        terminalPaste: 'Ctrl+Shift+V',
+        terminalSearch: 'Ctrl+Shift+F',
       };
     case 'darwin':
       return {
@@ -202,13 +297,16 @@ const getDefaultKeymap = (
         tab9: 'Command+9',
         closeTab: 'Command+W',
         newTab: 'Command+T',
-        newTerminalTab: 'Shift+Command+T',
+        newTerminalTab: 'Control+Shift+`',
         previousTab: 'Control+Shift+Tab',
         nextTab: 'Control+Tab',
         openSearchBar: 'Command+K',
         openConnections: 'Command+P',
         openClusters: 'Command+E',
         openProfiles: 'Command+I',
+        terminalCopy: 'Command+C',
+        terminalPaste: 'Command+V',
+        terminalSearch: 'Command+F',
       };
   }
 };

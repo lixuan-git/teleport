@@ -1,22 +1,27 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package watcherjob
 
 import (
 	"context"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -106,4 +111,55 @@ func TestConcurrencyLimit(t *testing.T) {
 
 	timeAfter := time.Now()
 	assert.InDelta(t, 4*time.Second, timeAfter.Sub(timeBefore), float64(750*time.Millisecond))
+}
+
+// TestNewJobWithConfirmedWatchKinds checks that the watch kinds are passed back after init.
+func TestNewJobWithConfirmedWatchKinds(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	t.Cleanup(cancel)
+
+	watchKinds := []types.WatchKind{
+		{Kind: types.KindAccessRequest},
+	}
+	config := Config{
+		MaxConcurrency: 4,
+		Watch: types.Watch{
+			Kinds: watchKinds,
+		},
+	}
+	countdown := NewCountdown(config.MaxConcurrency)
+	var acceptedWatchKinds []string
+	onWatchInit := func(ws types.WatchStatus) {
+		for _, watchKind := range ws.GetKinds() {
+			acceptedWatchKinds = append(acceptedWatchKinds, watchKind.Kind)
+		}
+	}
+
+	process := NewMockEventsProcessWithConfirmedWatchJobs(ctx, t, config,
+		func(ctx context.Context, event types.Event) error {
+			defer countdown.Decrement()
+			time.Sleep(time.Second)
+			return trace.Wrap(ctx.Err())
+		}, onWatchInit)
+
+	_, err := process.WaitReady(ctx)
+	require.NoError(t, err)
+
+	if !slices.ContainsFunc(acceptedWatchKinds, func(kind string) bool {
+		return kind == types.KindAccessRequest
+	}) {
+		t.Error("access request watch kind not returned after init: %V", acceptedWatchKinds)
+	}
+
+	timeBefore := time.Now()
+	for i := 0; i < config.MaxConcurrency; i++ {
+		resource, err := types.NewAccessRequest("REQ-SAME", "foo", "admin")
+		require.NoError(t, err)
+		process.Events.Fire(types.Event{Type: types.OpPut, Resource: resource})
+	}
+	require.NoError(t, countdown.Wait(ctx))
+
+	timeAfter := time.Now()
+	assert.InDelta(t, 4*time.Second, timeAfter.Sub(timeBefore), float64(1000*time.Millisecond))
 }

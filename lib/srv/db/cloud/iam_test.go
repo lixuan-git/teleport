@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package cloud
 
@@ -22,17 +24,16 @@ import (
 	"testing"
 	"time"
 
+	rdstypes "github.com/aws/aws-sdk-go-v2/service/rds/types"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/iam"
-	"github.com/aws/aws-sdk-go/service/rds"
-	"github.com/aws/aws-sdk-go/service/redshift"
 	"github.com/google/uuid"
 	"github.com/gravitational/trace"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	clients "github.com/gravitational/teleport/lib/cloud"
 	"github.com/gravitational/teleport/lib/cloud/mocks"
 	"github.com/gravitational/teleport/lib/defaults"
@@ -45,35 +46,28 @@ func TestAWSIAM(t *testing.T) {
 	t.Cleanup(cancel)
 
 	// Setup AWS database objects.
-	rdsInstance := &rds.DBInstance{
+	rdsInstance := &rdstypes.DBInstance{
 		DBInstanceArn:        aws.String("arn:aws:rds:us-west-1:123456789012:db:postgres-rds"),
 		DBInstanceIdentifier: aws.String("postgres-rds"),
 		DbiResourceId:        aws.String("db-xyz"),
 	}
 
-	auroraCluster := &rds.DBCluster{
+	auroraCluster := &rdstypes.DBCluster{
 		DBClusterArn:        aws.String("arn:aws:rds:us-east-1:123456789012:cluster:postgres-aurora"),
 		DBClusterIdentifier: aws.String("postgres-aurora"),
 		DbClusterResourceId: aws.String("cluster-xyz"),
 	}
 
-	redshiftCluster := &redshift.Cluster{
-		ClusterNamespaceArn: aws.String("arn:aws:redshift:us-east-2:123456789012:namespace:namespace-xyz"),
-		ClusterIdentifier:   aws.String("redshift-cluster-1"),
-	}
-
 	// Configure mocks.
-	stsClient := &mocks.STSMock{
-		ARN: "arn:aws:iam::123456789012:role/test-role",
+	stsClient := &mocks.STSClient{
+		STSClientV1: mocks.STSClientV1{
+			ARN: "arn:aws:iam::123456789012:role/test-role",
+		},
 	}
 
-	rdsClient := &mocks.RDSMock{
-		DBInstances: []*rds.DBInstance{rdsInstance},
-		DBClusters:  []*rds.DBCluster{auroraCluster},
-	}
-
-	redshiftClient := &mocks.RedshiftMock{
-		Clusters: []*redshift.Cluster{redshiftCluster},
+	clt := &mocks.RDSClient{
+		DBInstances: []rdstypes.DBInstance{*rdsInstance},
+		DBClusters:  []rdstypes.DBCluster{*auroraCluster},
 	}
 
 	iamClient := &mocks.IAMMock{}
@@ -129,6 +123,22 @@ func TestAWSIAM(t *testing.T) {
 	})
 	require.NoError(t, err)
 
+	memorydb, err := types.NewDatabaseV3(types.Metadata{
+		Name: "aws-memorydb",
+	}, types.DatabaseSpecV3{
+		Protocol: "redis",
+		URI:      "clustercfg.my-memorydb.xxxxxx.memorydb.us-east-1.amazonaws.com:6379",
+		AWS: types.AWS{
+			AccountID: "123456789012",
+			MemoryDB: types.MemoryDB{
+				ClusterName:  "my-memorydb",
+				TLSEnabled:   true,
+				EndpointType: "cluster",
+			},
+		},
+	})
+	require.NoError(t, err)
+
 	// Make configurator.
 	taskChan := make(chan struct{})
 	waitForTaskProcessed := func(t *testing.T) {
@@ -144,15 +154,19 @@ func TestAWSIAM(t *testing.T) {
 	}
 	configurator, err := NewIAM(ctx, IAMConfig{
 		AccessPoint: &mockAccessPoint{},
+		AWSConfigProvider: &mocks.AWSConfigProvider{
+			STSClient: stsClient,
+		},
 		Clients: &clients.TestCloudClients{
-			RDS:      rdsClient,
-			Redshift: redshiftClient,
-			STS:      stsClient,
-			IAM:      iamClient,
+			STS: &stsClient.STSClientV1,
+			IAM: iamClient,
 		},
 		HostID: "host-id",
 		onProcessedTask: func(iamTask, error) {
 			taskChan <- struct{}{}
+		},
+		awsClients: fakeAWSClients{
+			rdsClient: clt,
 		},
 	})
 	require.NoError(t, err)
@@ -170,6 +184,7 @@ func TestAWSIAM(t *testing.T) {
 			database:           rdsDatabase,
 			wantPolicyContains: rdsDatabase.GetAWS().RDS.ResourceID,
 			getIAMAuthEnabled: func() bool {
+				rdsInstance := &clt.DBInstances[0]
 				out := aws.BoolValue(rdsInstance.IAMDatabaseAuthenticationEnabled)
 				// reset it
 				rdsInstance.IAMDatabaseAuthenticationEnabled = aws.Bool(false)
@@ -180,6 +195,7 @@ func TestAWSIAM(t *testing.T) {
 			database:           auroraDatabase,
 			wantPolicyContains: auroraDatabase.GetAWS().RDS.ResourceID,
 			getIAMAuthEnabled: func() bool {
+				auroraCluster := &clt.DBClusters[0]
 				out := aws.BoolValue(auroraCluster.IAMDatabaseAuthenticationEnabled)
 				// reset it
 				auroraCluster.IAMDatabaseAuthenticationEnabled = aws.Bool(false)
@@ -205,6 +221,13 @@ func TestAWSIAM(t *testing.T) {
 			wantPolicyContains: elasticache.GetAWS().ElastiCache.ReplicationGroupID,
 			getIAMAuthEnabled: func() bool {
 				return true // it always is for ElastiCache.
+			},
+		},
+		"MemoryDB": {
+			database:           memorydb,
+			wantPolicyContains: memorydb.GetAWS().MemoryDB.ClusterName,
+			getIAMAuthEnabled: func() bool {
+				return true // it always is for MemoryDB.
 			},
 		},
 	}
@@ -237,7 +260,7 @@ func TestAWSIAM(t *testing.T) {
 				require.True(t, tt.getIAMAuthEnabled())
 				require.Contains(t, aws.StringValue(output.PolicyDocument), tt.wantPolicyContains)
 
-				err = configurator.UpdateIAMStatus(database)
+				err = configurator.UpdateIAMStatus(ctx, database)
 				require.NoError(t, err)
 				require.Equal(t, types.IAMPolicyStatus_IAM_POLICY_STATUS_SUCCESS, database.GetAWS().IAMPolicyStatus, "must be success because iam policy was set up")
 
@@ -254,7 +277,7 @@ func TestAWSIAM(t *testing.T) {
 					stsClient.ResetAssumeRoleHistory()
 				}
 
-				err = configurator.UpdateIAMStatus(database)
+				err = configurator.UpdateIAMStatus(ctx, database)
 				require.NoError(t, err)
 				require.Equal(t, types.IAMPolicyStatus_IAM_POLICY_STATUS_UNSPECIFIED, database.GetAWS().IAMPolicyStatus, "must be unspecified because task is tearing down")
 			})
@@ -269,7 +292,7 @@ func TestAWSIAMNoPermissions(t *testing.T) {
 	t.Cleanup(cancel)
 
 	// Create unauthorized mocks for AWS services.
-	stsClient := &mocks.STSMock{
+	stsClient := &mocks.STSClientV1{
 		ARN: "arn:aws:iam::123456789012:role/test-role",
 	}
 	// Make configurator.
@@ -277,6 +300,16 @@ func TestAWSIAMNoPermissions(t *testing.T) {
 		AccessPoint: &mockAccessPoint{},
 		Clients:     &clients.TestCloudClients{}, // placeholder,
 		HostID:      "host-id",
+		AWSConfigProvider: &mocks.AWSConfigProvider{
+			STSClient: &mocks.STSClient{
+				STSClientV1: mocks.STSClientV1{
+					ARN: "arn:aws:iam::123456789012:role/test-role",
+				},
+			},
+		},
+		awsClients: fakeAWSClients{
+			rdsClient: &mocks.RDSClient{Unauth: true},
+		},
 	})
 	require.NoError(t, err)
 
@@ -289,7 +322,6 @@ func TestAWSIAMNoPermissions(t *testing.T) {
 			name: "RDS database",
 			meta: types.AWS{Region: "localhost", AccountID: "123456789012", RDS: types.RDS{InstanceID: "postgres-rds", ResourceID: "postgres-rds-resource-id"}},
 			clients: &clients.TestCloudClients{
-				RDS: &mocks.RDSMockUnauth{},
 				IAM: &mocks.IAMErrorMock{
 					Error: trace.AccessDenied("unauthorized"),
 				},
@@ -300,7 +332,6 @@ func TestAWSIAMNoPermissions(t *testing.T) {
 			name: "Aurora cluster",
 			meta: types.AWS{Region: "localhost", AccountID: "123456789012", RDS: types.RDS{ClusterID: "postgres-aurora", ResourceID: "postgres-aurora-resource-id"}},
 			clients: &clients.TestCloudClients{
-				RDS: &mocks.RDSMockUnauth{},
 				IAM: &mocks.IAMErrorMock{
 					Error: trace.AccessDenied("unauthorized"),
 				},
@@ -311,7 +342,6 @@ func TestAWSIAMNoPermissions(t *testing.T) {
 			name: "RDS database missing metadata",
 			meta: types.AWS{Region: "localhost", RDS: types.RDS{ClusterID: "postgres-aurora"}},
 			clients: &clients.TestCloudClients{
-				RDS: &mocks.RDSMockUnauth{},
 				IAM: &mocks.IAMErrorMock{
 					Error: trace.AccessDenied("unauthorized"),
 				},
@@ -322,7 +352,6 @@ func TestAWSIAMNoPermissions(t *testing.T) {
 			name: "Redshift cluster",
 			meta: types.AWS{Region: "localhost", AccountID: "123456789012", Redshift: types.Redshift{ClusterID: "redshift-cluster-1"}},
 			clients: &clients.TestCloudClients{
-				Redshift: &mocks.RedshiftMockUnauth{},
 				IAM: &mocks.IAMErrorMock{
 					Error: trace.AccessDenied("unauthorized"),
 				},
@@ -346,7 +375,6 @@ func TestAWSIAMNoPermissions(t *testing.T) {
 			name: "IAM UnmodifiableEntityException",
 			meta: types.AWS{Region: "localhost", AccountID: "123456789012", Redshift: types.Redshift{ClusterID: "redshift-cluster-1"}},
 			clients: &clients.TestCloudClients{
-				Redshift: &mocks.RedshiftMockUnauth{},
 				IAM: &mocks.IAMErrorMock{
 					Error: awserr.New(iam.ErrCodeUnmodifiableEntityException, "unauthorized", fmt.Errorf("unauthorized")),
 				},
@@ -376,7 +404,7 @@ func TestAWSIAMNoPermissions(t *testing.T) {
 			})
 			require.NoError(t, err)
 
-			err = configurator.UpdateIAMStatus(database)
+			err = configurator.UpdateIAMStatus(ctx, database)
 			require.NoError(t, err)
 			require.Equal(t, types.IAMPolicyStatus_IAM_POLICY_STATUS_FAILED, database.GetAWS().IAMPolicyStatus, "must be invalid because of perm issues")
 
@@ -386,7 +414,7 @@ func TestAWSIAMNoPermissions(t *testing.T) {
 			})
 			require.NoError(t, err)
 
-			err = configurator.UpdateIAMStatus(database)
+			err = configurator.UpdateIAMStatus(ctx, database)
 			require.NoError(t, err)
 			require.Equal(t, types.IAMPolicyStatus_IAM_POLICY_STATUS_UNSPECIFIED, database.GetAWS().IAMPolicyStatus, "must be unspecified, task is tearing down")
 		})
@@ -395,7 +423,7 @@ func TestAWSIAMNoPermissions(t *testing.T) {
 
 // mockAccessPoint is a mock for auth.DatabaseAccessPoint.
 type mockAccessPoint struct {
-	auth.DatabaseAccessPoint
+	authclient.DatabaseAccessPoint
 }
 
 func (m *mockAccessPoint) GetClusterName(opts ...services.MarshalOption) (types.ClusterName, error) {
@@ -404,6 +432,7 @@ func (m *mockAccessPoint) GetClusterName(opts ...services.MarshalOption) (types.
 		ClusterID:   "cluster-id",
 	})
 }
+
 func (m *mockAccessPoint) AcquireSemaphore(ctx context.Context, params types.AcquireSemaphoreRequest) (*types.SemaphoreLease, error) {
 	return &types.SemaphoreLease{
 		SemaphoreKind: params.SemaphoreKind,
@@ -412,6 +441,7 @@ func (m *mockAccessPoint) AcquireSemaphore(ctx context.Context, params types.Acq
 		Expires:       params.Expires,
 	}, nil
 }
+
 func (m *mockAccessPoint) CancelSemaphoreLease(ctx context.Context, lease types.SemaphoreLease) error {
 	return nil
 }

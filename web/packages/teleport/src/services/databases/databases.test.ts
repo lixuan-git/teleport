@@ -1,18 +1,20 @@
-/*
-Copyright 2021-2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 import api from 'teleport/services/api';
 
@@ -37,6 +39,8 @@ test('correct formatting of database fetch response', async () => {
         protocol: 'postgres',
         names: [],
         users: [],
+        roles: [],
+        hostname: '',
         labels: [
           { name: 'cluster', value: 'root' },
           { name: 'env', value: 'aws' },
@@ -47,9 +51,11 @@ test('correct formatting of database fetch response', async () => {
             region: 'us-west-1',
             vpcId: 'vpc-123',
             subnets: ['sn1', 'sn2'],
+            securityGroups: [],
           },
           iamPolicyStatus: IamPolicyStatus.Success,
         },
+        supportsInteractive: false,
       },
       {
         kind: 'db',
@@ -58,7 +64,11 @@ test('correct formatting of database fetch response', async () => {
         protocol: 'postgres',
         names: [],
         users: [],
+        roles: [],
+        hostname: '',
         labels: [],
+        aws: undefined,
+        supportsInteractive: true,
       },
     ],
     startKey: mockResponse.startKey,
@@ -176,6 +186,7 @@ const mockResponse = {
       protocol: 'postgres',
       type: 'rds',
       uri: 'postgres-aurora-instance-1.c1xpjrob56xs.us-west-1.rds.amazonaws.com:5432',
+      hostname: '',
       labels: [
         { name: 'cluster', value: 'root' },
         { name: 'env', value: 'aws' },
@@ -186,6 +197,7 @@ const mockResponse = {
           region: 'us-west-1',
           vpc_id: 'vpc-123',
           subnets: ['sn1', 'sn2'],
+          security_groups: [],
         },
         iam_policy_status: 'IAM_POLICY_STATUS_SUCCESS',
       },
@@ -197,6 +209,8 @@ const mockResponse = {
       protocol: 'postgres',
       uri: 'localhost:5432',
       labels: [],
+      hostname: '',
+      supports_interactive: true,
     },
   ],
   startKey: 'mockKey',

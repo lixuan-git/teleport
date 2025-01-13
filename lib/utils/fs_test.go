@@ -1,26 +1,30 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package utils
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -38,10 +42,25 @@ func TestOpenFileLinks(t *testing.T) {
 	// broken-s -> nonexistent
 	// hardfile
 	// hardfile-h -> hardfile
-	rootDir := t.TempDir()
+
+	// macOS is special cased here since t.TempDir() returns a path to a protected directory that doesn't allow symlinks.
+	var rootDir string
+	var err error
+	switch runtime.GOOS {
+	case "darwin":
+		rootDir, err = os.MkdirTemp("/private/tmp", "teleport-test-*")
+		require.NoError(t, err)
+
+		t.Cleanup(func() {
+			err := os.RemoveAll(rootDir)
+			require.NoError(t, err)
+		})
+	default:
+		rootDir = t.TempDir()
+	}
 
 	dirPath := filepath.Join(rootDir, "dir")
-	err := os.Mkdir(dirPath, 0755)
+	err = os.Mkdir(dirPath, 0755)
 	require.NoError(t, err)
 
 	dirFilePath := filepath.Join(dirPath, "file")
@@ -309,6 +328,56 @@ func TestLocks(t *testing.T) {
 	require.Nil(t, unlock2)
 
 	require.NoError(t, unlock())
+}
+
+// TestLockWithBlocking verifies that second lock call is blocked until first is released.
+func TestLockWithBlocking(t *testing.T) {
+	var locked atomic.Bool
+
+	lockFile := filepath.Join(os.TempDir(), ".lock")
+	t.Cleanup(func() {
+		require.NoError(t, os.Remove(lockFile))
+	})
+
+	// Acquire first lock should not return any error.
+	unlock, err := FSWriteLock(lockFile)
+	require.NoError(t, err)
+	locked.Store(true)
+
+	signal := make(chan struct{})
+	errChan := make(chan error)
+	go func() {
+		signal <- struct{}{}
+		unlock, err := FSWriteLock(lockFile)
+		if err != nil {
+			errChan <- err
+			return
+		}
+		if locked.Load() {
+			errChan <- fmt.Errorf("first lock is still acquired, second lock must be blocking")
+			return
+		}
+		if err := unlock(); err != nil {
+			errChan <- err
+			return
+		}
+		signal <- struct{}{}
+	}()
+
+	<-signal
+	// We have to wait till next lock is reached to ensure we block execution of goroutine.
+	// Since this is system call we can't track if the function reach blocking state already.
+	time.Sleep(100 * time.Millisecond)
+	locked.Store(false)
+	require.NoError(t, unlock())
+
+	select {
+	case err := <-errChan:
+		require.NoError(t, err)
+	case <-signal:
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "second lock is not released")
+	}
 }
 
 func TestOverwriteFile(t *testing.T) {

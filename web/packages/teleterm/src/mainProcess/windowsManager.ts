@@ -1,47 +1,90 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import path from 'path';
+import path from 'node:path';
+import * as url from 'node:url';
 
 import {
   app,
   BrowserWindow,
+  ipcMain,
   Menu,
+  nativeTheme,
   Rectangle,
   screen,
-  nativeTheme,
 } from 'electron';
 
+import { DeepLinkParseResult } from 'teleterm/deepLinks';
+import Logger from 'teleterm/logger';
+import {
+  RendererIpc,
+  RuntimeSettings,
+  WindowsManagerIpc,
+} from 'teleterm/mainProcess/types';
 import { FileStorage } from 'teleterm/services/fileStorage';
-import { RuntimeSettings } from 'teleterm/mainProcess/types';
 import { darkTheme, lightTheme } from 'teleterm/ui/ThemeProvider/theme';
 
 type WindowState = Rectangle;
 
 export class WindowsManager {
   private storageKey = 'windowState';
+  private logger = new Logger('WindowsManager');
   private selectionContextMenu: Menu;
   private inputContextMenu: Menu;
   private window?: BrowserWindow;
+  private frontendAppInit: {
+    /**
+     * The promise is resolved after the UI is fully initialized, that is the user has interacted
+     * with the relevant modals during startup and is free to use the app.
+     */
+    promise: Promise<void>;
+    resolve: () => void;
+    reject: (error: Error) => void;
+  };
+  private readonly windowUrl: string;
 
   constructor(
     private fileStorage: FileStorage,
     private settings: RuntimeSettings
   ) {
     this.selectionContextMenu = Menu.buildFromTemplate([{ role: 'copy' }]);
+    this.frontendAppInit = {
+      promise: undefined,
+      resolve: undefined,
+      reject: undefined,
+    };
+    this.frontendAppInit.promise = new Promise((resolve, reject) => {
+      this.frontendAppInit.resolve = resolve;
+      this.frontendAppInit.reject = reject;
+    });
+
+    ipcMain.once(
+      WindowsManagerIpc.SignalUserInterfaceReadiness,
+      (event, args) => {
+        if (args.success) {
+          this.frontendAppInit.resolve();
+        } else {
+          this.frontendAppInit.reject(
+            new Error('Encountered an error while initializing frontend app')
+          );
+        }
+      }
+    );
 
     this.inputContextMenu = Menu.buildFromTemplate([
       { role: 'undo' },
@@ -51,6 +94,7 @@ export class WindowsManager {
       { role: 'copy' },
       { role: 'paste' },
     ]);
+    this.windowUrl = getWindowUrl(settings.dev);
   }
 
   createWindow(): void {
@@ -68,50 +112,90 @@ export class WindowsManager {
       minHeight: 300,
       show: false,
       autoHideMenuBar: true,
-      title: 'Teleport Connect Preview',
+      title: 'Teleport Connect',
       webPreferences: {
-        devTools: this.settings.dev,
+        devTools: this.settings.debug,
         webgl: false,
         enableWebSQL: false,
         safeDialogs: true,
         contextIsolation: true,
         nodeIntegration: false,
         sandbox: false,
-        preload: path.join(__dirname, 'preload.js'),
+        preload: path.join(__dirname, '../preload/index.js'),
       },
     });
 
     window.once('close', () => {
       this.saveWindowState(window);
+      this.frontendAppInit.reject(
+        new Error('Window was closed before frontend app got initialized')
+      );
     });
 
     // shows the window when the DOM is ready, so we don't have a brief flash of a blank screen
     window.once('ready-to-show', window.show);
-
-    if (this.settings.dev) {
-      window.loadURL('https://localhost:8080');
-    } else {
-      window.loadFile(path.join(__dirname, '../renderer/index.html'));
-    }
-
+    window.loadURL(this.windowUrl);
     window.webContents.on('context-menu', (_, props) => {
       this.popupUniversalContextMenu(window, props);
     });
 
     nativeTheme.on('updated', () => {
-      window.webContents.send('main-process-native-theme-update', {
+      window.webContents.send(RendererIpc.NativeThemeUpdate, {
         shouldUseDarkColors: nativeTheme.shouldUseDarkColors,
       });
     });
 
     window.webContents.session.setPermissionRequestHandler(
-      (webContents, permission, callback) => {
-        // deny all permissions requests, we currently do not require any
+      (webContents, permission, callback, details) => {
+        if (details.requestingUrl !== this.windowUrl) {
+          this.logger.error(
+            `requestingUrl ${details.requestingUrl} does not match the window URL ${this.windowUrl}`
+          );
+          return callback(false);
+        }
+
+        if (
+          permission === 'clipboard-sanitized-write' ||
+          permission === 'clipboard-read'
+        ) {
+          return callback(true);
+        }
         return callback(false);
       }
     );
 
     this.window = window;
+  }
+
+  /**
+   * dispose exists as a cleanup function that the MainProcess can call during 'will-quit' event of
+   * the Electron app.
+   *
+   * dispose doesn't have to close the window as that's typically done by Electron itself. It should
+   * however clean up any other remaining resources.
+   */
+  dispose() {
+    this.frontendAppInit.reject(
+      new Error('Main process was closed before frontend app got initialized')
+    );
+  }
+
+  async launchDeepLink(
+    deepLinkParseResult: DeepLinkParseResult
+  ): Promise<void> {
+    try {
+      await this.whenFrontendAppIsReady();
+    } catch (error) {
+      this.logger.error(
+        `Could not send the deep link to the frontend app: ${error.message}`
+      );
+      return;
+    }
+
+    this.window.webContents.send(
+      RendererIpc.DeepLinkLaunch,
+      deepLinkParseResult
+    );
   }
 
   /**
@@ -192,6 +276,18 @@ export class WindowsManager {
     return this.window;
   }
 
+  /**
+   * whenFrontendAppIsReady is made to resemble app.whenReady from Electron.
+   * For now it is kept private just to signal that it's not used by any other class, but can be
+   * made public if needed.
+   *
+   * The promise is resolved after the UI is fully initialized, that is the user has interacted with
+   * the relevant modals during startup and is free to use the app.
+   */
+  private whenFrontendAppIsReady(): Promise<void> {
+    return this.frontendAppInit.promise;
+  }
+
   private saveWindowState(window: BrowserWindow): void {
     const windowState: WindowState = {
       ...window.getNormalBounds(),
@@ -257,4 +353,24 @@ export class WindowsManager {
       ...getPositionAndSize(),
     };
   }
+}
+
+/**
+ * Returns a URL that will be loaded by `BrowserWindow`.
+ * This URL points either to a dev server or to index.html file
+ * for the packaged app.
+ * */
+function getWindowUrl(isDev: boolean): string {
+  if (isDev) {
+    return 'http://localhost:8080/';
+  }
+
+  // The returned URL is percent-encoded.
+  // It is important because `details.requestingUrl` (in `setPermissionRequestHandler`)
+  // to which we match the URL is also percent-encoded.
+  return url
+    .pathToFileURL(
+      path.resolve(app.getAppPath(), __dirname, '../renderer/index.html')
+    )
+    .toString();
 }

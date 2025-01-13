@@ -1,37 +1,38 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package local
 
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	"github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport/api/types"
 	apiutils "github.com/gravitational/teleport/api/utils"
 	"github.com/gravitational/teleport/api/utils/retryutils"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/defaults"
-	"github.com/gravitational/teleport/lib/utils"
 )
 
 // maxSubscribers is the maximum number of concurrent subscribers that a headless authentication watcher
@@ -50,8 +51,8 @@ var ErrHeadlessAuthenticationWatcherClosed = errors.New("headless authentication
 type HeadlessAuthenticationWatcherConfig struct {
 	// Backend is the storage backend used to create watchers.
 	Backend backend.Backend
-	// Log is a logger.
-	Log logrus.FieldLogger
+	// Logger is a logger.
+	Logger *slog.Logger
 	// Clock is used to control time.
 	Clock clockwork.Clock
 	// MaxRetryPeriod is the maximum retry period on failed watchers.
@@ -63,9 +64,8 @@ func (cfg *HeadlessAuthenticationWatcherConfig) CheckAndSetDefaults() error {
 	if cfg.Backend == nil {
 		return trace.BadParameter("missing parameter Backend")
 	}
-	if cfg.Log == nil {
-		cfg.Log = logrus.StandardLogger()
-		cfg.Log.WithField("resource-kind", types.KindHeadlessAuthentication)
+	if cfg.Logger == nil {
+		cfg.Logger = slog.With("resource_kind", types.KindHeadlessAuthentication)
 	}
 	if cfg.MaxRetryPeriod == 0 {
 		// On watcher failure, we eagerly retry in order to avoid login delays.
@@ -96,19 +96,24 @@ func NewHeadlessAuthenticationWatcher(ctx context.Context, cfg HeadlessAuthentic
 	}
 
 	retry, err := retryutils.NewLinear(retryutils.LinearConfig{
-		First:  utils.FullJitter(cfg.MaxRetryPeriod / 10),
+		First:  retryutils.FullJitter(cfg.MaxRetryPeriod / 10),
 		Step:   cfg.MaxRetryPeriod / 5,
 		Max:    cfg.MaxRetryPeriod,
-		Jitter: retryutils.NewHalfJitter(),
+		Jitter: retryutils.HalfJitter,
 		Clock:  cfg.Clock,
 	})
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
+	identityService, err := NewIdentityServiceV2(cfg.Backend)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
 	h := &HeadlessAuthenticationWatcher{
 		HeadlessAuthenticationWatcherConfig: cfg,
-		identityService:                     NewIdentityService(cfg.Backend),
+		identityService:                     identityService,
 		retry:                               retry,
 		closed:                              make(chan struct{}),
 		running:                             make(chan struct{}),
@@ -153,13 +158,15 @@ func (h *HeadlessAuthenticationWatcher) runWatchLoop(ctx context.Context) {
 		startedWaiting := h.Clock.Now()
 		select {
 		case t := <-h.retry.After():
-			h.Log.Warningf("Restarting watch on error after waiting %v. Error: %v.", t.Sub(startedWaiting), err)
+			h.Logger.WarnContext(ctx, "Restarting watch on error",
+				"backoff", t.Sub(startedWaiting),
+				"error", err,
+			)
 			h.retry.Inc()
 		case <-ctx.Done():
-			h.Log.WithError(ctx.Err()).Debugf("Context closed with err. Returning from watch loop.")
 			return
 		case <-h.closed:
-			h.Log.Debug("Watcher closed. Returning from watch loop.")
+			h.Logger.DebugContext(ctx, "Watcher closed, terminating watch loop")
 			return
 		}
 	}
@@ -186,7 +193,7 @@ func (h *HeadlessAuthenticationWatcher) watch(ctx context.Context) error {
 			case types.OpPut:
 				headlessAuthn, err := unmarshalHeadlessAuthenticationFromItem(&event.Item)
 				if err != nil {
-					h.Log.WithError(err).Debug("failed to unmarshal headless authentication from put event")
+					h.Logger.DebugContext(ctx, "failed to unmarshal headless authentication from put event", "error", err)
 				} else {
 					h.notify(headlessAuthn)
 				}
@@ -204,7 +211,7 @@ func (h *HeadlessAuthenticationWatcher) newWatcher(ctx context.Context) (backend
 	watcher, err := h.identityService.NewWatcher(ctx, backend.Watch{
 		Name:            types.KindHeadlessAuthentication,
 		MetricComponent: types.KindHeadlessAuthentication,
-		Prefixes:        [][]byte{backend.Key(headlessAuthenticationPrefix)},
+		Prefixes:        []backend.Key{backend.NewKey(headlessAuthenticationPrefix)},
 	})
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -380,6 +387,13 @@ func (s *headlessAuthenticationSubscriber) Close() {
 func (s *headlessAuthenticationSubscriber) update(ha *types.HeadlessAuthentication, overwrite bool) {
 	s.updatesMu.Lock()
 	defer s.updatesMu.Unlock()
+
+	select {
+	case <-s.closed:
+		// subscriber is closing, ignore updates.
+		return
+	default:
+	}
 
 	// Drain stale update if there is one.
 	if overwrite {

@@ -1,47 +1,52 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package githubactions
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
+	"crypto"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/go-jose/go-jose/v3"
+	"github.com/go-jose/go-jose/v3/jwt"
 	"github.com/jonboulle/clockwork"
 	"github.com/stretchr/testify/require"
-	"gopkg.in/square/go-jose.v2"
-	"gopkg.in/square/go-jose.v2/jwt"
+
+	"github.com/gravitational/teleport/lib/cryptosuites"
 )
 
 type fakeIDP struct {
-	t          *testing.T
-	signer     jose.Signer
-	privateKey *rsa.PrivateKey
-	server     *httptest.Server
-	ghesMode   bool
+	t             *testing.T
+	signer        jose.Signer
+	publicKey     crypto.PublicKey
+	server        *httptest.Server
+	entepriseSlug string
+	ghesMode      bool
 }
 
-func newFakeIDP(t *testing.T, ghesMode bool) *fakeIDP {
-	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+func newFakeIDP(t *testing.T, ghesMode bool, enterpriseSlug string) *fakeIDP {
+	// Github uses RSA2048, prefer to test with it.
+	privateKey, err := cryptosuites.GenerateKeyWithAlgorithm(cryptosuites.RSA2048)
 	require.NoError(t, err)
 
 	signer, err := jose.NewSigner(
@@ -51,19 +56,20 @@ func newFakeIDP(t *testing.T, ghesMode bool) *fakeIDP {
 	require.NoError(t, err)
 
 	f := &fakeIDP{
-		signer:     signer,
-		ghesMode:   ghesMode,
-		privateKey: privateKey,
-		t:          t,
+		signer:        signer,
+		ghesMode:      ghesMode,
+		publicKey:     privateKey.Public(),
+		t:             t,
+		entepriseSlug: enterpriseSlug,
 	}
 
 	providerMux := http.NewServeMux()
 	providerMux.HandleFunc(
-		f.pathPrefix()+"/.well-known/openid-configuration",
+		f.pathPostfix()+"/.well-known/openid-configuration",
 		f.handleOpenIDConfig,
 	)
 	providerMux.HandleFunc(
-		f.pathPrefix()+"/.well-known/jwks",
+		f.pathPostfix()+"/.well-known/jwks",
 		f.handleJWKSEndpoint,
 	)
 
@@ -73,17 +79,20 @@ func newFakeIDP(t *testing.T, ghesMode bool) *fakeIDP {
 	return f
 }
 
-func (f *fakeIDP) pathPrefix() string {
+func (f *fakeIDP) pathPostfix() string {
 	if f.ghesMode {
 		// GHES instances serve the token related content on a prefix of the
 		// instance hostname.
 		return "/_services/token"
 	}
+	if f.entepriseSlug != "" {
+		return "/" + f.entepriseSlug
+	}
 	return ""
 }
 
 func (f *fakeIDP) issuer() string {
-	return f.server.URL + f.pathPrefix()
+	return f.server.URL + f.pathPostfix()
 }
 
 func (f *fakeIDP) handleOpenIDConfig(w http.ResponseWriter, r *http.Request) {
@@ -135,7 +144,7 @@ func (f *fakeIDP) handleJWKSEndpoint(w http.ResponseWriter, r *http.Request) {
 	jwks := jose.JSONWebKeySet{
 		Keys: []jose.JSONWebKey{
 			{
-				Key: &f.privateKey.PublicKey,
+				Key: f.publicKey,
 			},
 		},
 	}
@@ -176,19 +185,23 @@ func (f *fakeIDP) issueToken(
 
 func TestIDTokenValidator_Validate(t *testing.T) {
 	t.Parallel()
-	idp := newFakeIDP(t, false)
-	ghesIdp := newFakeIDP(t, true)
+	idp := newFakeIDP(t, false, "")
+	ghesIdp := newFakeIDP(t, true, "")
+	enterpriseSlugIDP := newFakeIDP(t, false, "slug")
 
 	tests := []struct {
-		name        string
-		assertError require.ErrorAssertionFunc
-		want        *IDTokenClaims
-		token       string
-		ghesHost    string
+		name           string
+		assertError    require.ErrorAssertionFunc
+		want           *IDTokenClaims
+		token          string
+		ghesHost       string
+		defaultIDPHost string
+		enterpriseSlug string
 	}{
 		{
-			name:        "success",
-			assertError: require.NoError,
+			name:           "success",
+			assertError:    require.NoError,
+			defaultIDPHost: idp.server.Listener.Addr().String(),
 			token: idp.issueToken(
 				t,
 				idp.issuer(),
@@ -206,6 +219,9 @@ func TestIDTokenValidator_Validate(t *testing.T) {
 		{
 			name:        "success with ghes",
 			assertError: require.NoError,
+			// This is intentionally the plain IDP as the GHES Host should
+			// override it.
+			defaultIDPHost: idp.server.Listener.Addr().String(),
 			token: ghesIdp.issueToken(
 				t,
 				ghesIdp.issuer(),
@@ -222,8 +238,57 @@ func TestIDTokenValidator_Validate(t *testing.T) {
 			ghesHost: ghesIdp.server.Listener.Addr().String(),
 		},
 		{
-			name:        "expired",
-			assertError: require.Error,
+			name:           "success with slug",
+			assertError:    require.NoError,
+			defaultIDPHost: enterpriseSlugIDP.server.Listener.Addr().String(),
+			token: enterpriseSlugIDP.issueToken(
+				t,
+				enterpriseSlugIDP.issuer(),
+				"teleport.cluster.local",
+				"octocat",
+				"repo:octo-org/octo-repo:environment:prod",
+				time.Now().Add(-5*time.Minute),
+				time.Now().Add(5*time.Minute),
+			),
+			enterpriseSlug: "slug",
+			want: &IDTokenClaims{
+				Actor: "octocat",
+				Sub:   "repo:octo-org/octo-repo:environment:prod",
+			},
+		},
+		{
+			name:           "fails if slugged jwt is used with non-slug idp",
+			assertError:    require.Error,
+			defaultIDPHost: idp.server.Listener.Addr().String(),
+			token: enterpriseSlugIDP.issueToken(
+				t,
+				enterpriseSlugIDP.issuer(),
+				"teleport.cluster.local",
+				"octocat",
+				"repo:octo-org/octo-repo:environment:prod",
+				time.Now().Add(-5*time.Minute),
+				time.Now().Add(5*time.Minute),
+			),
+		},
+		{
+			name:           "fails if non-slugged jwt is used with idp",
+			assertError:    require.Error,
+			defaultIDPHost: enterpriseSlugIDP.server.Listener.Addr().String(),
+			token: idp.issueToken(
+				t,
+				idp.issuer(),
+				"teleport.cluster.local",
+				"octocat",
+				"repo:octo-org/octo-repo:environment:prod",
+				time.Now().Add(-5*time.Minute),
+				time.Now().Add(5*time.Minute),
+			),
+			enterpriseSlug: "slug",
+		},
+		{
+			name:           "expired",
+			assertError:    require.Error,
+			defaultIDPHost: idp.server.Listener.Addr().String(),
 			token: idp.issueToken(
 				t,
 				idp.issuer(),
@@ -235,8 +300,9 @@ func TestIDTokenValidator_Validate(t *testing.T) {
 			),
 		},
 		{
-			name:        "future",
-			assertError: require.Error,
+			name:           "future",
+			assertError:    require.Error,
+			defaultIDPHost: idp.server.Listener.Addr().String(),
 			token: idp.issueToken(
 				t,
 				idp.issuer(),
@@ -246,8 +312,9 @@ func TestIDTokenValidator_Validate(t *testing.T) {
 				time.Now().Add(10*time.Minute), time.Now().Add(20*time.Minute)),
 		},
 		{
-			name:        "invalid audience",
-			assertError: require.Error,
+			name:           "invalid audience",
+			assertError:    require.Error,
+			defaultIDPHost: idp.server.Listener.Addr().String(),
 			token: idp.issueToken(
 				t,
 				idp.issuer(),
@@ -257,8 +324,9 @@ func TestIDTokenValidator_Validate(t *testing.T) {
 				time.Now().Add(-5*time.Minute), time.Now().Add(5*time.Minute)),
 		},
 		{
-			name:        "invalid issuer",
-			assertError: require.Error,
+			name:           "invalid issuer",
+			assertError:    require.Error,
+			defaultIDPHost: idp.server.Listener.Addr().String(),
 			token: idp.issueToken(
 				t,
 				"https://the.wrong.issuer",
@@ -273,13 +341,156 @@ func TestIDTokenValidator_Validate(t *testing.T) {
 			ctx := context.Background()
 			v := NewIDTokenValidator(IDTokenValidatorConfig{
 				Clock:            clockwork.NewRealClock(),
-				GitHubIssuerHost: idp.server.Listener.Addr().String(),
+				GitHubIssuerHost: tt.defaultIDPHost,
 				insecure:         true,
 			})
 
-			claims, err := v.Validate(ctx, tt.ghesHost, tt.token)
+			claims, err := v.Validate(
+				ctx, tt.ghesHost, tt.enterpriseSlug, tt.token,
+			)
 			tt.assertError(t, err)
 			require.Equal(t, tt.want, claims)
+		})
+	}
+}
+
+func testSigner(t *testing.T) ([]byte, jose.Signer) {
+	key, err := cryptosuites.GenerateKeyWithAlgorithm(cryptosuites.ECDSAP256)
+	require.NoError(t, err)
+	signer, err := jose.NewSigner(
+		jose.SigningKey{Algorithm: jose.ES256, Key: key},
+		(&jose.SignerOptions{}).
+			WithType("JWT").
+			WithHeader("kid", "foo"),
+	)
+	require.NoError(t, err)
+
+	jwks := jose.JSONWebKeySet{Keys: []jose.JSONWebKey{
+		{
+			Key:       key.Public(),
+			Use:       "sig",
+			Algorithm: string(jose.ES256),
+			KeyID:     "foo",
+		},
+	}}
+	jwksData, err := json.Marshal(jwks)
+	require.NoError(t, err)
+	return jwksData, signer
+}
+
+//nolint:govet // there's some weird json struct tag overlap here
+type claims struct {
+	jwt.Claims
+	IDTokenClaims
+	Subject string `json:"sub"`
+}
+
+func TestValidateTokenWithJWKS(t *testing.T) {
+	jwks, signer := testSigner(t)
+	_, wrongSigner := testSigner(t)
+
+	now := time.Now()
+	clusterName := "teleport.cluster.local"
+
+	tests := []struct {
+		name   string
+		signer jose.Signer
+		claims claims
+
+		wantResult *IDTokenClaims
+		wantErr    string
+	}{
+		{
+			name:   "valid token",
+			signer: signer,
+			claims: claims{
+				IDTokenClaims: IDTokenClaims{
+					Repository: "123",
+				},
+				Subject: "foo",
+				Claims: jwt.Claims{
+					Audience:  jwt.Audience{clusterName},
+					IssuedAt:  jwt.NewNumericDate(now.Add(-1 * time.Minute)),
+					NotBefore: jwt.NewNumericDate(now.Add(-1 * time.Minute)),
+					Expiry:    jwt.NewNumericDate(now.Add(10 * time.Minute)),
+				},
+			},
+			wantResult: &IDTokenClaims{
+				Sub:        "foo",
+				Repository: "123",
+			},
+		},
+		{
+			name:   "signed by wrong signer",
+			signer: wrongSigner,
+			claims: claims{
+				IDTokenClaims: IDTokenClaims{
+					Repository: "123",
+				},
+				Subject: "foo",
+				Claims: jwt.Claims{
+					Audience:  jwt.Audience{clusterName},
+					IssuedAt:  jwt.NewNumericDate(now.Add(-1 * time.Minute)),
+					NotBefore: jwt.NewNumericDate(now.Add(-1 * time.Minute)),
+					Expiry:    jwt.NewNumericDate(now.Add(10 * time.Minute)),
+				},
+			},
+			wantResult: &IDTokenClaims{
+				Sub:        "foo",
+				Repository: "123",
+			},
+			wantErr: "validating jwt signature",
+		},
+		{
+			name:   "expired",
+			signer: signer,
+			claims: claims{
+				IDTokenClaims: IDTokenClaims{
+					Repository: "123",
+				},
+				Subject: "foo",
+				Claims: jwt.Claims{
+					Audience:  jwt.Audience{clusterName},
+					IssuedAt:  jwt.NewNumericDate(now.Add(-2 * time.Minute)),
+					NotBefore: jwt.NewNumericDate(now.Add(-2 * time.Minute)),
+					Expiry:    jwt.NewNumericDate(now.Add(-1 * time.Minute)),
+				},
+			},
+			wantErr: "token is expired",
+		},
+		{
+			name:   "not yet valid",
+			signer: signer,
+			claims: claims{
+				IDTokenClaims: IDTokenClaims{
+					Repository: "123",
+				},
+				Subject: "foo",
+				Claims: jwt.Claims{
+					Audience:  jwt.Audience{clusterName},
+					IssuedAt:  jwt.NewNumericDate(now.Add(2 * time.Minute)),
+					NotBefore: jwt.NewNumericDate(now.Add(2 * time.Minute)),
+					Expiry:    jwt.NewNumericDate(now.Add(4 * time.Minute)),
+				},
+			},
+			wantErr: "token not valid yet",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			token, err := jwt.Signed(tt.signer).
+				Claims(tt.claims).
+				CompactSerialize()
+			require.NoError(t, err)
+
+			result, err := ValidateTokenWithJWKS(now, jwks, token)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.wantResult, result)
 		})
 	}
 }

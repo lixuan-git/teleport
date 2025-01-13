@@ -1,18 +1,20 @@
 /*
-Copyright 2015 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package common
 
@@ -20,6 +22,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"text/template"
@@ -27,19 +30,20 @@ import (
 
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/client"
 	"github.com/gravitational/teleport/api/client/proto"
 	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	libclient "github.com/gravitational/teleport/lib/client"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/service/servicecfg"
 	"github.com/gravitational/teleport/lib/tlsca"
 	"github.com/gravitational/teleport/lib/utils"
+	commonclient "github.com/gravitational/teleport/tool/tctl/common/client"
+	tctlcfg "github.com/gravitational/teleport/tool/tctl/common/config"
 )
 
 // NodeCommand implements `tctl nodes` group of commands
@@ -74,7 +78,7 @@ type NodeCommand struct {
 }
 
 // Initialize allows NodeCommand to plug itself into the CLI parser
-func (c *NodeCommand) Initialize(app *kingpin.Application, config *servicecfg.Config) {
+func (c *NodeCommand) Initialize(app *kingpin.Application, _ *tctlcfg.GlobalCLIFlags, config *servicecfg.Config) {
 	c.config = config
 
 	// add node command
@@ -87,7 +91,7 @@ func (c *NodeCommand) Initialize(app *kingpin.Application, config *servicecfg.Co
 	c.nodeAdd.Alias(AddNodeHelp)
 
 	c.nodeList = nodes.Command("ls", "List all active SSH nodes within the cluster.")
-	c.nodeList.Flag("namespace", "Namespace of the nodes").Default(apidefaults.Namespace).StringVar(&c.namespace)
+	c.nodeList.Flag("namespace", "Namespace of the nodes").Hidden().Default(apidefaults.Namespace).StringVar(&c.namespace)
 	c.nodeList.Flag("format", "Output format, 'text', or 'yaml'").Default(teleport.Text).StringVar(&c.lsFormat)
 	c.nodeList.Flag("verbose", "Verbose table output, shows full label output").Short('v').BoolVar(&c.verbose)
 	c.nodeList.Alias(ListNodesHelp)
@@ -97,16 +101,22 @@ func (c *NodeCommand) Initialize(app *kingpin.Application, config *servicecfg.Co
 }
 
 // TryRun takes the CLI command as an argument (like "nodes ls") and executes it.
-func (c *NodeCommand) TryRun(ctx context.Context, cmd string, client auth.ClientI) (match bool, err error) {
+func (c *NodeCommand) TryRun(ctx context.Context, cmd string, clientFunc commonclient.InitFunc) (match bool, err error) {
+	var commandFunc func(ctx context.Context, client *authclient.Client) error
 	switch cmd {
 	case c.nodeAdd.FullCommand():
-		err = c.Invite(ctx, client)
+		commandFunc = c.Invite
 	case c.nodeList.FullCommand():
-		err = c.ListActive(ctx, client)
-
+		commandFunc = c.ListActive
 	default:
 		return false, nil
 	}
+	client, closeFn, err := clientFunc(ctx)
+	if err != nil {
+		return false, trace.Wrap(err)
+	}
+	err = commandFunc(ctx, client)
+	closeFn(ctx)
 	return true, trace.Wrap(err)
 }
 
@@ -135,7 +145,7 @@ Please note:
 
 // Invite generates a token which can be used to add another SSH node
 // to a cluster
-func (c *NodeCommand) Invite(ctx context.Context, client auth.ClientI) error {
+func (c *NodeCommand) Invite(ctx context.Context, client *authclient.Client) error {
 	// parse --roles flag
 	roles, err := types.ParseTeleportRoles(c.roles)
 	if err != nil {
@@ -144,7 +154,7 @@ func (c *NodeCommand) Invite(ctx context.Context, client auth.ClientI) error {
 
 	token := c.token
 	if c.token == "" {
-		token, err = utils.CryptoRandomHex(auth.TokenLenBytes)
+		token, err = utils.CryptoRandomHex(defaults.TokenLenBytes)
 		if err != nil {
 			return trace.WrapWithMessage(err, "generating token value")
 		}
@@ -192,7 +202,7 @@ func (c *NodeCommand) Invite(ctx context.Context, client auth.ClientI) error {
 
 			pingResponse, err := client.Ping(ctx)
 			if err != nil {
-				log.Debugf("unable to ping auth client: %s.", err.Error())
+				slog.DebugContext(ctx, "unable to ping auth client", "error", err)
 			}
 
 			if err == nil && pingResponse.GetServerFeatures().Cloud {
@@ -228,7 +238,7 @@ func (c *NodeCommand) Invite(ctx context.Context, client auth.ClientI) error {
 
 // ListActive retrieves the list of nodes who recently sent heartbeats to
 // to a cluster and prints it to stdout
-func (c *NodeCommand) ListActive(ctx context.Context, clt auth.ClientI) error {
+func (c *NodeCommand) ListActive(ctx context.Context, clt *authclient.Client) error {
 	labels, err := libclient.ParseLabelSpec(c.labels)
 	if err != nil {
 		return trace.Wrap(err)

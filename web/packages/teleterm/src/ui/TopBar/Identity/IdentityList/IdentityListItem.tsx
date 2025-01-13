@@ -1,51 +1,53 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React, { useState } from 'react';
+import { useState } from 'react';
+
 import { ButtonIcon, Flex, Label, Text } from 'design';
 import { Logout } from 'design/Icon';
 
-import { ListItem } from 'teleterm/ui/components/ListItem';
 import { useKeyboardArrowsNavigation } from 'teleterm/ui/components/KeyboardArrowsNavigation';
+import { ListItem } from 'teleterm/ui/components/ListItem';
+import { ProfileStatusError } from 'teleterm/ui/components/ProfileStatusError';
 import { getUserWithClusterName } from 'teleterm/ui/utils';
 
-interface IdentityListItemProps {
-  index: number;
-  userName?: string;
-  clusterName: string;
-  isSelected: boolean;
+import { IdentityRootCluster } from '../useIdentity';
 
+export function IdentityListItem(props: {
+  index: number;
+  cluster: IdentityRootCluster;
   onSelect(): void;
   onLogout(): void;
-}
-
-export function IdentityListItem(props: IdentityListItemProps) {
+}) {
   const [isHovered, setIsHovered] = useState(false);
   const { isActive } = useKeyboardArrowsNavigation({
     index: props.index,
     onRun: props.onSelect,
   });
 
-  const userWithClusterName = getUserWithClusterName(props);
+  const userWithClusterName = getUserWithClusterName(props.cluster);
 
   return (
     <ListItem
       css={`
         border-radius: 0;
-        height: 38px;
+        height: auto;
+        min-height: 38px;
       `}
       onClick={props.onSelect}
       isActive={isActive}
@@ -57,11 +59,19 @@ export function IdentityListItem(props: IdentityListItemProps) {
       }}
     >
       <Flex justifyContent="space-between" alignItems="center" width="100%">
-        <Text typography="body1" title={userWithClusterName}>
-          {userWithClusterName}
-        </Text>
+        <Flex flexDirection="column" minWidth="0">
+          <Text typography="body2" title={userWithClusterName}>
+            {userWithClusterName}
+          </Text>
+          {props.cluster.profileStatusError && (
+            <ProfileStatusError
+              error={props.cluster.profileStatusError}
+              mb={1}
+            />
+          )}
+        </Flex>
         <Flex alignItems="center">
-          {props.isSelected ? (
+          {props.cluster.active ? (
             <Label kind="success" ml={2} style={{ height: 'fit-content' }}>
               active
             </Label>
@@ -73,7 +83,7 @@ export function IdentityListItem(props: IdentityListItemProps) {
               transition: 'none',
             }}
             ml={2}
-            title={`Log out from ${props.clusterName}`}
+            title={`Log out from ${props.cluster.clusterName}`}
             onClick={e => {
               e.stopPropagation();
               props.onLogout();

@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package proxy
 
@@ -22,11 +24,11 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/pem"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"sort"
 	"sync/atomic"
 	"testing"
@@ -36,10 +38,8 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/google/uuid"
 	"github.com/gravitational/trace"
-	"github.com/gravitational/ttlmap"
 	"github.com/jonboulle/clockwork"
 	"github.com/julienschmidt/httprouter"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
 	kubeerrors "k8s.io/apimachinery/pkg/api/errors"
@@ -50,13 +50,15 @@ import (
 	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/types"
 	apievents "github.com/gravitational/teleport/api/types/events"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/api/utils/tlsutils"
+	"github.com/gravitational/teleport/entitlements"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/auth/testauthority"
 	"github.com/gravitational/teleport/lib/authz"
 	"github.com/gravitational/teleport/lib/backend/memory"
-	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/fixtures"
 	testingkubemock "github.com/gravitational/teleport/lib/kube/proxy/testing/kube_server"
+	"github.com/gravitational/teleport/lib/modules"
 	"github.com/gravitational/teleport/lib/reversetunnelclient"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/services/local"
@@ -83,55 +85,17 @@ var (
 	})
 )
 
-func TestRequestCertificate(t *testing.T) {
-	clock := clockwork.NewFakeClock()
-	cl, err := newMockCSRClient(clock)
-	require.NoError(t, err)
-	f := &Forwarder{
-		cfg: ForwarderConfig{
-			Keygen:         testauthority.New(),
-			AuthClient:     cl,
-			TracerProvider: otel.GetTracerProvider(),
-			tracer:         otel.Tracer(teleport.ComponentKube),
-		},
-		log: logrus.NewEntry(logrus.New()),
-	}
-	user, err := types.NewUser("bob")
-	require.NoError(t, err)
-	ctx := authContext{
-		teleportCluster: teleportClusterClient{
-			name: "site a",
-		},
-		Context: authz.Context{
-			User:             user,
-			Identity:         identity,
-			UnmappedIdentity: unmappedIdentity,
-		},
-	}
-
-	b, err := f.requestCertificate(context.Background(), ctx)
-	require.NoError(t, err)
-	// All fields except b.key are predictable.
-	require.Empty(t, cmp.Diff(b.Certificates[0].Certificate[0], cl.lastCert.Raw))
-
-	// Check the KubeCSR fields.
-	require.Empty(t, cmp.Diff(cl.gotCSR.Username, ctx.User.GetName()))
-	require.Empty(t, cmp.Diff(cl.gotCSR.ClusterName, ctx.teleportCluster.name))
-
-	// Parse x509 CSR and check the subject.
-	csrBlock, _ := pem.Decode(cl.gotCSR.CSR)
-	require.NotNil(t, csrBlock)
-	csr, err := x509.ParseCertificateRequest(csrBlock.Bytes)
-	require.NoError(t, err)
-	idFromCSR, err := tlsca.FromSubject(csr.Subject, time.Time{})
-	require.NoError(t, err)
-	require.Empty(t, cmp.Diff(*idFromCSR, ctx.UnmappedIdentity.GetIdentity()))
-}
-
 func fakeClusterFeatures() proto.Features {
 	return proto.Features{
-		Kubernetes: true,
+		Entitlements: map[string]*proto.EntitlementInfo{
+			string(entitlements.K8s): {Enabled: true},
+		},
 	}
+}
+
+func TestMain(m *testing.M) {
+	modules.SetInsecureTestMode(true)
+	os.Exit(m.Run())
 }
 
 func TestAuthenticate(t *testing.T) {
@@ -167,7 +131,7 @@ func TestAuthenticate(t *testing.T) {
 		},
 	}
 	f := &Forwarder{
-		log: logrus.NewEntry(logrus.New()),
+		log: utils.NewSlogLoggerForTests(),
 		cfg: ForwarderConfig{
 			ClusterName:       "local",
 			CachingAuthClient: ap,
@@ -211,12 +175,13 @@ func TestAuthenticate(t *testing.T) {
 		wantAuthErr bool
 	}{
 		{
-			desc:           "local user and cluster with active access request",
-			user:           authz.LocalUser{},
-			roleKubeGroups: []string{"kube-group-a", "kube-group-b"},
-			routeToCluster: "local",
-			haveKubeCreds:  true,
-			tunnel:         tun,
+			desc:              "local user and cluster with active access request",
+			user:              authz.LocalUser{},
+			roleKubeGroups:    []string{"kube-group-a", "kube-group-b"},
+			routeToCluster:    "local",
+			kubernetesCluster: "local",
+			haveKubeCreds:     true,
+			tunnel:            tun,
 			kubeServers: newKubeServersFromKubeClusters(
 				t,
 				&types.KubernetesClusterV3{
@@ -264,12 +229,13 @@ func TestAuthenticate(t *testing.T) {
 			},
 		},
 		{
-			desc:           "local user and cluster",
-			user:           authz.LocalUser{},
-			roleKubeGroups: []string{"kube-group-a", "kube-group-b"},
-			routeToCluster: "local",
-			haveKubeCreds:  true,
-			tunnel:         tun,
+			desc:              "local user and cluster",
+			user:              authz.LocalUser{},
+			roleKubeGroups:    []string{"kube-group-a", "kube-group-b"},
+			routeToCluster:    "local",
+			kubernetesCluster: "local",
+			haveKubeCreds:     true,
+			tunnel:            tun,
 			kubeServers: newKubeServersFromKubeClusters(
 				t,
 				&types.KubernetesClusterV3{
@@ -340,12 +306,13 @@ func TestAuthenticate(t *testing.T) {
 			},
 		},
 		{
-			desc:           "local user and cluster, no kubeconfig",
-			user:           authz.LocalUser{},
-			roleKubeGroups: []string{"kube-group-a", "kube-group-b"},
-			routeToCluster: "local",
-			haveKubeCreds:  false,
-			tunnel:         tun,
+			desc:              "local user and cluster, no kubeconfig",
+			user:              authz.LocalUser{},
+			roleKubeGroups:    []string{"kube-group-a", "kube-group-b"},
+			routeToCluster:    "local",
+			kubernetesCluster: "local",
+			haveKubeCreds:     false,
+			tunnel:            tun,
 			kubeServers: newKubeServersFromKubeClusters(
 				t,
 				&types.KubernetesClusterV3{
@@ -384,12 +351,13 @@ func TestAuthenticate(t *testing.T) {
 			},
 		},
 		{
-			desc:           "remote user and local cluster",
-			user:           authz.RemoteUser{},
-			roleKubeGroups: []string{"kube-group-a", "kube-group-b"},
-			routeToCluster: "local",
-			haveKubeCreds:  true,
-			tunnel:         tun,
+			desc:              "remote user and local cluster",
+			user:              authz.RemoteUser{},
+			roleKubeGroups:    []string{"kube-group-a", "kube-group-b"},
+			routeToCluster:    "local",
+			kubernetesCluster: "local",
+			haveKubeCreds:     true,
+			tunnel:            tun,
 			kubeServers: newKubeServersFromKubeClusters(
 				t,
 				&types.KubernetesClusterV3{
@@ -428,13 +396,14 @@ func TestAuthenticate(t *testing.T) {
 			},
 		},
 		{
-			desc:           "remote user and local cluster with active request id",
-			user:           authz.RemoteUser{},
-			roleKubeGroups: []string{"kube-group-a", "kube-group-b"},
-			routeToCluster: "local",
-			haveKubeCreds:  true,
-			tunnel:         tun,
-			activeRequests: activeAccessRequests,
+			desc:              "remote user and local cluster with active request id",
+			user:              authz.RemoteUser{},
+			roleKubeGroups:    []string{"kube-group-a", "kube-group-b"},
+			routeToCluster:    "local",
+			kubernetesCluster: "local",
+			haveKubeCreds:     true,
+			tunnel:            tun,
+			activeRequests:    activeAccessRequests,
 			kubeServers: newKubeServersFromKubeClusters(
 				t,
 				&types.KubernetesClusterV3{
@@ -534,13 +503,14 @@ func TestAuthenticate(t *testing.T) {
 			wantAuthErr: true,
 		},
 		{
-			desc:           "kube users passed in request",
-			user:           authz.LocalUser{},
-			roleKubeUsers:  []string{"kube-user-a", "kube-user-b"},
-			roleKubeGroups: []string{"kube-group-a", "kube-group-b"},
-			routeToCluster: "local",
-			haveKubeCreds:  true,
-			tunnel:         tun,
+			desc:              "kube users passed in request",
+			user:              authz.LocalUser{},
+			roleKubeUsers:     []string{"kube-user-a", "kube-user-b"},
+			roleKubeGroups:    []string{"kube-group-a", "kube-group-b"},
+			routeToCluster:    "local",
+			kubernetesCluster: "local",
+			haveKubeCreds:     true,
+			tunnel:            tun,
 			kubeServers: newKubeServersFromKubeClusters(
 				t,
 				&types.KubernetesClusterV3{
@@ -596,11 +566,12 @@ func TestAuthenticate(t *testing.T) {
 			wantAuthErr: true,
 		},
 		{
-			desc:           "local user and cluster, no tunnel",
-			user:           authz.LocalUser{},
-			roleKubeGroups: []string{"kube-group-a", "kube-group-b"},
-			routeToCluster: "local",
-			haveKubeCreds:  true,
+			desc:              "local user and cluster, no tunnel",
+			user:              authz.LocalUser{},
+			roleKubeGroups:    []string{"kube-group-a", "kube-group-b"},
+			routeToCluster:    "local",
+			kubernetesCluster: "local",
+			haveKubeCreds:     true,
 			kubeServers: newKubeServersFromKubeClusters(
 				t,
 				&types.KubernetesClusterV3{
@@ -780,7 +751,7 @@ func TestAuthenticate(t *testing.T) {
 			gotCtx, err := f.authenticate(req)
 			if tt.wantErr {
 				require.Error(t, err)
-				require.Equal(t, trace.IsAccessDenied(err), tt.wantAuthErr)
+				require.Equal(t, tt.wantAuthErr, trace.IsAccessDenied(err))
 				return
 			}
 			require.NoError(t, err)
@@ -815,6 +786,7 @@ func TestSetupImpersonationHeaders(t *testing.T) {
 		kubeUsers     []string
 		kubeGroups    []string
 		remoteCluster bool
+		isProxy       bool
 		inHeaders     http.Header
 		wantHeaders   http.Header
 		errAssertion  require.ErrorAssertionFunc
@@ -935,30 +907,62 @@ func TestSetupImpersonationHeaders(t *testing.T) {
 			},
 			errAssertion: require.NoError,
 		},
+		{
+			desc:         "no existing impersonation headers, proxy service",
+			kubeUsers:    []string{"kube-user-a"},
+			kubeGroups:   []string{"kube-group-a", "kube-group-b"},
+			isProxy:      true,
+			inHeaders:    http.Header{},
+			wantHeaders:  http.Header{},
+			errAssertion: require.NoError,
+		},
+		{
+			desc:       "existing impersonation headers, proxy service",
+			kubeUsers:  []string{"kube-user-a"},
+			kubeGroups: []string{"kube-group-a", "kube-group-b"},
+			isProxy:    true,
+			inHeaders: http.Header{
+				ImpersonateGroupHeader: []string{"kube-group-a"},
+			},
+			wantHeaders: http.Header{
+				ImpersonateGroupHeader: []string{"kube-group-a"},
+			},
+			errAssertion: require.NoError,
+		},
 	}
 	for _, tt := range tests {
-		err := setupImpersonationHeaders(
-			logrus.NewEntry(logrus.New()),
-			authContext{
-				kubeUsers:       utils.StringsSet(tt.kubeUsers),
-				kubeGroups:      utils.StringsSet(tt.kubeGroups),
-				teleportCluster: teleportClusterClient{isRemote: tt.remoteCluster},
-			},
-			tt.inHeaders,
-		)
-		tt.errAssertion(t, err)
-
-		if err == nil {
-			// Sort header values to get predictable ordering.
-			for _, vals := range tt.inHeaders {
-				sort.Strings(vals)
+		tt := tt
+		t.Run(tt.desc, func(t *testing.T) {
+			var kubeCreds kubeCreds
+			if !tt.isProxy {
+				kubeCreds = &staticKubeCreds{}
 			}
-			require.Empty(t, cmp.Diff(tt.inHeaders, tt.wantHeaders))
-		}
+			err := setupImpersonationHeaders(
+				&clusterSession{
+					kubeAPICreds: kubeCreds,
+					authContext: authContext{
+						kubeUsers:       utils.StringsSet(tt.kubeUsers),
+						kubeGroups:      utils.StringsSet(tt.kubeGroups),
+						teleportCluster: teleportClusterClient{isRemote: tt.remoteCluster},
+					},
+				},
+				tt.inHeaders,
+			)
+			tt.errAssertion(t, err)
+
+			if err == nil {
+				// Sort header values to get predictable ordering.
+				for _, vals := range tt.inHeaders {
+					sort.Strings(vals)
+				}
+				require.Empty(t, cmp.Diff(tt.inHeaders, tt.wantHeaders))
+			}
+		},
+		)
 	}
 }
 
-func mockAuthCtx(ctx context.Context, t *testing.T, kubeCluster string, isRemote bool) authContext {
+func mockAuthCtx(t *testing.T, kubeCluster string, isRemote bool) authContext {
 	t.Helper()
 	user, err := types.NewUser("bob")
 	require.NoError(t, err)
@@ -973,55 +977,10 @@ func mockAuthCtx(ctx context.Context, t *testing.T, kubeCluster string, isRemote
 			name:     "kube-cluster",
 			isRemote: isRemote,
 		},
-		kubeClusterName: "kube-cluster",
+		kubeClusterName: kubeCluster,
 		// getClientCreds requires sessions to be valid for at least 1 minute
 		sessionTTL: 2 * time.Minute,
 	}
-}
-
-func TestNewClusterSessionDirect(t *testing.T) {
-	ctx := context.Background()
-	f := newMockForwader(ctx, t)
-	authCtx := mockAuthCtx(ctx, t, "kube-cluster", false)
-
-	// helper function to create kube services
-	newKubeServer := func(name, addr, kubeCluster string) types.KubeServer {
-		cluster, err := types.NewKubernetesClusterV3(types.Metadata{
-			Name: kubeCluster,
-		},
-			types.KubernetesClusterSpecV3{})
-		require.NoError(t, err)
-		kubeService, err := types.NewKubernetesServerV3(types.Metadata{
-			Name: name,
-		}, types.KubernetesServerSpecV3{
-			Hostname: addr,
-			HostID:   name,
-			Cluster:  cluster,
-		})
-		require.NoError(t, err)
-
-		return kubeService
-	}
-
-	// no kube services for kube cluster
-	otherKubeService := newKubeServer("other", "other.example.com", "other-kube-cluster")
-	f.cfg.CachingAuthClient = mockAccessPoint{
-		kubeServers: []types.KubeServer{otherKubeService, otherKubeService, otherKubeService},
-	}
-	_, err := f.newClusterSession(ctx, authCtx)
-	require.Error(t, err)
-
-	// multiple kube services for kube cluster
-	publicKubeService := newKubeServer("public", "k8s.example.com", "kube-cluster")
-	tunnelKubeService := newKubeServer("tunnel", reversetunnelclient.LocalKubernetes, "kube-cluster")
-
-	f.cfg.CachingAuthClient = mockAccessPoint{
-		kubeServers: []types.KubeServer{publicKubeService, otherKubeService, tunnelKubeService, otherKubeService},
-	}
-	authCtx.kubeServers, err = f.cfg.CachingAuthClient.GetKubernetesServers(context.Background())
-	require.NoError(t, err)
-
-	require.Nil(t, f.getClientCreds(authCtx))
 }
 
 // TestKubeFwdHTTPProxyEnv ensures that Teleport only respects the `[HTTP(S)|NO]_PROXY`
@@ -1032,7 +991,7 @@ func TestKubeFwdHTTPProxyEnv(t *testing.T) {
 	t.Cleanup(cancel)
 	f := newMockForwader(ctx, t)
 
-	authCtx := mockAuthCtx(ctx, t, "kube-cluster", false)
+	authCtx := mockAuthCtx(t, "kube-cluster", false)
 
 	lockWatcher, err := services.NewLockWatcher(ctx, services.LockWatcherConfig{
 		ResourceWatcherConfig: services.ResourceWatcherConfig{
@@ -1143,15 +1102,16 @@ func TestKubeFwdHTTPProxyEnv(t *testing.T) {
 
 func newMockForwader(ctx context.Context, t *testing.T) *Forwarder {
 	clock := clockwork.NewFakeClock()
-	clientCreds, err := ttlmap.New(defaults.ClientCacheSize, ttlmap.Clock(clock))
-	require.NoError(t, err)
-	cachedTransport, err := ttlmap.New(defaults.ClientCacheSize, ttlmap.Clock(clock))
+	cachedTransport, err := utils.NewFnCache(utils.FnCacheConfig{
+		TTL:   transportCacheTTL,
+		Clock: clock,
+	})
 	require.NoError(t, err)
 	csrClient, err := newMockCSRClient(clock)
 	require.NoError(t, err)
 
 	return &Forwarder{
-		log:    logrus.NewEntry(logrus.New()),
+		log:    utils.NewSlogLoggerForTests(),
 		router: httprouter.New(),
 		cfg: ForwarderConfig{
 			Keygen:            testauthority.New(),
@@ -1163,22 +1123,22 @@ func newMockForwader(ctx context.Context, t *testing.T) *Forwarder {
 			tracer:            otel.Tracer(teleport.ComponentKube),
 			ClusterFeatures:   fakeClusterFeatures,
 		},
-		clientCredentials: clientCreds,
-		activeRequests:    make(map[string]context.Context),
-		ctx:               ctx,
-		cachedTransport:   cachedTransport,
+		activeRequests:  make(map[string]context.Context),
+		ctx:             ctx,
+		cachedTransport: cachedTransport,
 	}
 }
 
 // mockCSRClient to intercept ProcessKubeCSR requests, record them and return a
 // stub response.
 type mockCSRClient struct {
-	auth.ClientI
+	authclient.ClientI
 
-	clock    clockwork.Clock
-	ca       *tlsca.CertAuthority
-	gotCSR   auth.KubeCSR
-	lastCert *x509.Certificate
+	clock           clockwork.Clock
+	ca              *tlsca.CertAuthority
+	gotCSR          authclient.KubeCSR
+	lastCert        *x509.Certificate
+	leafClusterName string
 }
 
 func newMockCSRClient(clock clockwork.Clock) (*mockCSRClient, error) {
@@ -1189,7 +1149,27 @@ func newMockCSRClient(clock clockwork.Clock) (*mockCSRClient, error) {
 	return &mockCSRClient{ca: ca, clock: clock}, nil
 }
 
-func (c *mockCSRClient) ProcessKubeCSR(csr auth.KubeCSR) (*auth.KubeCSRResponse, error) {
+func (c *mockCSRClient) GetCertAuthority(ctx context.Context, id types.CertAuthID, loadKeys bool) (types.CertAuthority, error) {
+	if id.DomainName == c.leafClusterName {
+		return &types.CertAuthorityV2{
+			Kind:    types.KindCertAuthority,
+			Version: types.V3,
+			Metadata: types.Metadata{
+				Name: "local",
+			},
+			Spec: types.CertAuthoritySpecV2{
+				Type:        types.HostCA,
+				ClusterName: c.leafClusterName,
+				ActiveKeys: types.CAKeySet{
+					TLS: []*types.TLSKeyPair{{Cert: []byte(fixtures.TLSCACertPEM)}},
+				},
+			},
+		}, nil
+	}
+	return nil, trace.NotFound("cluster not found")
+}
+
+func (c *mockCSRClient) ProcessKubeCSR(csr authclient.KubeCSR) (*authclient.KubeCSRResponse, error) {
 	c.gotCSR = csr
 
 	x509CSR, err := tlsca.ParseCertificateRequestPEM(csr.CSR)
@@ -1212,7 +1192,7 @@ func (c *mockCSRClient) ProcessKubeCSR(csr auth.KubeCSR) (*auth.KubeCSRResponse,
 	if err != nil {
 		return nil, err
 	}
-	return &auth.KubeCSRResponse{
+	return &authclient.KubeCSRResponse{
 		Cert:            cert,
 		CertAuthorities: [][]byte{[]byte(fixtures.TLSCACertPEM)},
 		TargetAddr:      "mock addr",
@@ -1230,7 +1210,7 @@ type mockRemoteSite struct {
 func (s mockRemoteSite) GetName() string { return s.name }
 
 type mockAccessPoint struct {
-	auth.KubernetesAccessPoint
+	authclient.KubernetesAccessPoint
 
 	netConfig       types.ClusterNetworkingConfig
 	recordingConfig types.SessionRecordingConfig
@@ -1239,11 +1219,11 @@ type mockAccessPoint struct {
 	cas             map[string]types.CertAuthority
 }
 
-func (ap mockAccessPoint) GetClusterNetworkingConfig(context.Context, ...services.MarshalOption) (types.ClusterNetworkingConfig, error) {
+func (ap mockAccessPoint) GetClusterNetworkingConfig(context.Context) (types.ClusterNetworkingConfig, error) {
 	return ap.netConfig, nil
 }
 
-func (ap mockAccessPoint) GetSessionRecordingConfig(context.Context, ...services.MarshalOption) (types.SessionRecordingConfig, error) {
+func (ap mockAccessPoint) GetSessionRecordingConfig(context.Context) (types.SessionRecordingConfig, error) {
 	return ap.recordingConfig, nil
 }
 
@@ -1335,7 +1315,7 @@ func (m *mockWatcher) Done() <-chan struct{} {
 
 func newTestForwarder(ctx context.Context, cfg ForwarderConfig) *Forwarder {
 	return &Forwarder{
-		log:            logrus.NewEntry(logrus.New()),
+		log:            utils.NewSlogLoggerForTests(),
 		router:         httprouter.New(),
 		cfg:            cfg,
 		activeRequests: make(map[string]context.Context),
@@ -1344,7 +1324,7 @@ func newTestForwarder(ctx context.Context, cfg ForwarderConfig) *Forwarder {
 }
 
 type mockSemaphoreClient struct {
-	auth.ClientI
+	authclient.ClientI
 	sem   types.Semaphores
 	roles map[string]types.Role
 }
@@ -1460,186 +1440,6 @@ func newKubeServersFromKubeClusters(t *testing.T, kubeClusters ...*types.Kuberne
 	return kubeServers
 }
 
-func TestForwarder_clientCreds_cache(t *testing.T) {
-	now := time.Now()
-
-	clock := clockwork.NewFakeClockAt(now.Add(-2 * time.Minute))
-
-	cache, err := ttlmap.New(10, ttlmap.Clock(clock))
-	require.NoError(t, err)
-
-	cl, err := newMockCSRClient(clock)
-	require.NoError(t, err)
-
-	f := &Forwarder{
-		cfg: ForwarderConfig{
-			Keygen:         testauthority.New(),
-			AuthClient:     cl,
-			Clock:          clock,
-			TracerProvider: otel.GetTracerProvider(),
-			tracer:         otel.Tracer(teleport.ComponentKube),
-		},
-		clientCredentials: cache,
-		log:               logrus.New(),
-	}
-
-	type args struct {
-		ctx authContext
-	}
-	tests := []struct {
-		name    string
-		args    args
-		wantErr bool
-	}{
-		{
-			name: "store first certificate",
-			args: args{
-				ctx: authContext{
-					kubeUsers:       utils.StringsSet([]string{"user-a"}),
-					kubeGroups:      utils.StringsSet([]string{"kube-group-a", "kube-group-b", teleport.KubeSystemAuthenticated}),
-					kubeClusterName: "local",
-					Context: authz.Context{
-						User: &types.UserV2{
-							Metadata: types.Metadata{
-								Name: "user-a",
-							},
-						},
-						Identity:         identity,
-						UnmappedIdentity: unmappedIdentity,
-					},
-					kubeClusterLabels: make(map[string]string),
-					certExpires:       now.Add(1 * time.Hour),
-					teleportCluster: teleportClusterClient{
-						name: "local",
-					},
-					sessionTTL: 1 * time.Hour,
-				},
-			},
-		},
-		{
-			name: "store certificate with different certExpires value",
-			args: args{
-				ctx: authContext{
-					kubeUsers:       utils.StringsSet([]string{"user-a"}),
-					kubeGroups:      utils.StringsSet([]string{"kube-group-a", "kube-group-b", teleport.KubeSystemAuthenticated}),
-					kubeClusterName: "local",
-					Context: authz.Context{
-						User: &types.UserV2{
-							Metadata: types.Metadata{
-								Name: "user-a",
-							},
-						},
-						Identity:         identity,
-						UnmappedIdentity: unmappedIdentity,
-					},
-					kubeClusterLabels: make(map[string]string),
-					certExpires:       now.Add(2 * time.Hour),
-					teleportCluster: teleportClusterClient{
-						name: "local",
-					},
-					sessionTTL: 1 * time.Hour,
-				},
-			},
-		},
-		{
-			name: "store certificate with different kube groups",
-			args: args{
-				ctx: authContext{
-					kubeUsers:       utils.StringsSet([]string{"user-a"}),
-					kubeGroups:      utils.StringsSet([]string{"kube-group-b", teleport.KubeSystemAuthenticated}),
-					kubeClusterName: "local",
-					Context: authz.Context{
-						User: &types.UserV2{
-							Metadata: types.Metadata{
-								Name: "user-a",
-							},
-						},
-						Identity:         identity,
-						UnmappedIdentity: unmappedIdentity,
-					},
-					kubeClusterLabels: make(map[string]string),
-					certExpires:       now.Add(1 * time.Hour),
-					teleportCluster: teleportClusterClient{
-						name: "local",
-					},
-					sessionTTL: 1 * time.Hour,
-				},
-			},
-		},
-		{
-			name: "store certificate with different kube user",
-			args: args{
-				ctx: authContext{
-					kubeUsers:       utils.StringsSet([]string{"user-test"}),
-					kubeGroups:      utils.StringsSet([]string{"kube-group-b", teleport.KubeSystemAuthenticated}),
-					kubeClusterName: "local",
-					Context: authz.Context{
-						User: &types.UserV2{
-							Metadata: types.Metadata{
-								Name: "user-a",
-							},
-						},
-						Identity:         identity,
-						UnmappedIdentity: unmappedIdentity,
-					},
-					kubeClusterLabels: make(map[string]string),
-					certExpires:       now.Add(1 * time.Hour),
-					teleportCluster: teleportClusterClient{
-						name: "local",
-					},
-					sessionTTL: 1 * time.Hour,
-				},
-			},
-		},
-		{
-			name: "store certificate for different user",
-			args: args{
-				ctx: authContext{
-					kubeUsers:       utils.StringsSet([]string{"user-test"}),
-					kubeGroups:      utils.StringsSet([]string{"kube-group-b", teleport.KubeSystemAuthenticated}),
-					kubeClusterName: "local",
-					Context: authz.Context{
-						User: &types.UserV2{
-							Metadata: types.Metadata{
-								Name: "user-b",
-							},
-						},
-						Identity:         identity,
-						UnmappedIdentity: unmappedIdentity,
-					},
-					kubeClusterLabels: make(map[string]string),
-					certExpires:       now.Add(1 * time.Hour),
-					teleportCluster: teleportClusterClient{
-						name: "local",
-					},
-					sessionTTL: 1 * time.Hour,
-				},
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// make sure cert is not cached
-			cachedTLSCfg := f.getClientCreds(tt.args.ctx)
-			require.Nil(t, cachedTLSCfg)
-
-			// request a new cert
-			tlsCfg, err := f.requestCertificate(context.Background(), tt.args.ctx)
-			require.NoError(t, err)
-
-			// store the certificate in cache
-			err = f.saveClientCreds(tt.args.ctx, tlsCfg)
-			require.NoError(t, err)
-
-			// make sure cache has our entry.
-			cachedTLSCfg = f.getClientCreds(tt.args.ctx)
-			require.NotNil(t, cachedTLSCfg)
-			require.Equal(t, tlsCfg, cachedTLSCfg)
-		})
-	}
-}
-
 func Test_copyImpersonationHeaders(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -1690,22 +1490,26 @@ func TestKubernetesLicenseEnforcement(t *testing.T) {
 		{
 			name: "kubernetes agent is licensed",
 			features: proto.Features{
-				Kubernetes: true,
+				Entitlements: map[string]*proto.EntitlementInfo{
+					string(entitlements.K8s): {Enabled: true},
+				},
 			},
 			assertErrFunc: require.NoError,
 		},
 		{
 			name: "kubernetes isn't licensed",
 			features: proto.Features{
-				Kubernetes: false,
+				Entitlements: map[string]*proto.EntitlementInfo{
+					string(entitlements.K8s): {Enabled: false},
+				},
 			},
 			assertErrFunc: func(tt require.TestingT, err error, i ...interface{}) {
 				require.Error(tt, err)
 				var kubeErr *kubeerrors.StatusError
 				require.ErrorAs(tt, err, &kubeErr)
-				require.Equal(tt, kubeErr.ErrStatus.Code, int32(http.StatusForbidden))
-				require.Equal(tt, kubeErr.ErrStatus.Reason, metav1.StatusReasonForbidden)
-				require.Equal(tt, kubeErr.ErrStatus.Message, "Teleport cluster is not licensed for Kubernetes")
+				require.Equal(tt, int32(http.StatusForbidden), kubeErr.ErrStatus.Code)
+				require.Equal(tt, metav1.StatusReasonForbidden, kubeErr.ErrStatus.Reason)
+				require.Equal(tt, "Teleport cluster is not licensed for Kubernetes", kubeErr.ErrStatus.Message)
 			},
 		},
 	}
@@ -1836,4 +1640,64 @@ func Test_authContext_eventClusterMeta(t *testing.T) {
 			require.Equal(t, tt.want, got)
 		})
 	}
+}
+
+func TestForwarderTLSConfigCAs(t *testing.T) {
+	clusterName := "leaf"
+
+	// Create a cert pool with the cert from fixtures.TLSCACertPEM
+	caCert, err := tlsutils.ParseCertificatePEM([]byte(fixtures.TLSCACertPEM))
+	require.NoError(t, err)
+	certPool := x509.NewCertPool()
+	certPool.AddCert(caCert)
+
+	// create the auth server mock client
+	clock := clockwork.NewFakeClock()
+	cl, err := newMockCSRClient(clock)
+	require.NoError(t, err)
+	cl.leafClusterName = clusterName
+
+	var getConnTLSRootsCalled bool
+	f := &Forwarder{
+		cfg: ForwarderConfig{
+			Keygen:            testauthority.New(),
+			AuthClient:        cl,
+			TracerProvider:    otel.GetTracerProvider(),
+			tracer:            otel.Tracer(teleport.ComponentKube),
+			KubeServiceType:   ProxyService,
+			CachingAuthClient: cl,
+
+			GetConnTLSCertificate: func() (*tls.Certificate, error) {
+				return nil, nil
+			},
+			GetConnTLSRoots: func() (*x509.CertPool, error) {
+				getConnTLSRootsCalled = true
+				return x509.NewCertPool(), nil
+			},
+		},
+		log: utils.NewSlogLoggerForTests(),
+		ctx: context.Background(),
+	}
+
+	// generate tlsConfig for the leaf cluster
+	tlsConfig, err := f.getTLSConfigForLeafCluster(clusterName)
+	require.NoError(t, err)
+	_ = tlsConfig.VerifyConnection(tls.ConnectionState{
+		ServerName: "nonempty",
+		PeerCertificates: []*x509.Certificate{
+			caCert,
+		},
+	})
+	require.False(t, getConnTLSRootsCalled)
+
+	// generate tlsConfig for the local cluster
+	_, localTLSConfig, err := f.newLocalClusterTransport(clusterName)
+	require.NoError(t, err)
+	_ = localTLSConfig.VerifyConnection(tls.ConnectionState{
+		ServerName: "nonempty",
+		PeerCertificates: []*x509.Certificate{
+			caCert,
+		},
+	})
+	require.True(t, getConnTLSRootsCalled)
 }

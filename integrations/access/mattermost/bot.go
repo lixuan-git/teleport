@@ -1,23 +1,26 @@
-/**
- * Copyright 2023 Gravitational, Inc.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 package mattermost
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/url"
 	"strings"
@@ -26,9 +29,11 @@ import (
 
 	"github.com/go-resty/resty/v2"
 	"github.com/gravitational/trace"
-	"github.com/mailgun/holster/v3/collections"
+	lru "github.com/hashicorp/golang-lru/v2"
 
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/api/types/accesslist"
+	"github.com/gravitational/teleport/integrations/access/accessrequest"
 	"github.com/gravitational/teleport/integrations/access/common"
 	"github.com/gravitational/teleport/integrations/lib"
 	"github.com/gravitational/teleport/integrations/lib/logger"
@@ -54,6 +59,7 @@ var postTextTemplate = template.Must(template.New("description").Parse(
 {{else if eq .Status "PENDING"}}**Approve**: ` + "`tsh request review --approve {{.ID}}`" + `
 **Deny**: ` + "`tsh request review --deny {{.ID}}`" + `{{end}}`,
 ))
+
 var reviewCommentTemplate = template.Must(template.New("review comment").Parse(
 	`{{.Author}} reviewed the request at {{.Created.Format .TimeFormat}}.
 Resolution: {{.ProposedStateEmoji}} {{.ProposedState}}.
@@ -76,11 +82,14 @@ type Bot struct {
 	webProxyURL *url.URL
 }
 
-type getMeKey struct{}
-type getChannelByTeamNameAndNameKey struct {
-	team string
-	name string
-}
+type (
+	getMeKey                       struct{}
+	getChannelByTeamNameAndNameKey struct {
+		team string
+		name string
+	}
+)
+
 type getUserByEmail struct {
 	email string
 }
@@ -103,7 +112,10 @@ func NewBot(conf Config, clusterName, webProxyAddr string) (Bot, error) {
 		}
 	}
 
-	cache := collections.NewLRUCache(mmCacheSize)
+	cache, err := lru.New[any, etagCacheEntry](mmCacheSize)
+	if err != nil {
+		return Bot{}, trace.Wrap(err, "failed to create cache")
+	}
 
 	client := resty.
 		NewWithClient(&http.Client{
@@ -111,6 +123,7 @@ func NewBot(conf Config, clusterName, webProxyAddr string) (Bot, error) {
 			Transport: &http.Transport{
 				MaxConnsPerHost:     mmMaxConns,
 				MaxIdleConnsPerHost: mmMaxConns,
+				Proxy:               http.ProxyFromEnvironment,
 			},
 		}).
 		SetBaseURL(conf.Mattermost.URL).
@@ -137,7 +150,7 @@ func NewBot(conf Config, clusterName, webProxyAddr string) (Bot, error) {
 			ctx, cancel := context.WithTimeout(context.Background(), mmStatusEmitTimeout)
 			defer cancel()
 			if err := sink.Emit(ctx, status); err != nil {
-				log.Errorf("Error while emitting plugin status: %v", err)
+				log.ErrorContext(ctx, "Error while emitting plugin status", "error", err)
 			}
 		}()
 
@@ -168,14 +181,9 @@ func NewBot(conf Config, clusterName, webProxyAddr string) (Bot, error) {
 			return nil
 		}
 
-		val, ok := cache.Get(cacheKey)
+		res, ok := cache.Get(cacheKey)
 		if !ok {
 			return nil
-		}
-
-		res, ok := val.(etagCacheEntry)
-		if !ok {
-			return trace.Errorf("etag cache entry of unknown type %T", val)
 		}
 
 		req.SetHeader("If-None-Match", res.etag)
@@ -212,6 +220,13 @@ func NewBot(conf Config, clusterName, webProxyAddr string) (Bot, error) {
 	}, nil
 }
 
+// SupportedApps are the apps supported by this bot.
+func (b Bot) SupportedApps() []common.App {
+	return []common.App{
+		accessrequest.NewApp(b),
+	}
+}
+
 func (b Bot) CheckHealth(ctx context.Context) error {
 	_, err := b.GetMe(ctx)
 	return err
@@ -228,14 +243,19 @@ func (b Bot) GetMe(ctx context.Context) (User, error) {
 	return userResult(resp)
 }
 
-// Broadcast posts request info to Mattermost.
-func (b Bot) Broadcast(ctx context.Context, recipients []common.Recipient, reqID string, reqData pd.AccessRequestData) (common.SentMessages, error) {
+// SendReviewReminders will send a review reminder that an access list needs to be reviewed.
+func (b Bot) SendReviewReminders(ctx context.Context, recipients []common.Recipient, accessLists []*accesslist.AccessList) error {
+	return trace.NotImplemented("access list review reminder is not yet implemented")
+}
+
+// BroadcastAccessRequestMessage posts request info to Mattermost.
+func (b Bot) BroadcastAccessRequestMessage(ctx context.Context, recipients []common.Recipient, reqID string, reqData pd.AccessRequestData) (accessrequest.SentMessages, error) {
 	text, err := b.buildPostText(reqID, reqData)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	var data common.SentMessages
+	var data accessrequest.SentMessages
 	var errors []error
 
 	for _, recipient := range recipients {
@@ -253,7 +273,7 @@ func (b Bot) Broadcast(ctx context.Context, recipients []common.Recipient, reqID
 			continue
 		}
 
-		data = append(data, common.MessageData{ChannelID: post.ChannelID, MessageID: post.ID})
+		data = append(data, accessrequest.MessageData{ChannelID: post.ChannelID, MessageID: post.ID})
 	}
 
 	return data, trace.NewAggregate(errors...)
@@ -355,7 +375,12 @@ func (b Bot) LookupDirectChannel(ctx context.Context, email string) (string, err
 	return channel.ID, nil
 }
 
-func (b Bot) UpdateMessages(ctx context.Context, reqID string, reqData pd.AccessRequestData, mmData common.SentMessages, reviews []types.AccessReview) error {
+// NotifyUser will send users a direct message with the access request status
+func (b Bot) NotifyUser(ctx context.Context, reqID string, reqData pd.AccessRequestData) error {
+	return trace.NotImplemented("notify user not implemented for plugin")
+}
+
+func (b Bot) UpdateMessages(ctx context.Context, reqID string, reqData pd.AccessRequestData, mmData accessrequest.SentMessages, reviews []types.AccessReview) error {
 	text, err := b.buildPostText(reqID, reqData)
 	if err != nil {
 		return trace.Wrap(err)
@@ -438,13 +463,14 @@ func (b Bot) buildPostText(reqID string, reqData pd.AccessRequestData) (string, 
 }
 
 func (b Bot) tryLookupDirectChannel(ctx context.Context, userEmail string) string {
-	log := logger.Get(ctx).WithField("mm_user_email", userEmail)
+	log := logger.Get(ctx).With("mm_user_email", userEmail)
 	channel, err := b.LookupDirectChannel(ctx, userEmail)
 	if err != nil {
-		if errResult, ok := trace.Unwrap(err).(*ErrorResult); ok {
-			log.Warningf("Failed to lookup direct channel info: %q", errResult.Message)
+		var errResult *ErrorResult
+		if errors.As(trace.Unwrap(err), &errResult) {
+			log.WarnContext(ctx, "Failed to lookup direct channel info", "error", errResult.Message)
 		} else {
-			log.WithError(err).Error("Failed to lookup direct channel info")
+			log.ErrorContext(ctx, "Failed to lookup direct channel info", "error", err)
 		}
 		return ""
 	}
@@ -452,16 +478,17 @@ func (b Bot) tryLookupDirectChannel(ctx context.Context, userEmail string) strin
 }
 
 func (b Bot) tryLookupChannel(ctx context.Context, team, name string) string {
-	log := logger.Get(ctx).WithFields(logger.Fields{
-		"mm_team":    team,
-		"mm_channel": name,
-	})
+	log := logger.Get(ctx).With(
+		"mm_team", team,
+		"mm_channel", name,
+	)
 	channel, err := b.LookupChannel(ctx, team, name)
 	if err != nil {
-		if errResult, ok := trace.Unwrap(err).(*ErrorResult); ok {
-			log.Warningf("Failed to lookup channel info: %q", errResult.Message)
+		var errResult *ErrorResult
+		if errors.As(trace.Unwrap(err), &errResult) {
+			log.WarnContext(ctx, "Failed to lookup channel info", "error", errResult.Message)
 		} else {
-			log.WithError(err).Error("Failed to lookup channel info")
+			log.ErrorContext(ctx, "Failed to lookup channel info", "error", err)
 		}
 		return ""
 	}
@@ -469,30 +496,35 @@ func (b Bot) tryLookupChannel(ctx context.Context, team, name string) string {
 }
 
 // FetchRecipient returns the recipient for the given raw recipient.
-func (b Bot) FetchRecipient(ctx context.Context, recipient string) (*common.Recipient, error) {
+func (b Bot) FetchRecipient(ctx context.Context, name string) (*common.Recipient, error) {
 	var channel string
 	kind := "Channel"
 
 	// Recipients from config file could contain either email or team and
 	// channel names separated by '/' symbol. It's up to user what format to use.
-	if lib.IsEmail(recipient) {
-		channel = b.tryLookupDirectChannel(ctx, recipient)
+	if lib.IsEmail(name) {
+		channel = b.tryLookupDirectChannel(ctx, name)
 		kind = "Email"
 	} else {
-		parts := strings.Split(recipient, "/")
+		parts := strings.Split(name, "/")
 		if len(parts) == 2 {
 			channel = b.tryLookupChannel(ctx, parts[0], parts[1])
 		} else {
-			return nil, trace.BadParameter("Recipient must be either a user email or a channel in the format \"team/channel\" but got %q", recipient)
+			return nil, trace.BadParameter("Recipient must be either a user email or a channel in the format \"team/channel\" but got %q", name)
 		}
 	}
 
 	return &common.Recipient{
-		Name: recipient,
+		Name: name,
 		ID:   channel,
 		Kind: kind,
 		Data: nil,
 	}, nil
+}
+
+// FetchOncallUsers fetches on-call users filtered by the provided annotations.
+func (b Bot) FetchOncallUsers(ctx context.Context, req types.AccessRequest) ([]string, error) {
+	return nil, trace.NotImplemented("fetch oncall users not implemented for plugin")
 }
 
 func userResult(resp *resty.Response) (User, error) {

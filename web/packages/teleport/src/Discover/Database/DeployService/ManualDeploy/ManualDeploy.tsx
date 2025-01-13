@@ -1,45 +1,45 @@
 /**
- * Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React, { Suspense, useState, useEffect } from 'react';
-import { Box, ButtonSecondary, Text } from 'design';
+import { Suspense, useEffect, useState } from 'react';
+
+import { Box, ButtonSecondary, H3, Mark, Text } from 'design';
 import * as Icons from 'design/Icon';
 import Validation, { Validator } from 'shared/components/Validation';
 
 import { CatchError } from 'teleport/components/CatchError';
-import {
-  clearCachedJoinTokenResult,
-  useJoinTokenSuspender,
-} from 'teleport/Discover/Shared/useJoinTokenSuspender';
-import { usePingTeleport } from 'teleport/Discover/Shared/PingTeleportContext';
-import { ResourceLabel } from 'teleport/services/agents';
-import cfg from 'teleport/config';
-import { Database } from 'teleport/services/databases';
-
 import { TextSelectCopyMulti } from 'teleport/components/TextSelectCopy';
-
+import cfg from 'teleport/config';
+import { DatabaseLocation } from 'teleport/Discover/SelectResource';
+import { CommandBox } from 'teleport/Discover/Shared/CommandBox';
 import {
   HintBox,
   SuccessBox,
   WaitingInfo,
 } from 'teleport/Discover/Shared/HintBox';
-
-import { CommandBox } from 'teleport/Discover/Shared/CommandBox';
-import { DbMeta, useDiscover } from 'teleport/Discover/useDiscover';
-import { DatabaseLocation } from 'teleport/Discover/SelectResource';
+import { usePingTeleport } from 'teleport/Discover/Shared/PingTeleportContext';
+import {
+  clearCachedJoinTokenResult,
+  useJoinTokenSuspender,
+} from 'teleport/Discover/Shared/useJoinTokenSuspender';
+import { useDiscover } from 'teleport/Discover/useDiscover';
+import { ResourceLabel } from 'teleport/services/agents';
+import { Database } from 'teleport/services/databases';
 import {
   DiscoverEventStatus,
   DiscoverServiceDeployMethod,
@@ -52,12 +52,11 @@ import {
   DiscoverLabel,
   Header,
   HeaderSubtitle,
-  Mark,
   ResourceKind,
   TextIcon,
   useShowHint,
 } from '../../../Shared';
-import { Labels, hasMatchingLabels } from '../../common';
+import { hasMatchingLabels, Labels } from '../../common';
 import { DeployServiceProp } from '../DeployService';
 
 export default function Container({ toggleDeployMethod }: DeployServiceProp) {
@@ -86,6 +85,7 @@ export default function Container({ toggleDeployMethod }: DeployServiceProp) {
           fallbackFn={fbProps => (
             <Box>
               {heading}
+              <H3>Define Matcher Labels</H3>
               <Labels {...labelProps} />
               <Box>
                 <TextIcon mt={3}>
@@ -106,6 +106,7 @@ export default function Container({ toggleDeployMethod }: DeployServiceProp) {
             fallback={
               <Box>
                 {heading}
+                <H3>Define Matcher Labels</H3>
                 <Labels {...labelProps} disableBtns={true} />
                 <ActionButtons onProceed={() => null} disableProceed={true} />
               </Box>
@@ -142,15 +143,19 @@ export function ManualDeploy(props: {
   const { agentMeta, updateAgentMeta, nextStep, emitEvent } = useDiscover();
 
   // Fetches join token.
-  const { joinToken } = useJoinTokenSuspender(
-    [ResourceKind.Database],
-    props.labels
-  );
+  const { joinToken } = useJoinTokenSuspender({
+    resourceKinds: [ResourceKind.Database],
+    suggestedAgentMatcherLabels: props.labels,
+  });
 
   // Starts resource querying interval.
   const { active, result } = usePingTeleport<Database>(agentMeta.resourceName);
 
   const showHint = useShowHint(active);
+
+  useEffect(() => {
+    return () => clearCachedJoinTokenResult([ResourceKind.Database]);
+  }, []);
 
   function handleNextStep() {
     updateAgentMeta({
@@ -222,12 +227,13 @@ export function ManualDeploy(props: {
   return (
     <Box>
       <Heading toggleDeployMethod={props.toggleDeployMethod} />
+      <H3>Define Matcher Labels</H3>
       <Labels
         labels={props.labels}
         setLabels={props.setLabels}
         disableBtns={true}
         dbLabels={props.dbLabels}
-        region={(agentMeta as DbMeta).selectedAwsRdsDb?.region}
+        region={agentMeta.awsRegion}
       />
       <Box mt={6}>
         <CommandBox>
@@ -301,6 +307,7 @@ function LoadedView({
   return (
     <Box>
       <Heading toggleDeployMethod={toggleDeployMethod} />
+      <H3>Define Matcher Labels</H3>
       <Labels
         labels={labels}
         setLabels={setLabels}

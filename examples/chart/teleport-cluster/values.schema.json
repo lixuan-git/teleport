@@ -6,6 +6,7 @@
         "authentication",
         "enterprise",
         "operator",
+        "global",
         "podSecurityPolicy",
         "labels",
         "chartMode",
@@ -19,6 +20,7 @@
         "affinity",
         "nodeSelector",
         "annotations",
+        "extraContainers",
         "extraVolumes",
         "extraVolumeMounts",
         "imagePullPolicy",
@@ -284,9 +286,28 @@
             "type": "boolean",
             "default": false
         },
+        "licenseSecretName": {
+            "$id": "#/properties/licenseSecretName",
+            "type": "string",
+            "default": "license"
+        },
         "installCRDs": {
             "$id": "#/properties/installCRDs",
             "type": "boolean"
+        },
+        "global": {
+            "$id": "#/properties/global",
+            "type": "object",
+            "required": [
+                "clusterDomain"
+            ],
+            "properties": {
+                "clusterDomain": {
+                    "$id": "#/properties/global/properties/clusterDomain",
+                    "type": "string",
+                    "default": "cluster.local"
+                }
+            }
         },
         "operator": {
             "$id": "#/properties/operator",
@@ -888,6 +909,11 @@
             "type": "array",
             "default": []
         },
+        "extraContainers": {
+            "$id": "#/properties/extraContainers",
+            "type": "array",
+            "default": []
+        },
         "extraVolumes": {
             "$id": "#/properties/extraVolumes",
             "type": "array",
@@ -934,6 +960,11 @@
         },
         "resources": {
             "$id": "#/properties/resources",
+            "type": "object",
+            "default": {}
+        },
+        "podSecurityContext": {
+            "$id": "#/properties/podSecurityContext",
             "type": "object",
             "default": {}
         },

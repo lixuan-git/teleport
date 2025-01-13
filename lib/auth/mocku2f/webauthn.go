@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package mocku2f
 
@@ -77,6 +79,12 @@ func (muk *Key) SignAssertion(origin string, assertion *wantypes.CredentialAsser
 		return nil, trace.Wrap(err)
 	}
 
+	// If passwordless, then relay our WebAuthn UserHandle.
+	var userHandle []byte
+	if len(assertion.Response.AllowedCredentials) == 0 && len(muk.UserHandle) > 0 {
+		userHandle = muk.UserHandle
+	}
+
 	return &wantypes.CredentialAssertionResponse{
 		PublicKeyCredential: wantypes.PublicKeyCredential{
 			Credential: wantypes.Credential{
@@ -93,7 +101,8 @@ func (muk *Key) SignAssertion(origin string, assertion *wantypes.CredentialAsser
 			},
 			AuthenticatorData: res.AuthData,
 			// Signature starts after user presence (1byte) and counter (4 bytes).
-			Signature: res.SignData[5:],
+			Signature:  res.SignData[5:],
+			UserHandle: userHandle,
 		},
 	}, nil
 }
@@ -126,7 +135,11 @@ func (muk *Key) SignCredentialCreation(origin string, cc *wantypes.CredentialCre
 	if aa := cc.Response.AuthenticatorSelection.AuthenticatorAttachment; aa == protocol.Platform {
 		return nil, trace.BadParameter("platform attachment required by authenticator selection")
 	}
-	if rrk := cc.Response.AuthenticatorSelection.RequireResidentKey; rrk != nil && *rrk && !muk.AllowResidentKey {
+	rrk, err := cc.RequireResidentKey()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	if rrk && !muk.AllowResidentKey {
 		return nil, trace.BadParameter("resident key required by authenticator selection")
 	}
 	if uv := cc.Response.AuthenticatorSelection.UserVerification; uv == protocol.VerificationRequired && !muk.SetUV {
@@ -182,13 +195,28 @@ func (muk *Key) SignCredentialCreation(origin string, cc *wantypes.CredentialCre
 		return nil, trace.Wrap(err)
 	}
 
+	// Save the WebAuthn UserHandle if this is a resident key creation.
+	if rrk && len(cc.Response.User.ID) > 0 && len(muk.UserHandle) == 0 {
+		muk.UserHandle = cc.Response.User.ID
+	}
+
+	var exts *wantypes.AuthenticationExtensionsClientOutputs
+	if muk.ReplyWithCredProps {
+		exts = &wantypes.AuthenticationExtensionsClientOutputs{
+			CredProps: &wantypes.CredentialPropertiesOutput{
+				RK: true,
+			},
+		}
+	}
+
 	return &wantypes.CredentialCreationResponse{
 		PublicKeyCredential: wantypes.PublicKeyCredential{
 			Credential: wantypes.Credential{
 				ID:   base64.RawURLEncoding.EncodeToString(muk.KeyHandle),
 				Type: string(protocol.PublicKeyCredentialType),
 			},
-			RawID: muk.KeyHandle,
+			RawID:      muk.KeyHandle,
+			Extensions: exts,
 		},
 		AttestationResponse: wantypes.AuthenticatorAttestationResponse{
 			AuthenticatorResponse: wantypes.AuthenticatorResponse{

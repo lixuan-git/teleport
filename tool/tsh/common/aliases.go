@@ -1,21 +1,26 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package common
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"regexp"
@@ -24,6 +29,8 @@ import (
 
 	"github.com/google/shlex"
 	"github.com/gravitational/trace"
+
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
 // tshAliasEnvKey is an env variable storing the aliases that, so far, has been expanded, and should not be expanded again.
@@ -200,7 +207,7 @@ func (ar *aliasRunner) runAliasCommand(ctx context.Context, currentExecPath, exe
 	// if execPath is our path, skip re-execution and run main directly instead.
 	// this makes for better error messages in case of failures.
 	if execPath == currentExecPath {
-		log.Debugf("Self re-exec command: tsh %v.", arguments)
+		logger.DebugContext(ctx, "tsh re-exec command", "arguments", arguments)
 		return trace.Wrap(ar.runTshMain(ctx, arguments))
 	}
 
@@ -209,13 +216,14 @@ func (ar *aliasRunner) runAliasCommand(ctx context.Context, currentExecPath, exe
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	log.Debugf("Running external command: %v", cmd)
+	logger.DebugContext(ctx, "Running external command", "command", logutils.StringerAttr(cmd))
 	err = ar.runExternalCommand(cmd)
 	if err == nil {
 		return nil
 	}
 
-	if exitErr, ok := err.(*exec.ExitError); ok {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
 		return trace.Wrap(exitErr)
 	}
 

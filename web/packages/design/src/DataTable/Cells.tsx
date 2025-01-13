@@ -1,34 +1,39 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React from 'react';
+import { TdHTMLAttributes } from 'react';
 
-import { displayDate } from 'shared/services/loc';
+import { Theme } from 'design/theme';
 
-import { Label, Flex } from 'design';
-import * as Icons from 'design/Icon';
-
+import { displayDate } from '../datetime';
+import Flex from '../Flex';
+import * as Icons from '../Icon';
+import Label from '../Label';
 import {
+  LabelDescription,
   ServersideProps,
   SortDir,
   TableColumn,
-  LabelDescription,
 } from './types';
 
-export const Cell = props => <td children={props.children} {...props} />;
+export function Cell(props: TdHTMLAttributes<HTMLTableCellElement>) {
+  return <td {...props} />;
+}
 
 export function SortHeaderCell<T>({
   column,
@@ -38,8 +43,9 @@ export function SortHeaderCell<T>({
   onClick,
 }: SortHeaderCellProps<T>) {
   function handleServersideClick() {
-    serversideProps.setSort({
+    serversideProps?.setSort({
       dir: serversideProps.sort?.dir === 'ASC' ? 'DESC' : 'ASC',
+      // @ts-expect-error TODO(gzdunek): The key can be undefined since the column can provide altKey. Improve the types.
       fieldName: column.key,
     });
   }
@@ -56,7 +62,7 @@ export function SortHeaderCell<T>({
             sortDir={
               serversideProps.sort?.fieldName === column.key
                 ? serversideProps.sort.dir
-                : null
+                : undefined
             }
           />
         </a>
@@ -90,7 +96,9 @@ export function SortIndicator<T>({
   return <Icons.ChevronsVertical title="sort items" />;
 }
 
-export const TextCell = ({ data }) => <Cell>{`${data || ''}`}</Cell>;
+export const TextCell = ({ data }: { data: unknown }) => (
+  <Cell>{`${data || ''}`}</Cell>
+);
 
 export const LabelCell = ({ data }: { data: string[] }) =>
   renderLabelCell(data);
@@ -132,7 +140,8 @@ export const ClickableLabelCell = ({
         css={`
           cursor: pointer;
           &:hover {
-            background-color: ${props => props.theme.colors.spotBackground[1]};
+            background-color: ${(props: { theme: Theme }) =>
+              props.theme.colors.spotBackground[1]};
           }
         `}
       >
@@ -150,8 +159,8 @@ export const ClickableLabelCell = ({
 
 type SortHeaderCellProps<T> = {
   column: TableColumn<T>;
-  serversideProps: ServersideProps;
+  serversideProps?: ServersideProps;
   text: string;
-  dir: SortDir;
+  dir?: SortDir;
   onClick: () => void;
 };

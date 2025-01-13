@@ -1,26 +1,31 @@
 /*
-Copyright 2018-2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package events
 
 import (
 	"context"
+	"io"
 
 	"github.com/gravitational/trace"
 
+	auditlogpb "github.com/gravitational/teleport/api/gen/proto/go/teleport/auditlog/v1"
+	"github.com/gravitational/teleport/api/internalutils/stream"
 	apievents "github.com/gravitational/teleport/api/types/events"
 )
 
@@ -73,6 +78,62 @@ func (m *MultiLog) SearchEvents(ctx context.Context, req SearchEventsRequest) (e
 		}
 	}
 	return events, lastKey, err
+}
+
+func (m *MultiLog) ExportUnstructuredEvents(ctx context.Context, req *auditlogpb.ExportUnstructuredEventsRequest) stream.Stream[*auditlogpb.ExportEventUnstructured] {
+	var foundImplemented bool
+	var pos int
+	// model our iteration through sub-loggers as a stream of streams that terminates after the first stream
+	// is reached that results in something other than a not implemented error, then flatten the stream of streams
+	// to produce the effect of creating a single stream of events originating solely from the first logger that
+	// implements the ExportUnstructuredEvents method.
+	return stream.Flatten(stream.Func(func() (stream.Stream[*auditlogpb.ExportEventUnstructured], error) {
+		if foundImplemented {
+			// an implementing stream has already been found and consumed.
+			return nil, io.EOF
+		}
+		if pos >= len(m.loggers) {
+			// we've reached the end of the list of loggers and none of them implement ExportUnstructuredEvents
+			return nil, trace.NotImplemented("no loggers implement ExportUnstructuredEvents")
+		}
+		log := m.loggers[pos]
+		pos++
+		return stream.MapErr(log.ExportUnstructuredEvents(ctx, req), func(err error) error {
+			if trace.IsNotImplemented(err) {
+				return nil
+			}
+			foundImplemented = true
+			return err
+		}), nil
+	}))
+}
+
+func (m *MultiLog) GetEventExportChunks(ctx context.Context, req *auditlogpb.GetEventExportChunksRequest) stream.Stream[*auditlogpb.EventExportChunk] {
+	var foundImplemented bool
+	var pos int
+	// model our iteration through sub-loggers as a stream of streams that terminates after the first stream
+	// is reached that results in something other than a not implemented error, then flatten the stream of streams
+	// to produce the effect of creating a single stream of chunks originating solely from the first logger that
+	// implements the GetEventExportChunks method.
+	return stream.Flatten(stream.Func(func() (stream.Stream[*auditlogpb.EventExportChunk], error) {
+		if foundImplemented {
+			// an implementing stream has already been found and consumed.
+			return nil, io.EOF
+		}
+		if pos >= len(m.loggers) {
+			// we've reached the end of the list of loggers and none of them implement GetEventExportChunks
+			return nil, trace.NotImplemented("no loggers implement GetEventExportChunks")
+		}
+		log := m.loggers[pos]
+		pos++
+		return stream.MapErr(log.GetEventExportChunks(ctx, req), func(err error) error {
+			if trace.IsNotImplemented(err) {
+				return nil
+			}
+			foundImplemented = true
+			return err
+		}), nil
+	}))
 }
 
 // SearchSessionEvents is a flexible way to find session events.

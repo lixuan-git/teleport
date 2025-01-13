@@ -1,22 +1,26 @@
-/*
-Copyright 2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 import { formatDistanceStrict } from 'date-fns';
 
-import { Event, RawEvent, Formatters, eventCodes, RawEvents } from './types';
+import { pluralize } from 'shared/utils/text';
+
+import { Event, eventCodes, Formatters, RawEvent, RawEvents } from './types';
 
 const formatElasticsearchEvent: (
   json:
@@ -77,8 +81,9 @@ export const formatters: Formatters = {
   [eventCodes.ACCESS_REQUEST_REVIEWED]: {
     type: 'access_request.review',
     desc: 'Access Request Reviewed',
-    format: ({ id, reviewer }) =>
-      `User [${reviewer}] reviewed access request [${id}]`,
+    format: ({ id, reviewer, state }) => {
+      return `User [${reviewer}] ${state.toLowerCase()} access request [${id}]`;
+    },
   },
   [eventCodes.ACCESS_REQUEST_DELETED]: {
     type: 'access_request.delete',
@@ -89,7 +94,7 @@ export const formatters: Formatters = {
     type: 'access_request.search',
     desc: 'Resource Access Search',
     format: ({ user, resource_type, search_as_roles }) =>
-      `User [${user}] searched for resource type [${resource_type}] with role(s) [${search_as_roles}]`,
+      `User [${user}] searched for resource type [${resource_type}] with role(s) [${truncateStr(search_as_roles.join(','), 80)}]`,
   },
   [eventCodes.SESSION_COMMAND]: {
     type: 'session.command',
@@ -162,9 +167,9 @@ export const formatters: Formatters = {
       const { proto, kubernetes_cluster, user = '' } = event;
       if (proto === 'kube') {
         if (!kubernetes_cluster) {
-          return `User [${user}] executed a kubernetes command`;
+          return `User [${user}] executed a Kubernetes command`;
         }
-        return `User [${user}] executed a command on kubernetes cluster [${kubernetes_cluster}]`;
+        return `User [${user}] executed a command on Kubernetes cluster [${kubernetes_cluster}]`;
       }
 
       return `User [${user}] executed a command on node ${
@@ -182,15 +187,21 @@ export const formatters: Formatters = {
   },
   [eventCodes.GITHUB_CONNECTOR_CREATED]: {
     type: 'github.created',
-    desc: 'GITHUB Auth Connector Created',
+    desc: 'GitHub Auth Connector Created',
     format: ({ user, name }) =>
-      `User [${user}] created GitHub connector [${name}] has been created`,
+      `User [${user}] created GitHub connector [${name}]`,
   },
   [eventCodes.GITHUB_CONNECTOR_DELETED]: {
     type: 'github.deleted',
-    desc: 'GITHUB Auth Connector Deleted',
+    desc: 'GitHub Auth Connector Deleted',
     format: ({ user, name }) =>
       `User [${user}] deleted GitHub connector [${name}]`,
+  },
+  [eventCodes.GITHUB_CONNECTOR_UPDATED]: {
+    type: 'github.updated',
+    desc: 'GitHub Auth Connector Updated',
+    format: ({ user, name }) =>
+      `User [${user}] updated GitHub connector [${name}]`,
   },
   [eventCodes.OIDC_CONNECTOR_CREATED]: {
     type: 'oidc.created',
@@ -204,6 +215,12 @@ export const formatters: Formatters = {
     format: ({ user, name }) =>
       `User [${user}] deleted OIDC connector [${name}]`,
   },
+  [eventCodes.OIDC_CONNECTOR_UPDATED]: {
+    type: 'oidc.updated',
+    desc: 'OIDC Auth Connector Updated',
+    format: ({ user, name }) =>
+      `User [${user}] updated OIDC connector [${name}]`,
+  },
   [eventCodes.PORTFORWARD]: {
     type: 'port',
     desc: 'Port Forwarding Started',
@@ -214,6 +231,11 @@ export const formatters: Formatters = {
     desc: 'Port Forwarding Failed',
     format: ({ user, error }) =>
       `User [${user}] port forwarding request failed: ${error}`,
+  },
+  [eventCodes.PORTFORWARD_STOP]: {
+    type: 'port',
+    desc: 'Port Forwarding Stopped',
+    format: ({ user }) => `User [${user}] stopped port forwarding`,
   },
   [eventCodes.SAML_CONNECTOR_CREATED]: {
     type: 'saml.created',
@@ -226,6 +248,12 @@ export const formatters: Formatters = {
     desc: 'SAML Connector Deleted',
     format: ({ user, name }) =>
       `User [${user}] deleted SAML connector [${name}]`,
+  },
+  [eventCodes.SAML_CONNECTOR_UPDATED]: {
+    type: 'saml.updated',
+    desc: 'SAML Connector Updated',
+    format: ({ user, name }) =>
+      `User [${user}] updated SAML connector [${name}]`,
   },
   [eventCodes.SCP_DOWNLOAD]: {
     type: 'scp',
@@ -259,6 +287,14 @@ export const formatters: Formatters = {
         rest['server_hostname'] || rest['addr.local']
       }] failed [${exitError}]`,
   },
+  [eventCodes.SCP_DISALLOWED]: {
+    type: 'scp',
+    desc: 'SCP Disallowed',
+    format: ({ user, ...rest }) =>
+      `User [${user}] SCP file transfer on node [${
+        rest['server_hostname'] || rest['addr.local']
+      }] blocked`,
+  },
   [eventCodes.SFTP_OPEN]: {
     type: 'sftp',
     desc: 'SFTP Open',
@@ -275,86 +311,6 @@ export const formatters: Formatters = {
         rest['server_hostname'] || rest['addr.local']
       }]: [${error}]`,
   },
-  [eventCodes.SFTP_CLOSE]: {
-    type: 'sftp',
-    desc: 'SFTP Close',
-    format: ({ user, path, ...rest }) =>
-      `User [${user}] closed file [${path}] on node [${
-        rest['server_hostname'] || rest['addr.local']
-      }]`,
-  },
-  [eventCodes.SFTP_CLOSE_FAILURE]: {
-    type: 'sftp',
-    desc: 'SFTP Close Failed',
-    format: ({ user, path, error, ...rest }) =>
-      `User [${user}] failed to close file [${path}] on node [${
-        rest['server_hostname'] || rest['addr.local']
-      }]: [${error}]`,
-  },
-  [eventCodes.SFTP_READ]: {
-    type: 'sftp',
-    desc: 'SFTP Read',
-    format: ({ user, path, ...rest }) =>
-      `User [${user}] read from file [${path}] on node [${
-        rest['server_hostname'] || rest['addr.local']
-      }]`,
-  },
-  [eventCodes.SFTP_READ_FAILURE]: {
-    type: 'sftp',
-    desc: 'SFTP Read Failed',
-    format: ({ user, path, error, ...rest }) =>
-      `User [${user}] failed to read from file [${path}] on node [${
-        rest['server_hostname'] || rest['addr.local']
-      }]: [${error}]`,
-  },
-  [eventCodes.SFTP_WRITE]: {
-    type: 'sftp',
-    desc: 'SFTP Write',
-    format: ({ user, path, ...rest }) =>
-      `User [${user}] wrote to file [${path}] on node [${
-        rest['server_hostname'] || rest['addr.local']
-      }]`,
-  },
-  [eventCodes.SFTP_WRITE_FAILURE]: {
-    type: 'sftp',
-    desc: 'SFTP Write Failed',
-    format: ({ user, path, error, ...rest }) =>
-      `User [${user}] failed to write to file [${path}] on node [${
-        rest['server_hostname'] || rest['addr.local']
-      }]: [${error}]`,
-  },
-  [eventCodes.SFTP_LSTAT]: {
-    type: 'sftp',
-    desc: 'SFTP Lstat',
-    format: ({ user, path, ...rest }) =>
-      `User [${user}] queried attributes of file [${path}] on node [${
-        rest['server_hostname'] || rest['addr.local']
-      }]`,
-  },
-  [eventCodes.SFTP_LSTAT_FAILURE]: {
-    type: 'sftp',
-    desc: 'SFTP Lstat Failed',
-    format: ({ user, path, error, ...rest }) =>
-      `User [${user}] failed to query attributes of file [${path}] on node [${
-        rest['server_hostname'] || rest['addr.local']
-      }]: [${error}]`,
-  },
-  [eventCodes.SFTP_FSTAT]: {
-    type: 'sftp',
-    desc: 'SFTP Fstat',
-    format: ({ user, path, ...rest }) =>
-      `User [${user}] queried attributes of file [${path}] on node [${
-        rest['server_hostname'] || rest['addr.local']
-      }]`,
-  },
-  [eventCodes.SFTP_FSTAT_FAILURE]: {
-    type: 'sftp',
-    desc: 'SFTP Fstat Failed',
-    format: ({ user, path, error, ...rest }) =>
-      `User [${user}] failed to query attributes of file [${path}] on node [${
-        rest['server_hostname'] || rest['addr.local']
-      }]: [${error}]`,
-  },
   [eventCodes.SFTP_SETSTAT]: {
     type: 'sftp',
     desc: 'SFTP Setstat',
@@ -366,22 +322,6 @@ export const formatters: Formatters = {
   [eventCodes.SFTP_SETSTAT_FAILURE]: {
     type: 'sftp',
     desc: 'SFTP Setstat Failed',
-    format: ({ user, path, error, ...rest }) =>
-      `User [${user}] failed to change attributes of file [${path}] on node [${
-        rest['server_hostname'] || rest['addr.local']
-      }]: [${error}]`,
-  },
-  [eventCodes.SFTP_FSETSTAT]: {
-    type: 'sftp',
-    desc: 'SFTP Fsetstat',
-    format: ({ user, path, ...rest }) =>
-      `User [${user}] changed attributes of file [${path}] on node [${
-        rest['server_hostname'] || rest['addr.local']
-      }]`,
-  },
-  [eventCodes.SFTP_FSETSTAT_FAILURE]: {
-    type: 'sftp',
-    desc: 'SFTP Fsetstat Failed',
     format: ({ user, path, error, ...rest }) =>
       `User [${user}] failed to change attributes of file [${path}] on node [${
         rest['server_hostname'] || rest['addr.local']
@@ -467,38 +407,6 @@ export const formatters: Formatters = {
         rest['server_hostname'] || rest['addr.local']
       }]: [${error}]`,
   },
-  [eventCodes.SFTP_REALPATH]: {
-    type: 'sftp',
-    desc: 'SFTP Realpath',
-    format: ({ user, path, ...rest }) =>
-      `User [${user}] queried absolute path of file [${path}] on node [${
-        rest['server_hostname'] || rest['addr.local']
-      }]`,
-  },
-  [eventCodes.SFTP_REALPATH_FAILURE]: {
-    type: 'sftp',
-    desc: 'SFTP Realpath Failed',
-    format: ({ user, path, error, ...rest }) =>
-      `User [${user}] failed to query absolute path of file [${path}] on node [${
-        rest['server_hostname'] || rest['addr.local']
-      }]: [${error}]`,
-  },
-  [eventCodes.SFTP_STAT]: {
-    type: 'sftp',
-    desc: 'SFTP Stat',
-    format: ({ user, path, ...rest }) =>
-      `User [${user}] queried attributes of file [${path}] on node [${
-        rest['server_hostname'] || rest['addr.local']
-      }]`,
-  },
-  [eventCodes.SFTP_STAT_FAILURE]: {
-    type: 'sftp',
-    desc: 'SFTP Stat Failed',
-    format: ({ user, path, error, ...rest }) =>
-      `User [${user}] failed to query attributes of file [${path}] on node [${
-        rest['server_hostname'] || rest['addr.local']
-      }]: [${error}]`,
-  },
   [eventCodes.SFTP_RENAME]: {
     type: 'sftp',
     desc: 'SFTP Rename',
@@ -512,22 +420,6 @@ export const formatters: Formatters = {
     desc: 'SFTP Rename Failed',
     format: ({ user, path, error, ...rest }) =>
       `User [${user}] failed to rename file [${path}] on node [${
-        rest['server_hostname'] || rest['addr.local']
-      }]: [${error}]`,
-  },
-  [eventCodes.SFTP_READLINK]: {
-    type: 'sftp',
-    desc: 'SFTP Readlink',
-    format: ({ user, path, ...rest }) =>
-      `User [${user}] read symbolic link [${path}] on node [${
-        rest['server_hostname'] || rest['addr.local']
-      }]`,
-  },
-  [eventCodes.SFTP_READLINK_FAILURE]: {
-    type: 'sftp',
-    desc: 'SFTP Readlink Failed',
-    format: ({ user, path, error, ...rest }) =>
-      `User [${user}] failed to read symbolic link [${path}] on node [${
         rest['server_hostname'] || rest['addr.local']
       }]: [${error}]`,
   },
@@ -547,6 +439,30 @@ export const formatters: Formatters = {
         rest['server_hostname'] || rest['addr.local']
       }]: [${error}]`,
   },
+  [eventCodes.SFTP_LINK]: {
+    type: 'sftp',
+    desc: 'SFTP Link',
+    format: ({ user, path, ...rest }) =>
+      `User [${user}] created hard link [${path}] on node [${
+        rest['server_hostname'] || rest['addr.local']
+      }]`,
+  },
+  [eventCodes.SFTP_LINK_FAILURE]: {
+    type: 'sftp',
+    desc: 'SFTP Link Failed',
+    format: ({ user, path, error, ...rest }) =>
+      `User [${user}] failed to create hard link [${path}] on node [${
+        rest['server_hostname'] || rest['addr.local']
+      }]: [${error}]`,
+  },
+  [eventCodes.SFTP_DISALLOWED]: {
+    type: 'sftp',
+    desc: 'SFTP Disallowed',
+    format: ({ user, ...rest }) =>
+      `User [${user}] was blocked from creating an SFTP session on node [${
+        rest['server_hostname'] || rest['addr.local']
+      }]`,
+  },
   [eventCodes.SESSION_JOIN]: {
     type: 'session.join',
     desc: 'User Joined',
@@ -562,9 +478,9 @@ export const formatters: Formatters = {
 
       if (event.proto === 'kube') {
         if (!event.kubernetes_cluster) {
-          return `User [${user}] has ended a kubernetes session [${event.sid}]`;
+          return `User [${user}] has ended a Kubernetes session [${event.sid}]`;
         }
-        return `User [${user}] has ended a session [${event.sid}] on kubernetes cluster [${event.kubernetes_cluster}]`;
+        return `User [${user}] has ended a session [${event.sid}] on Kubernetes cluster [${event.kubernetes_cluster}]`;
       }
 
       if (!event.interactive) {
@@ -595,7 +511,20 @@ export const formatters: Formatters = {
   [eventCodes.SESSION_START]: {
     type: 'session.start',
     desc: 'Session Started',
-    format: ({ user, sid }) => `User [${user}] has started a session [${sid}]`,
+    format: event => {
+      const user = event.user || '';
+
+      if (event.proto === 'kube') {
+        if (!event.kubernetes_cluster) {
+          return `User [${user}] has started a Kubernetes session [${event.sid}]`;
+        }
+        return `User [${user}] has started a session [${event.sid}] on Kubernetes cluster [${event.kubernetes_cluster}]`;
+      }
+
+      const node =
+        event.server_hostname || event.server_addr || event.server_id;
+      return `User [${user}] has started a session [${event.sid}] on node [${node}] `;
+    },
   },
   [eventCodes.SESSION_UPLOAD]: {
     type: 'session.upload',
@@ -698,6 +627,48 @@ export const formatters: Formatters = {
     desc: 'SSO Test Flow Login Failed',
     format: ({ error }) => `SSO Test flow: user login failed [${error}]`,
   },
+  [eventCodes.USER_HEADLESS_LOGIN_REQUESTED]: {
+    type: 'user.login',
+    desc: 'Headless Login Requested',
+    format: ({ user }) => `Headless login was requested for user [${user}]`,
+  },
+  [eventCodes.USER_HEADLESS_LOGIN_APPROVED]: {
+    type: 'user.login',
+    desc: 'Headless Login Approved',
+    format: ({ user }) =>
+      `User [${user}] successfully approved headless login request`,
+  },
+  [eventCodes.USER_HEADLESS_LOGIN_APPROVEDFAILURE]: {
+    type: 'user.login',
+    desc: 'Headless Login Failed',
+    format: ({ user, error }) =>
+      `User [${user}] tried to approve headless login request, but got an error [${error}]`,
+  },
+  [eventCodes.USER_HEADLESS_LOGIN_REJECTED]: {
+    type: 'user.login',
+    desc: 'Headless Login Rejected',
+    format: ({ user }) => `User [${user}] rejected headless login request`,
+  },
+  [eventCodes.CREATE_MFA_AUTH_CHALLENGE]: {
+    type: 'mfa_auth_challenge.create',
+    desc: 'MFA Authentication Attempt',
+    format: ({ user }) => {
+      if (user) {
+        return `User [${user}] requested an MFA authentication challenge`;
+      }
+      return `Passwordless user requested an MFA authentication challenge`;
+    },
+  },
+  [eventCodes.VALIDATE_MFA_AUTH_RESPONSE]: {
+    type: 'mfa_auth_challenge.validate',
+    desc: 'MFA Authentication Success',
+    format: ({ user }) => `User [${user}] completed MFA authentication`,
+  },
+  [eventCodes.VALIDATE_MFA_AUTH_RESPONSEFAILURE]: {
+    type: 'mfa_auth_challenge.validate',
+    desc: 'MFA Authentication Failure',
+    format: ({ user }) => `User [${user}] failed MFA authentication`,
+  },
   [eventCodes.ROLE_CREATED]: {
     type: 'role.created',
     desc: 'User Role Created',
@@ -707,6 +678,11 @@ export const formatters: Formatters = {
     type: 'role.deleted',
     desc: 'User Role Deleted',
     format: ({ user, name }) => `User [${user}] deleted a role [${name}]`,
+  },
+  [eventCodes.ROLE_UPDATED]: {
+    type: 'role.updated',
+    desc: 'User Role Updated',
+    format: ({ user, name }) => `User [${user}] updated a role [${name}]`,
   },
   [eventCodes.TRUSTED_CLUSTER_TOKEN_CREATED]: {
     type: 'trusted_cluster_token.create',
@@ -735,25 +711,25 @@ export const formatters: Formatters = {
     type: 'kube.request',
     desc: 'Kubernetes Request',
     format: ({ user, kubernetes_cluster, verb, request_path, response_code }) =>
-      `User [${user}] received a [${response_code}] from a [${verb} ${request_path}] request to kubernetes cluster [${kubernetes_cluster}]`,
+      `User [${user}] received a [${response_code}] from a [${verb} ${request_path}] request to Kubernetes cluster [${kubernetes_cluster}]`,
   },
   [eventCodes.KUBE_CREATED]: {
     type: 'kube.create',
     desc: 'Kubernetes Created',
     format: ({ user, name }) =>
-      `User [${user}] created kubernetes cluster [${name}]`,
+      `User [${user}] created Kubernetes cluster [${name}]`,
   },
   [eventCodes.KUBE_UPDATED]: {
     type: 'kube.update',
     desc: 'Kubernetes Updated',
     format: ({ user, name }) =>
-      `User [${user}] updated kubernetes cluster [${name}]`,
+      `User [${user}] updated Kubernetes cluster [${name}]`,
   },
   [eventCodes.KUBE_DELETED]: {
     type: 'kube.delete',
     desc: 'Kubernetes Deleted',
     format: ({ user, name }) =>
-      `User [${user}] deleted kubernetes cluster [${name}]`,
+      `User [${user}] deleted Kubernetes cluster [${name}]`,
   },
   [eventCodes.DATABASE_SESSION_STARTED]: {
     type: 'db.session.start',
@@ -798,10 +774,62 @@ export const formatters: Formatters = {
       )}] in database [${db_name}] on [${db_service}] failed`,
   },
   [eventCodes.DATABASE_SESSION_MALFORMED_PACKET]: {
-    type: 'db.session.malformed_packet"',
+    type: 'db.session.malformed_packet',
     desc: 'Database Malformed Packet',
     format: ({ user, db_service, db_name }) =>
       `Received malformed packet from [${user}] in [${db_name}] on database [${db_service}]`,
+  },
+  [eventCodes.DATABASE_SESSION_PERMISSIONS_UPDATE]: {
+    type: 'db.session.permissions.update',
+    desc: 'Database User Permissions Updated',
+    format: ({ user, db_service, db_name, permission_summary }) => {
+      if (!permission_summary) {
+        return `Database user [${user}] permissions updated for database [${db_name}] on [${db_service}]`;
+      }
+      const summary = permission_summary
+        .map(p => {
+          const details = Object.entries(p.counts)
+            .map(([key, value]) => `${key}:${value}`)
+            .join(',');
+          return `${p.permission}:${details}`;
+        })
+        .join('; ');
+      return `Database user [${user}] permissions updated for database [${db_name}] on [${db_service}]: ${summary}`;
+    },
+  },
+  [eventCodes.DATABASE_SESSION_USER_CREATE]: {
+    type: 'db.session.user.create',
+    desc: 'Database User Created',
+    format: ev => {
+      if (!ev.roles) {
+        return `Database user [${ev.user}] created in database [${ev.db_service}]`;
+      }
+      return `Database user [${ev.user}] created in database [${ev.db_service}], roles: [${ev.roles}]`;
+    },
+  },
+  [eventCodes.DATABASE_SESSION_USER_CREATE_FAILURE]: {
+    type: 'db.session.user.create',
+    desc: 'Database User Creation Failed',
+    format: ev => {
+      return `Failed to create database user [${ev.user}] in database [${ev.db_service}], error: [${ev.error}]`;
+    },
+  },
+  [eventCodes.DATABASE_SESSION_USER_DEACTIVATE]: {
+    type: 'db.session.user.deactivate',
+    desc: 'Database User Deactivated',
+    format: ev => {
+      if (!ev.delete) {
+        return `Database user [${ev.user}] disabled in database [${ev.db_service}]`;
+      }
+      return `Database user [${ev.user}] deleted in database [${ev.db_service}]`;
+    },
+  },
+  [eventCodes.DATABASE_SESSION_USER_DEACTIVATE_FAILURE]: {
+    type: 'db.session.user.deactivate',
+    desc: 'Database User Deactivate Failure',
+    format: ev => {
+      return `Failed to disable database user [${ev.user}] in database [${ev.db_service}], error: [${ev.error}]`;
+    },
   },
   [eventCodes.DATABASE_CREATED]: {
     type: 'db.create',
@@ -1111,10 +1139,10 @@ export const formatters: Formatters = {
   [eventCodes.DESKTOP_SESSION_STARTED]: {
     type: 'windows.desktop.session.start',
     desc: 'Windows Desktop Session Started',
-    format: ({ user, windows_domain, desktop_addr, windows_user }) => {
-      let message = `User [${user}] has connected to Windows desktop [${windows_user}@${desktop_addr}]`;
+    format: ({ user, windows_domain, desktop_name, sid, windows_user }) => {
+      let message = `User [${user}] started session ${sid} on Windows desktop [${windows_user}@${desktop_name}]`;
       if (windows_domain) {
-        message += ` on [${windows_domain}]`;
+        message += ` with domain [${windows_domain}]`;
       }
       return message;
     },
@@ -1122,10 +1150,10 @@ export const formatters: Formatters = {
   [eventCodes.DESKTOP_SESSION_STARTED_FAILED]: {
     type: 'windows.desktop.session.start',
     desc: 'Windows Desktop Session Denied',
-    format: ({ user, windows_domain, desktop_addr, windows_user }) => {
-      let message = `User [${user}] was denied access to Windows desktop [${windows_user}@${desktop_addr}]`;
+    format: ({ user, windows_domain, desktop_name, windows_user }) => {
+      let message = `User [${user}] was denied access to Windows desktop [${windows_user}@${desktop_name}]`;
       if (windows_domain) {
-        message += ` on [${windows_domain}]`;
+        message += ` with domain [${windows_domain}]`;
       }
       return message;
     },
@@ -1133,12 +1161,12 @@ export const formatters: Formatters = {
   [eventCodes.DESKTOP_SESSION_ENDED]: {
     type: 'windows.desktop.session.end',
     desc: 'Windows Desktop Session Ended',
-    format: ({ user, windows_domain, desktop_addr, windows_user }) => {
-      let desktopMessage = `[${windows_user}@${desktop_addr}]`;
+    format: ({ user, windows_domain, desktop_name, sid, windows_user }) => {
+      let desktopMessage = `[${windows_user}@${desktop_name}]`;
       if (windows_domain) {
-        desktopMessage += ` on [${windows_domain}]`;
+        desktopMessage += ` with domain [${windows_domain}]`;
       }
-      let message = `Session for Windows desktop ${desktopMessage} has ended for user [${user}]`;
+      let message = `Session ${sid} for Windows desktop ${desktopMessage} has ended for user [${user}]`;
       return message;
     },
   },
@@ -1192,7 +1220,7 @@ export const formatters: Formatters = {
   },
   [eventCodes.DEVICE_CREATE]: {
     type: 'device.create',
-    desc: 'Device Register',
+    desc: 'Device Registered',
     format: ({ user, status, success }) =>
       success || (status && status.success)
         ? `User [${user}] has registered a device`
@@ -1200,7 +1228,7 @@ export const formatters: Formatters = {
   },
   [eventCodes.DEVICE_DELETE]: {
     type: 'device.delete',
-    desc: 'Device Delete',
+    desc: 'Device Deleted',
     format: ({ user, status, success }) =>
       success || (status && status.success)
         ? `User [${user}] has deleted a device`
@@ -1208,7 +1236,7 @@ export const formatters: Formatters = {
   },
   [eventCodes.DEVICE_AUTHENTICATE]: {
     type: 'device.authenticate',
-    desc: 'Device Authenticate',
+    desc: 'Device Authenticated',
     format: ({ user, status, success }) =>
       success || (status && status.success)
         ? `User [${user}] has successfully authenticated their device`
@@ -1216,7 +1244,7 @@ export const formatters: Formatters = {
   },
   [eventCodes.DEVICE_ENROLL]: {
     type: 'device.enroll',
-    desc: 'Device Enrollment',
+    desc: 'Device Enrolled',
     format: ({ user, status, success }) =>
       success || (status && status.success)
         ? `User [${user}] has successfully enrolled their device`
@@ -1224,7 +1252,7 @@ export const formatters: Formatters = {
   },
   [eventCodes.DEVICE_ENROLL_TOKEN_CREATE]: {
     type: 'device.token.create',
-    desc: 'Device Enroll Token Create',
+    desc: 'Device Enroll Token Created',
     format: ({ user, status, success }) =>
       success || (status && status.success)
         ? `User [${user}] created a device enroll token`
@@ -1240,11 +1268,27 @@ export const formatters: Formatters = {
   },
   [eventCodes.DEVICE_UPDATE]: {
     type: 'device.update',
-    desc: 'Device Update',
+    desc: 'Device Updated',
     format: ({ user, status, success }) =>
       success || (status && status.success)
         ? `User [${user}] has updated a device`
         : `User [${user}] has failed to update a device`,
+  },
+  [eventCodes.DEVICE_WEB_TOKEN_CREATE]: {
+    type: 'device.webtoken.create',
+    desc: 'Device Web Token Created',
+    format: ({ user, status, success }) =>
+      success || (status && status.success)
+        ? `User [${user}] has issued a device web token`
+        : `User [${user}] has failed to issue a device web token`,
+  },
+  [eventCodes.DEVICE_AUTHENTICATE_CONFIRM]: {
+    type: 'device.authenticate.confirm',
+    desc: 'Device Web Authentication Confirmed',
+    format: ({ user, status, success }) =>
+      success || (status && status.success)
+        ? `User [${user}] has confirmed device web authentication`
+        : `User [${user}] has failed to confirm device web authentication`,
   },
   [eventCodes.X11_FORWARD]: {
     type: 'x11-forward',
@@ -1308,11 +1352,67 @@ export const formatters: Formatters = {
       return `Bot [${bot_name}] joined the cluster using the [${method}] join method`;
     },
   },
+  [eventCodes.BOT_JOIN_FAILURE]: {
+    type: 'bot.join',
+    desc: 'Bot Join Failed',
+    format: ({ bot_name }) => {
+      return `Bot [${bot_name || 'unknown'}] failed to join the cluster`;
+    },
+  },
   [eventCodes.INSTANCE_JOIN]: {
     type: 'instance.join',
     desc: 'Instance Joined',
     format: ({ node_name, role, method }) => {
       return `Instance [${node_name}] joined the cluster with the [${role}] role using the [${method}] join method`;
+    },
+  },
+  [eventCodes.INSTANCE_JOIN_FAILURE]: {
+    type: 'instance.join',
+    desc: 'Instance Join Failed',
+    format: ({ node_name }) => {
+      return `Instance [${node_name || 'unknown'}] failed to join the cluster`;
+    },
+  },
+  [eventCodes.BOT_CREATED]: {
+    type: 'bot.create',
+    desc: 'Bot Created',
+    format: ({ user, name }) => {
+      return `User [${user}] created a Bot [${name}]`;
+    },
+  },
+  [eventCodes.BOT_UPDATED]: {
+    type: 'bot.update',
+    desc: 'Bot Updated',
+    format: ({ user, name }) => {
+      return `User [${user}] modified a Bot [${name}]`;
+    },
+  },
+  [eventCodes.BOT_DELETED]: {
+    type: 'bot.delete',
+    desc: 'Bot Deleted',
+    format: ({ user, name }) => {
+      return `User [${user}] deleted a Bot [${name}]`;
+    },
+  },
+  [eventCodes.WORKLOAD_IDENTITY_CREATE]: {
+    type: 'workload_identity.create',
+    desc: 'Workload Identity Created',
+    format: ({ user, name }) => {
+      return `User [${user}] created a Workload Identity [${name}]`;
+    },
+  },
+  [eventCodes.WORKLOAD_IDENTITY_UPDATE]: {
+    type: 'workload_identity.update',
+    desc: 'Workload Identity Updated',
+    format: ({ user, name }) => {
+      return `User [${user}] updated a Workload Identity [${name}]`;
+    },
+  },
+  [eventCodes.WORKLOAD_IDENTITY_DELETE]: {
+    type: 'workload_identity.delete',
+    desc: 'Workload Identity Deleted',
+    format: ({ user, name }) => {
+      return `User [${user}] deleted a Workload Identity [${name}]`;
     },
   },
   [eventCodes.LOGIN_RULE_CREATE]: {
@@ -1433,6 +1533,27 @@ export const formatters: Formatters = {
     format: ({ name, source, user }) =>
       `Okta assignment [${name}], source [${source}], user [${user}] cleanup has failed`,
   },
+  [eventCodes.OKTA_USER_SYNC]: {
+    type: 'okta.user.sync',
+    desc: 'Okta user synchronization completed',
+    format: ({ num_users_created, num_users_modified, num_users_deleted }) =>
+      `[${num_users_created}] users added, [${num_users_modified}] users updated, [${num_users_deleted}] users deleted`,
+  },
+  [eventCodes.OKTA_USER_SYNC_FAILURE]: {
+    type: 'okta.user.sync',
+    desc: 'Okta user synchronization failed',
+    format: () => `Okta user synchronization failed`,
+  },
+  [eventCodes.OKTA_ACCESS_LIST_SYNC]: {
+    type: 'okta.access_list.sync',
+    desc: 'Okta access list synchronization completed',
+    format: () => `Okta access list synchronization successfully completed`,
+  },
+  [eventCodes.OKTA_ACCESS_LIST_SYNC_FAILURE]: {
+    type: 'okta.access_list.sync',
+    desc: 'Okta access list synchronization failed',
+    format: () => `Okta access list synchronization failed`,
+  },
   [eventCodes.ACCESS_LIST_CREATE]: {
     type: 'access_list.create',
     desc: 'Access list created',
@@ -1479,43 +1600,55 @@ export const formatters: Formatters = {
     type: 'access_list.review',
     desc: 'Access list review failed',
     format: ({ name, updated_by }) =>
-      `User [${updated_by}] failed to to review access list [${name}]]`,
+      `User [${updated_by}] failed to to review access list [${name}]`,
   },
   [eventCodes.ACCESS_LIST_MEMBER_CREATE]: {
     type: 'access_list.member.create',
     desc: 'Access list member added',
-    format: ({ access_list_name, member_name, updated_by }) =>
-      `User [${updated_by}] added member [${member_name}] to access list [${access_list_name}]`,
+    format: ({ access_list_name, members, updated_by }) =>
+      `User [${updated_by}] added ${formatMembers(
+        members
+      )} to access list [${access_list_name}]`,
   },
   [eventCodes.ACCESS_LIST_MEMBER_CREATE_FAILURE]: {
     type: 'access_list.member.create',
     desc: 'Access list member addition failure',
-    format: ({ access_list_name, member_name, updated_by }) =>
-      `User [${updated_by}] failed to add member [${member_name}] to access list [${access_list_name}]`,
+    format: ({ access_list_name, members, updated_by }) =>
+      `User [${updated_by}] failed to add ${formatMembers(
+        members
+      )} to access list [${access_list_name}]`,
   },
   [eventCodes.ACCESS_LIST_MEMBER_UPDATE]: {
     type: 'access_list.member.update',
     desc: 'Access list member updated',
-    format: ({ access_list_name, member_name, updated_by }) =>
-      `User [${updated_by}] updated member [${member_name}] in access list [${access_list_name}]`,
+    format: ({ access_list_name, members, updated_by }) =>
+      `User [${updated_by}] updated ${formatMembers(
+        members
+      )} in access list [${access_list_name}]`,
   },
   [eventCodes.ACCESS_LIST_MEMBER_UPDATE_FAILURE]: {
     type: 'access_list.member.update',
     desc: 'Access list member update failure',
-    format: ({ access_list_name, member_name, updated_by }) =>
-      `User [${updated_by}] failed to update member [${member_name}] in access list [${access_list_name}]`,
+    format: ({ access_list_name, members, updated_by }) =>
+      `User [${updated_by}] failed to update ${formatMembers(
+        members
+      )} in access list [${access_list_name}]`,
   },
   [eventCodes.ACCESS_LIST_MEMBER_DELETE]: {
     type: 'access_list.member.delete',
     desc: 'Access list member removed',
-    format: ({ access_list_name, member_name, updated_by }) =>
-      `User [${updated_by}] removed member [${member_name}] from access list [${access_list_name}]`,
+    format: ({ access_list_name, members, updated_by }) =>
+      `User [${updated_by}] removed ${formatMembers(
+        members
+      )} from access list [${access_list_name}]`,
   },
   [eventCodes.ACCESS_LIST_MEMBER_DELETE_FAILURE]: {
     type: 'access_list.member.delete',
     desc: 'Access list member removal failure',
-    format: ({ access_list_name, member_name, updated_by }) =>
-      `User [${updated_by}] failed to remove member [${member_name}] from access list [${access_list_name}]`,
+    format: ({ access_list_name, members, updated_by }) =>
+      `User [${updated_by}] failed to remove ${formatMembers(
+        members
+      )} from access list [${access_list_name}]`,
   },
   [eventCodes.ACCESS_LIST_MEMBER_DELETE_ALL_FOR_ACCESS_LIST]: {
     type: 'access_list.member.delete_all_members',
@@ -1529,11 +1662,299 @@ export const formatters: Formatters = {
     format: ({ access_list_name, updated_by }) =>
       `User [${updated_by}] failed to remove all members from access list [${access_list_name}]`,
   },
+  [eventCodes.USER_LOGIN_INVALID_ACCESS_LIST]: {
+    type: 'user_login.invalid_access_list',
+    desc: 'Access list skipped.',
+    format: ({ access_list_name, user, missing_roles }) =>
+      `Access list [${access_list_name}] is invalid and was skipped for member [${user}] because it references non-existent role${missing_roles.length > 1 ? 's' : ''} [${missing_roles}]`,
+  },
+  [eventCodes.SECURITY_REPORT_AUDIT_QUERY_RUN]: {
+    type: 'secreports.audit.query.run"',
+    desc: 'Access Monitoring Query Executed',
+    format: ({ user, query }) =>
+      `User [${user}] executed Access Monitoring query [${truncateStr(
+        query,
+        80
+      )}]`,
+  },
+  [eventCodes.SECURITY_REPORT_RUN]: {
+    type: 'secreports.report.run""',
+    desc: 'Access Monitoring Report Executed',
+    format: ({ user, name }) =>
+      `User [${user}] executed [${name}] access monitoring report`,
+  },
+  [eventCodes.EXTERNAL_AUDIT_STORAGE_ENABLE]: {
+    type: 'external_audit_storage.enable',
+    desc: 'External Audit Storage Enabled',
+    format: ({ updated_by }) =>
+      `User [${updated_by}] enabled External Audit Storage`,
+  },
+  [eventCodes.EXTERNAL_AUDIT_STORAGE_DISABLE]: {
+    type: 'external_audit_storage.disable',
+    desc: 'External Audit Storage Disabled',
+    format: ({ updated_by }) =>
+      `User [${updated_by}] disabled External Audit Storage`,
+  },
+  [eventCodes.SPIFFE_SVID_ISSUED]: {
+    type: 'spiffe.svid.issued',
+    desc: 'SPIFFE SVID Issued',
+    format: ({ user, spiffe_id }) =>
+      `User [${user}] issued SPIFFE SVID [${spiffe_id}]`,
+  },
+  [eventCodes.SPIFFE_SVID_ISSUED_FAILURE]: {
+    type: 'spiffe.svid.issued',
+    desc: 'SPIFFE SVID Issued Failure',
+    format: ({ user, spiffe_id }) =>
+      `User [${user}] failed to issue SPIFFE SVID [${spiffe_id}]`,
+  },
+  [eventCodes.AUTH_PREFERENCE_UPDATE]: {
+    type: 'auth_preference.update',
+    desc: 'Cluster Authentication Preferences Updated',
+    format: ({ user }) =>
+      `User [${user}] updated the cluster authentication preferences`,
+  },
+  [eventCodes.CLUSTER_NETWORKING_CONFIG_UPDATE]: {
+    type: 'cluster_networking_config.update',
+    desc: 'Cluster Networking Configuration Updated',
+    format: ({ user }) =>
+      `User [${user}] updated the cluster networking configuration`,
+  },
+  [eventCodes.SESSION_RECORDING_CONFIG_UPDATE]: {
+    type: 'session_recording_config.update',
+    desc: 'Session Recording Configuration Updated',
+    format: ({ user }) =>
+      `User [${user}] updated the cluster session recording configuration`,
+  },
+  [eventCodes.ACCESS_GRAPH_PATH_CHANGED]: {
+    type: 'access_graph.path.changed',
+    desc: 'Access Path Changed',
+    format: ({
+      affected_resource_kind,
+      affected_resource_name,
+      affected_resource_source,
+    }) =>
+      `Access path for ${affected_resource_kind || 'Node'} [${affected_resource_name}/${affected_resource_source}] changed`,
+  },
+  [eventCodes.SPANNER_RPC]: {
+    type: 'db.session.spanner.rpc',
+    desc: 'Spanner RPC',
+    format: ({ args, user, procedure, db_name, db_service }) => {
+      if (args.sql) {
+        return `User [${user}] executed query [${truncateStr(
+          args.sql,
+          80
+        )}] in database [${db_name}] on [${db_service}]`;
+      }
+      return `User [${user}] called [${procedure}] in database [${db_name}] on [${db_service}]`;
+    },
+  },
+  [eventCodes.SPANNER_RPC_DENIED]: {
+    type: 'db.session.spanner.rpc',
+    desc: 'Spanner RPC Denied',
+    format: ({ args, user, procedure, db_name, db_service }) => {
+      if (args.sql) {
+        return `User [${user}] attempted to execute query [${truncateStr(
+          args.sql,
+          80
+        )}] in database [${db_name}] on [${db_service}]`;
+      }
+      return `User [${user}] attempted to call [${procedure}] in database [${db_name}] on [${db_service}]`;
+    },
+  },
+  [eventCodes.DISCOVERY_CONFIG_CREATE]: {
+    type: 'discovery_config.create',
+    desc: 'Discovery Config Created',
+    format: ({ user, name }) => {
+      return `User [${user}] created a discovery config [${name}]`;
+    },
+  },
+  [eventCodes.DISCOVERY_CONFIG_UPDATE]: {
+    type: 'discovery_config.update',
+    desc: 'Discovery Config Updated',
+    format: ({ user, name }) => {
+      return `User [${user}] updated a discovery config [${name}]`;
+    },
+  },
+  [eventCodes.DISCOVERY_CONFIG_DELETE]: {
+    type: 'discovery_config.delete',
+    desc: 'Discovery Config Deleted',
+    format: ({ user, name }) => {
+      return `User [${user}] deleted a discovery config [${name}]`;
+    },
+  },
+  [eventCodes.DISCOVERY_CONFIG_DELETE_ALL]: {
+    type: 'discovery_config.delete_all',
+    desc: 'All Discovery Configs Deleted',
+    format: ({ user }) => {
+      return `User [${user}] deleted all discovery configs`;
+    },
+  },
+  [eventCodes.INTEGRATION_CREATE]: {
+    type: 'integration.create',
+    desc: 'Integration Created',
+    format: ({ user, name }) => {
+      return `User [${user}] created an integration [${name}]`;
+    },
+  },
+  [eventCodes.INTEGRATION_UPDATE]: {
+    type: 'integration.update',
+    desc: 'Integration Updated',
+    format: ({ user, name }) => {
+      return `User [${user}] updated an integration [${name}]`;
+    },
+  },
+  [eventCodes.INTEGRATION_DELETE]: {
+    type: 'integration.delete',
+    desc: 'Integration Deleted',
+    format: ({ user, name }) => {
+      return `User [${user}] deleted an integration [${name}]`;
+    },
+  },
+  [eventCodes.STATIC_HOST_USER_CREATE]: {
+    type: 'static_host_user.create',
+    desc: 'Static Host User Created',
+    format: ({ user, name }) => {
+      return `User [${user}] created a static host user [${name}]`;
+    },
+  },
+  [eventCodes.STATIC_HOST_USER_UPDATE]: {
+    type: 'static_host_user.update',
+    desc: 'Static Host User Updated',
+    format: ({ user, name }) => {
+      return `User [${user}] updated a static host user [${name}]`;
+    },
+  },
+  [eventCodes.STATIC_HOST_USER_DELETE]: {
+    type: 'static_host_user.delete',
+    desc: 'Static Host User Deleted',
+    format: ({ user, name }) => {
+      return `User [${user}] deleted a static host user [${name}]`;
+    },
+  },
+  [eventCodes.CROWN_JEWEL_CREATE]: {
+    type: 'access_graph.crown_jewel.create',
+    desc: 'Crown Jewel Created',
+    format: ({ user, name }) => {
+      return `User [${user}] created a crown jewel [${name}]`;
+    },
+  },
+  [eventCodes.CROWN_JEWEL_UPDATE]: {
+    type: 'access_graph.crown_jewel.update',
+    desc: 'Crown Jewel Updated',
+    format: ({ user, name }) => {
+      return `User [${user}] updated a crown jewel [${name}]`;
+    },
+  },
+  [eventCodes.CROWN_JEWEL_DELETE]: {
+    type: 'access_graph.crown_jewel.delete',
+    desc: 'Crown Jewel Deleted',
+    format: ({ user, name }) => {
+      return `User [${user}] deleted a crown jewel [${name}]`;
+    },
+  },
+  [eventCodes.USER_TASK_CREATE]: {
+    type: 'user_task.create',
+    desc: 'User Task Created',
+    format: ({ user, name }) => {
+      return `User [${user}] created a user task [${name}]`;
+    },
+  },
+  [eventCodes.USER_TASK_UPDATE]: {
+    type: 'user_task.update',
+    desc: 'User Task Updated',
+    format: ({ user, name }) => {
+      return `User [${user}] updated a user task [${name}]`;
+    },
+  },
+  [eventCodes.USER_TASK_DELETE]: {
+    type: 'user_task.delete',
+    desc: 'User Task Deleted',
+    format: ({ user, name }) => {
+      return `User [${user}] deleted a user task [${name}]`;
+    },
+  },
+  [eventCodes.SFTP_SUMMARY]: {
+    type: 'sftp_summary',
+    desc: 'File Transfer Completed',
+    format: ({ user, server_hostname }) => {
+      return `User [${user}] completed a file transfer on [${server_hostname}]`;
+    },
+  },
+  [eventCodes.PLUGIN_CREATE]: {
+    type: 'plugin.create',
+    desc: 'Plugin Created',
+    format: ({ user, name, plugin_type }) => {
+      return `User [${user}] created a plugin [${name}] of type [${plugin_type}]`;
+    },
+  },
+  [eventCodes.PLUGIN_UPDATE]: {
+    type: 'plugin.update',
+    desc: 'Plugin Updated',
+    format: ({ user, name, plugin_type }) => {
+      return `User [${user}] updated a plugin [${name}] of type [${plugin_type}]`;
+    },
+  },
+  [eventCodes.PLUGIN_DELETE]: {
+    type: 'plugin.delete',
+    desc: 'Plugin Deleted',
+    format: ({ user, name }) => {
+      return `User [${user}] deleted a plugin [${name}]`;
+    },
+  },
+  [eventCodes.CONTACT_CREATE]: {
+    type: 'contact.create',
+    desc: 'Contact Created',
+    format: ({ user, email, contact_type }) => {
+      return `User [${user}] created a [${contactTypeStr(contact_type)}] contact [${email}]`;
+    },
+  },
+  [eventCodes.CONTACT_DELETE]: {
+    type: 'contact.delete',
+    desc: 'Contact Deleted',
+    format: ({ user, email, contact_type }) => {
+      return `User [${user}] deleted a [${contactTypeStr(contact_type)}] contact [${email}]`;
+    },
+  },
   [eventCodes.UNKNOWN]: {
     type: 'unknown',
     desc: 'Unknown Event',
     format: ({ unknown_type, unknown_code }) =>
       `Unknown '${unknown_type}' event (${unknown_code})`,
+  },
+  [eventCodes.GIT_COMMAND]: {
+    type: 'git.command',
+    desc: 'Git Command',
+    format: ({ user, service, path, actions }) => {
+      // "git-upload-pack" are fetches like "git fetch", "git pull".
+      if (service === 'git-upload-pack') {
+        return `User [${user}] has fetched from [${path}]`;
+      }
+      // "git-receive-pack" are pushes. Usually it should have one action.
+      if (service === 'git-receive-pack') {
+        if (actions && actions.length == 1) {
+          switch (actions[0].action) {
+            case 'delete':
+              return `User [${user}] has deleted [${actions[0].reference}] from [${path}]`;
+            case 'create':
+              return `User [${user}] has created [${actions[0].reference}] on [${path}]`;
+            case 'update':
+              return `User [${user}] has updated [${actions[0].reference}] to [${actions[0].new.substring(0, 7)}] on [${path}]`;
+          }
+        }
+        return `User [${user}] has attempted a push to [${path}]`;
+      }
+      if (service && path) {
+        return `User [${user}] has executed a Git Command [${service}] at [${path}]`;
+      }
+      return `User [${user}] has executed a Git Command`;
+    },
+  },
+  [eventCodes.GIT_COMMAND_FAILURE]: {
+    type: 'git.command',
+    desc: 'Git Command Failed',
+    format: ({ user, exitError, service, path }) => {
+      return `User [${user}] Git Command [${service}] at [${path}] failed [${exitError}]`;
+    },
   },
 };
 
@@ -1545,17 +1966,15 @@ const unknownFormatter = {
 export default function makeEvent(json: any): Event {
   // lookup event formatter by code
   const formatter = formatters[json.code] || unknownFormatter;
-  const event = {
+  return {
     codeDesc: formatter.desc,
     message: formatter.format(json as any),
     id: getId(json),
     code: json.code,
     user: json.user,
-    time: json.time,
+    time: new Date(json.time),
     raw: json,
   };
-
-  return event;
 }
 
 // older events might not have an uid field.
@@ -1574,4 +1993,22 @@ function truncateStr(str: string, len: number): string {
     return str;
   }
   return str.substring(0, len - 3) + '...';
+}
+
+function formatMembers(members: { member_name: string }[]) {
+  const memberNames = members.map(m => m.member_name);
+  const memberNamesJoined = memberNames.join(', ');
+
+  return `${pluralize(memberNames.length, 'member')} [${memberNamesJoined}]`;
+}
+
+function contactTypeStr(type: number): string {
+  switch (type) {
+    case 1:
+      return 'Business';
+    case 2:
+      return 'Security';
+    default:
+      return `Unknown type: ${type}`;
+  }
 }

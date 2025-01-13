@@ -1,18 +1,20 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package proxy
 
@@ -32,6 +34,7 @@ import (
 	"golang.org/x/exp/maps"
 	authzapi "k8s.io/api/authorization/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	apimachineryversion "k8s.io/apimachinery/pkg/version"
 	"k8s.io/client-go/kubernetes"
 	authztypes "k8s.io/client-go/kubernetes/typed/authorization/v1"
 	"k8s.io/client-go/rest"
@@ -137,7 +140,6 @@ func TestGetKubeCreds(t *testing.T) {
 	rbacSupportedTypes[allowedResourcesKey{apiGroup: "resources.teleport.dev", resourceKind: "teleportroles"}] = utils.KubeCustomResource
 	rbacSupportedTypes[allowedResourcesKey{apiGroup: "resources.teleport.dev", resourceKind: "teleportroles/status"}] = utils.KubeCustomResource
 
-	logger := utils.NewLoggerForTests()
 	ctx := context.TODO()
 	const teleClusterName = "teleport-cluster"
 	dir := t.TempDir()
@@ -210,7 +212,12 @@ current-context: foo
 						kubeClient:      &kubernetes.Clientset{},
 						clientRestCfg:   &rest.Config{},
 					},
-					kubeCluster:        mustCreateKubernetesClusterV3(t, "foo"),
+					kubeCluster: mustCreateKubernetesClusterV3(t, "foo"),
+					kubeClusterVersion: &apimachineryversion.Info{
+						Major:      "1",
+						Minor:      "20",
+						GitVersion: "1.20.0",
+					},
 					rbacSupportedTypes: rbacSupportedTypes,
 				},
 				"bar": {
@@ -219,6 +226,11 @@ current-context: foo
 						transportConfig: &transport.Config{},
 						kubeClient:      &kubernetes.Clientset{},
 						clientRestCfg:   &rest.Config{},
+					},
+					kubeClusterVersion: &apimachineryversion.Info{
+						Major:      "1",
+						Minor:      "20",
+						GitVersion: "1.20.0",
 					},
 					kubeCluster:        mustCreateKubernetesClusterV3(t, "bar"),
 					rbacSupportedTypes: rbacSupportedTypes,
@@ -229,6 +241,11 @@ current-context: foo
 						transportConfig: &transport.Config{},
 						kubeClient:      &kubernetes.Clientset{},
 						clientRestCfg:   &rest.Config{},
+					},
+					kubeClusterVersion: &apimachineryversion.Info{
+						Major:      "1",
+						Minor:      "20",
+						GitVersion: "1.20.0",
 					},
 					kubeCluster:        mustCreateKubernetesClusterV3(t, "baz"),
 					rbacSupportedTypes: rbacSupportedTypes,
@@ -255,6 +272,11 @@ current-context: foo
 						kubeClient:      &kubernetes.Clientset{},
 						clientRestCfg:   &rest.Config{},
 					},
+					kubeClusterVersion: &apimachineryversion.Info{
+						Major:      "1",
+						Minor:      "20",
+						GitVersion: "1.20.0",
+					},
 					kubeCluster:        mustCreateKubernetesClusterV3(t, teleClusterName),
 					rbacSupportedTypes: rbacSupportedTypes,
 				},
@@ -273,6 +295,11 @@ current-context: foo
 						kubeClient:      &kubernetes.Clientset{},
 						clientRestCfg:   &rest.Config{},
 					},
+					kubeClusterVersion: &apimachineryversion.Info{
+						Major:      "1",
+						Minor:      "20",
+						GitVersion: "1.20.0",
+					},
 					kubeCluster:        mustCreateKubernetesClusterV3(t, "foo"),
 					rbacSupportedTypes: rbacSupportedTypes,
 				},
@@ -283,6 +310,11 @@ current-context: foo
 						kubeClient:      &kubernetes.Clientset{},
 						clientRestCfg:   &rest.Config{},
 					},
+					kubeClusterVersion: &apimachineryversion.Info{
+						Major:      "1",
+						Minor:      "20",
+						GitVersion: "1.20.0",
+					},
 					kubeCluster:        mustCreateKubernetesClusterV3(t, "bar"),
 					rbacSupportedTypes: rbacSupportedTypes,
 				},
@@ -292,6 +324,11 @@ current-context: foo
 						transportConfig: &transport.Config{},
 						kubeClient:      &kubernetes.Clientset{},
 						clientRestCfg:   &rest.Config{},
+					},
+					kubeClusterVersion: &apimachineryversion.Info{
+						Major:      "1",
+						Minor:      "20",
+						GitVersion: "1.20.0",
 					},
 					kubeCluster:        mustCreateKubernetesClusterV3(t, "baz"),
 					rbacSupportedTypes: rbacSupportedTypes,
@@ -313,7 +350,7 @@ current-context: foo
 					CheckImpersonationPermissions: tt.impersonationCheck,
 					Clock:                         clockwork.NewFakeClock(),
 				},
-				log: logger,
+				log: utils.NewSlogLoggerForTests(),
 			}
 			err := fwd.getKubeDetails(ctx)
 			tt.assertErr(t, err)
@@ -323,7 +360,7 @@ current-context: foo
 			require.Empty(t, cmp.Diff(fwd.clusterDetails, tt.want,
 				cmp.AllowUnexported(staticKubeCreds{}),
 				cmp.AllowUnexported(kubeDetails{}),
-				cmpopts.IgnoreFields(kubeDetails{}, "rwMu", "kubeCodecs", "wg", "cancelFunc"),
+				cmpopts.IgnoreFields(kubeDetails{}, "rwMu", "kubeCodecs", "wg", "cancelFunc", "gvkSupportedResources"),
 				cmp.Comparer(func(a, b *transport.Config) bool { return (a == nil) == (b == nil) }),
 				cmp.Comparer(func(a, b *tls.Config) bool { return true }),
 				cmp.Comparer(func(a, b *kubernetes.Clientset) bool { return (a == nil) == (b == nil) }),

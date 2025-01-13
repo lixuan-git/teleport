@@ -1,32 +1,45 @@
-/*
-Copyright 2019-2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 import React from 'react';
+
+import {
+  Box,
+  ButtonIcon,
+  ButtonPrimary,
+  Flex,
+  H2,
+  Indicator,
+  Text,
+} from 'design';
 import * as Alerts from 'design/Alert';
-import { ButtonIcon, Text, Indicator, Box } from 'design';
+import { DialogContent, DialogHeader } from 'design/Dialog';
 import * as Icons from 'design/Icon';
-import { DialogHeader, DialogContent } from 'design/Dialog';
 import { PrimaryAuthType } from 'shared/services';
 
+import { publicAddrWithTargetPort } from 'teleterm/services/tshd/app';
+import { getTargetNameFromUri } from 'teleterm/services/tshd/gateway';
 import { AuthSettings } from 'teleterm/ui/services/clusters/types';
 import { ClusterConnectReason } from 'teleterm/ui/services/modals';
-import { routing } from 'teleterm/ui/uri';
 
+import { outermostPadding } from '../spacing';
 import LoginForm from './FormLogin';
-import useClusterLogin, { State, Props } from './useClusterLogin';
+import useClusterLogin, { Props, State } from './useClusterLogin';
 
 export function ClusterLogin(props: Props & { reason: ClusterConnectReason }) {
   const { reason, ...otherProps } = props;
@@ -41,6 +54,7 @@ export type ClusterLoginPresentationProps = State & {
 export function ClusterLoginPresentation({
   title,
   initAttempt,
+  init,
   loginAttempt,
   clearLoginAttempt,
   onLoginWithLocal,
@@ -50,30 +64,45 @@ export function ClusterLoginPresentation({
   onAbort,
   loggedInUserName,
   shouldPromptSsoStatus,
-  webauthnLogin,
+  passwordlessLoginState,
   reason,
 }: ClusterLoginPresentationProps) {
   return (
     <>
-      <DialogHeader px={4} pt={4} mb={0}>
-        <Text typography="h4">
-          Login to <b>{title}</b>
-        </Text>
+      <DialogHeader px={outermostPadding}>
+        <H2>
+          Log in to <b>{title}</b>
+        </H2>
         <ButtonIcon ml="auto" p={3} onClick={onCloseDialog} aria-label="Close">
           <Icons.Cross size="medium" />
         </ButtonIcon>
       </DialogHeader>
-      <DialogContent mb={0}>
-        {reason && <Reason reason={reason} />}
+      <DialogContent mb={0} gap={2}>
+        {reason && (
+          <Box px={outermostPadding}>
+            <Reason reason={reason} />
+          </Box>
+        )}
 
         {initAttempt.status === 'error' && (
-          <Alerts.Danger m={4}>
-            Unable to retrieve cluster auth preferences,{' '}
-            {initAttempt.statusText}
-          </Alerts.Danger>
+          <Flex
+            px={outermostPadding}
+            flexDirection="column"
+            alignItems="flex-start"
+            gap={3}
+          >
+            <Alerts.Danger
+              details={initAttempt.statusText}
+              margin={0}
+              width="100%"
+            >
+              Unable to retrieve cluster auth preferences
+            </Alerts.Danger>
+            <ButtonPrimary onClick={init}>Retry</ButtonPrimary>
+          </Flex>
         )}
         {initAttempt.status === 'processing' && (
-          <Box textAlign="center" m={4}>
+          <Box px={outermostPadding} textAlign="center">
             <Indicator delay="none" />
           </Box>
         )}
@@ -89,7 +118,7 @@ export function ClusterLoginPresentation({
             loginAttempt={loginAttempt}
             clearLoginAttempt={clearLoginAttempt}
             shouldPromptSsoStatus={shouldPromptSsoStatus}
-            webauthnLogin={webauthnLogin}
+            passwordlessLoginState={passwordlessLoginState}
           />
         )}
       </DialogContent>
@@ -111,12 +140,22 @@ function getPrimaryAuthType(auth: AuthSettings): PrimaryAuthType {
 }
 
 function Reason({ reason }: { reason: ClusterConnectReason }) {
+  const $targetDesc = getTargetDesc(reason);
+
+  return (
+    <Text>
+      You tried to connect to {$targetDesc} but your session has expired. Please
+      log in to refresh the session.
+    </Text>
+  );
+}
+
+const getTargetDesc = (reason: ClusterConnectReason): React.ReactNode => {
   switch (reason.kind) {
     case 'reason.gateway-cert-expired': {
       const { gateway, targetUri } = reason;
-      let $targetDesc: React.ReactFragment;
       if (gateway) {
-        $targetDesc = (
+        return (
           <>
             <strong>{gateway.targetName}</strong>
             {gateway.targetUser && (
@@ -128,28 +167,15 @@ function Reason({ reason }: { reason: ClusterConnectReason }) {
           </>
         );
       } else {
-        const targetName = routing.parseDbUri(targetUri)?.params['dbId'];
-
-        if (targetName) {
-          $targetDesc = <strong>{targetName}</strong>;
-        } else {
-          $targetDesc = (
-            <>
-              a database server under <code>{targetUri}</code>
-            </>
-          );
-        }
+        return <strong>{getTargetNameFromUri(targetUri)}</strong>;
       }
-
-      return (
-        <Text px={4} pt={2} mb={0}>
-          You tried to connect to {$targetDesc} but your session has expired.
-          Please log in to refresh the session.
-        </Text>
-      );
+    }
+    case 'reason.vnet-cert-expired': {
+      return <strong>{publicAddrWithTargetPort(reason.routeToApp)}</strong>;
     }
     default: {
+      reason satisfies never;
       return;
     }
   }
-}
+};

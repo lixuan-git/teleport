@@ -1,40 +1,37 @@
-/*
-Copyright 2023 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
+import type { Location } from 'history';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { matchPath, useHistory } from 'react-router';
+import { NavLink } from 'react-router-dom';
 import styled from 'styled-components';
 
-import { ChevronRightIcon } from 'design/SVGIcon';
+import { ChevronRight } from 'design/Icon';
 
-import { NavLink } from 'react-router-dom';
-
-import { matchPath, useHistory } from 'react-router';
-
+import { useTeleport } from 'teleport';
+import { useFeatures } from 'teleport/FeaturesContext';
 import {
   commonNavigationItemStyles,
   LinkContent,
   NavigationItemSize,
 } from 'teleport/Navigation/common';
-import { useFeatures } from 'teleport/FeaturesContext';
 import { getIcon } from 'teleport/Navigation/utils';
-
-import { useTeleport } from 'teleport';
-
-import type { Location } from 'history';
-
 import type { TeleportFeature } from 'teleport/types';
 
 interface NavigationDropdownProps {
@@ -134,7 +131,7 @@ export function NavigationDropdown(props: NavigationDropdownProps) {
   const history = useHistory();
 
   const ref = useRef<HTMLDivElement>();
-  const firstLinkRef = useRef<HTMLDivElement>();
+  const firstLinkRef = useRef<HTMLAnchorElement>();
 
   const clusterId = ctx.storeUser.getClusterId();
 
@@ -291,7 +288,7 @@ export function NavigationDropdown(props: NavigationDropdownProps) {
           {props.feature.navigationItem.title}
 
           <DropdownArrow open={open}>
-            <ChevronRightIcon />
+            <ChevronRight />
           </DropdownArrow>
         </LinkContent>
       </Container>

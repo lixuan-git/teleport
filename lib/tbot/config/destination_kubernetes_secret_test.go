@@ -1,18 +1,20 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package config
 
@@ -79,6 +81,17 @@ func TestDestinationKubernetesSecret(t *testing.T) {
 			},
 		},
 		{
+			name: "labels",
+			dest: &DestinationKubernetesSecret{
+				Name: "my-secret",
+				Labels: map[string]string{
+					"key": "value",
+					"bar": "baz",
+				},
+				k8s: fakeClientSet(),
+			},
+		},
+		{
 			name: "existing secret",
 			dest: &DestinationKubernetesSecret{
 				Name: "my-secret",
@@ -97,6 +110,8 @@ func TestDestinationKubernetesSecret(t *testing.T) {
 			defer cancel()
 
 			require.NoError(t, tt.dest.Init(ctx, []string{}))
+
+			// Test individual write
 			require.NoError(t, tt.dest.Write(ctx, "artifact-a", []byte("data-a")))
 			require.NoError(t, tt.dest.Write(ctx, "artifact-b", []byte("data-b")))
 			aData, err := tt.dest.Read(ctx, "artifact-a")
@@ -105,6 +120,23 @@ func TestDestinationKubernetesSecret(t *testing.T) {
 			bData, err := tt.dest.Read(ctx, "artifact-b")
 			require.NoError(t, err)
 			require.Equal(t, []byte("data-b"), bData)
+
+			// Test write many
+			require.NoError(t, tt.dest.WriteMany(ctx, map[string][]byte{
+				"artifact-a": []byte("data-c"),
+				"artifact-b": []byte("data-d"),
+			}))
+			aData, err = tt.dest.Read(ctx, "artifact-a")
+			require.NoError(t, err)
+			require.Equal(t, []byte("data-c"), aData)
+			bData, err = tt.dest.Read(ctx, "artifact-b")
+			require.NoError(t, err)
+			require.Equal(t, []byte("data-d"), bData)
+
+			// Check labels have been set
+			secret, err := tt.dest.k8s.CoreV1().Secrets("test-namespace").Get(ctx, tt.dest.Name, metav1.GetOptions{})
+			require.NoError(t, err)
+			require.Equal(t, tt.dest.Labels, secret.Labels)
 		})
 	}
 }

@@ -1,22 +1,27 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package common
 
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sort"
 	"time"
 
@@ -24,16 +29,17 @@ import (
 	"github.com/google/uuid"
 	"github.com/gravitational/trace"
 	"github.com/gravitational/trace/trail"
-	log "github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	devicepb "github.com/gravitational/teleport/api/gen/proto/go/teleport/devicetrust/v1"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/asciitable"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/devicetrust"
 	dtnative "github.com/gravitational/teleport/lib/devicetrust/native"
 	"github.com/gravitational/teleport/lib/service/servicecfg"
+	commonclient "github.com/gravitational/teleport/tool/tctl/common/client"
+	tctlcfg "github.com/gravitational/teleport/tool/tctl/common/config"
 )
 
 // DevicesCommand implements the `tctl devices` command.
@@ -63,7 +69,7 @@ var osTypeToEnum = map[osType]devicepb.OSType{
 	windowsType: devicepb.OSType_OS_TYPE_WINDOWS,
 }
 
-func (c *DevicesCommand) Initialize(app *kingpin.Application, cfg *servicecfg.Config) {
+func (c *DevicesCommand) Initialize(app *kingpin.Application, _ *tctlcfg.GlobalCLIFlags, cfg *servicecfg.Config) {
 	devicesCmd := app.Command("devices", "Register and manage trusted devices").Hidden()
 
 	addCmd := devicesCmd.Command("add", "Register managed devices.")
@@ -105,22 +111,27 @@ func (c *DevicesCommand) Initialize(app *kingpin.Application, cfg *servicecfg.Co
 
 // runner is used as a simple interface for subcommands.
 type runner interface {
-	Run(context.Context, auth.ClientI) error
+	Run(context.Context, *authclient.Client) error
 }
 
-func (c *DevicesCommand) TryRun(ctx context.Context, selectedCommand string, authClient auth.ClientI) (match bool, err error) {
+func (c *DevicesCommand) TryRun(ctx context.Context, cmd string, clientFunc commonclient.InitFunc) (match bool, err error) {
 	innerCmd, ok := map[string]runner{
 		"devices add":    &c.add,
 		"devices ls":     &c.ls,
 		"devices rm":     &c.rm,
 		"devices enroll": &c.enroll,
 		"devices lock":   &c.lock,
-	}[selectedCommand]
+	}[cmd]
 	if !ok {
 		return false, nil
 	}
+	client, closeFn, err := clientFunc(ctx)
+	if err != nil {
+		return false, trace.Wrap(err)
+	}
+	defer closeFn(ctx)
 
-	switch err := trail.FromGRPC(innerCmd.Run(ctx, authClient)); {
+	switch err := trail.FromGRPC(innerCmd.Run(ctx, client)); {
 	case trace.IsNotImplemented(err):
 		return true, trace.AccessDenied("Device Trust requires a Teleport Enterprise Auth Server running v12 or later.")
 	default:
@@ -136,7 +147,7 @@ type deviceAddCommand struct {
 	enrollTTL time.Duration
 }
 
-func (c *deviceAddCommand) Run(ctx context.Context, authClient auth.ClientI) error {
+func (c *deviceAddCommand) Run(ctx context.Context, authClient *authclient.Client) error {
 	if _, err := c.setCurrentDevice(); err != nil {
 		return trace.Wrap(err)
 	}
@@ -204,7 +215,7 @@ tsh device enroll --token=%v
 
 type deviceListCommand struct{}
 
-func (c *deviceListCommand) Run(ctx context.Context, authClient auth.ClientI) error {
+func (c *deviceListCommand) Run(ctx context.Context, authClient *authclient.Client) error {
 	devices := authClient.DevicesClient()
 
 	// List all devices.
@@ -263,7 +274,7 @@ type deviceRemoveCommand struct {
 	deviceID string
 }
 
-func (c *deviceRemoveCommand) Run(ctx context.Context, authClient auth.ClientI) error {
+func (c *deviceRemoveCommand) Run(ctx context.Context, authClient *authclient.Client) error {
 	switch ok, err := c.setCurrentDevice(); {
 	case err != nil:
 		return trace.Wrap(err)
@@ -281,7 +292,7 @@ func (c *deviceRemoveCommand) Run(ctx context.Context, authClient auth.ClientI) 
 	devices := authClient.DevicesClient()
 
 	// Find the specified device, if necessary.
-	deviceID, name, err := findDeviceID(ctx, devices, c.deviceID, c.assetTag)
+	deviceID, name, err := findDeviceID(ctx, devices, c.deviceID, c.assetTag, c.osType)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -303,7 +314,7 @@ type deviceEnrollCommand struct {
 	ttl      time.Duration
 }
 
-func (c *deviceEnrollCommand) Run(ctx context.Context, authClient auth.ClientI) error {
+func (c *deviceEnrollCommand) Run(ctx context.Context, authClient *authclient.Client) error {
 	switch ok, err := c.setCurrentDevice(); {
 	case err != nil:
 		return trace.Wrap(err)
@@ -321,7 +332,7 @@ func (c *deviceEnrollCommand) Run(ctx context.Context, authClient auth.ClientI) 
 	devices := authClient.DevicesClient()
 
 	// Find the specified device, if necessary.
-	deviceID, name, err := findDeviceID(ctx, devices, c.deviceID, c.assetTag)
+	deviceID, name, err := findDeviceID(ctx, devices, c.deviceID, c.assetTag, c.osType)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -351,7 +362,7 @@ type deviceLockCommand struct {
 	ttl      time.Duration
 }
 
-func (c *deviceLockCommand) Run(ctx context.Context, authClient auth.ClientI) error {
+func (c *deviceLockCommand) Run(ctx context.Context, authClient *authclient.Client) error {
 	switch ok, err := c.setCurrentDevice(); {
 	case err != nil:
 		return trace.Wrap(err)
@@ -385,7 +396,7 @@ func (c *deviceLockCommand) Run(ctx context.Context, authClient auth.ClientI) er
 		expires = &t
 	}
 
-	deviceID, _, err := findDeviceID(ctx, authClient.DevicesClient(), c.deviceID, c.assetTag)
+	deviceID, _, err := findDeviceID(ctx, authClient.DevicesClient(), c.deviceID, c.assetTag, c.osType)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -412,10 +423,18 @@ func (c *deviceLockCommand) Run(ctx context.Context, authClient auth.ClientI) er
 // assetTag. If supplied with the former, no backend queries are made. It exists
 // to simplify the logic of commands that take either --device-id or --asset-tag
 // as an argument.
+//
+// The optional osType parameter is used to distinguish devices registered in
+// multiple platforms.
+//
 // Returns the device ID and a name that can be used for CLI messages, the
 // latter matching whatever was originally supplied - the device ID or the asset
 // tag.
-func findDeviceID(ctx context.Context, devices devicepb.DeviceTrustServiceClient, deviceID, assetTag string) (id, name string, err error) {
+func findDeviceID(
+	ctx context.Context,
+	devices devicepb.DeviceTrustServiceClient,
+	deviceID, assetTag string, osType devicepb.OSType,
+) (id, name string, err error) {
 	if deviceID != "" {
 		// No need to query.
 		return deviceID, deviceID, nil
@@ -428,8 +447,8 @@ func findDeviceID(ctx context.Context, devices devicepb.DeviceTrustServiceClient
 		return "", "", trace.Wrap(err)
 	}
 	for _, found := range resp.Devices {
-		// Skip ID matches.
-		if found.AssetTag != assetTag {
+		// Skip ID matches and unexpected osTypes.
+		if found.AssetTag != assetTag || (osType != devicepb.OSType_OS_TYPE_UNSPECIFIED && found.OsType != osType) {
 			continue
 		}
 
@@ -464,17 +483,18 @@ func (c *canOperateOnCurrentDevice) setCurrentDevice() (bool, error) {
 		return false, nil
 	}
 
-	cdd, err := dtnative.CollectDeviceData()
+	cdd, err := dtnative.CollectDeviceData(dtnative.CollectedDataMaybeEscalate)
 	if err != nil {
 		return false, trace.Wrap(err)
 	}
 
 	c.osType = cdd.OsType
 	c.assetTag = cdd.SerialNumber
-	log.Debugf(
-		"Running device command against current device: %q/%v",
-		c.assetTag,
-		devicetrust.FriendlyOSType(c.osType),
+	slog.DebugContext(
+		context.Background(),
+		"Running device command against current device",
+		"asset_tag", c.assetTag,
+		"os_type", devicetrust.FriendlyOSType(c.osType),
 	)
 	return true, nil
 }

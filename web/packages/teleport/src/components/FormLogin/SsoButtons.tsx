@@ -1,40 +1,40 @@
-/*
-Copyright 2019 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+import { forwardRef } from 'react';
 
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React, { forwardRef } from 'react';
-import { Box, Text } from 'design';
+import { Flex, Text } from 'design';
 import ButtonSso, { guessProviderType } from 'shared/components/ButtonSso';
 import { AuthProvider } from 'shared/services';
 
-const SSOBtnList = forwardRef<HTMLInputElement, Props>(
-  ({ providers, prefixText, isDisabled, onClick, autoFocus = false }, ref) => {
+const SSOBtnList = forwardRef<HTMLButtonElement, Props>(
+  ({ providers, isDisabled, onClick, autoFocus = false }, ref) => {
     const $btns = providers.map((item, index) => {
       let { name, type, displayName } = item;
-      const title = displayName || `${prefixText} ${name}`;
+      const title = displayName || name;
       const ssoType = guessProviderType(title, type);
-      const len = providers.length - 1;
       return (
         <ButtonSso
-          setRef={index === 0 ? ref : null}
+          ref={index === 0 ? ref : null}
           key={index}
           title={title}
           ssoType={ssoType}
           disabled={isDisabled}
-          mt={3}
-          mb={index < len ? 3 : 0}
           autoFocus={index === 0 && autoFocus}
           onClick={e => {
             e.preventDefault();
@@ -53,15 +53,14 @@ const SSOBtnList = forwardRef<HTMLInputElement, Props>(
     }
 
     return (
-      <Box px={6} pt={2} pb={2} data-testid="sso-list">
+      <Flex flexDirection="column" data-testid="sso-list" gap={3}>
         {$btns}
-      </Box>
+      </Flex>
     );
   }
 );
 
 type Props = {
-  prefixText: string;
   isDisabled: boolean;
   onClick(provider: AuthProvider): void;
   providers: AuthProvider[];

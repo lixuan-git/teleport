@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package db
 
@@ -51,10 +53,12 @@ func makeAWSMatchersForType(matcherType, region string, tags map[string]string) 
 	}}
 }
 
-func mustMakeAWSFetchers(t *testing.T, clients cloud.AWSClients, matchers []types.AWSMatcher) []common.Fetcher {
+func mustMakeAWSFetchers(t *testing.T, cfg AWSFetcherFactoryConfig, matchers []types.AWSMatcher, discoveryConfigName string) []common.Fetcher {
 	t.Helper()
 
-	fetchers, err := MakeAWSFetchers(context.Background(), clients, matchers)
+	fetcherFactory, err := NewAWSFetcherFactory(cfg)
+	require.NoError(t, err)
+	fetchers, err := fetcherFactory.MakeFetchers(context.Background(), matchers, discoveryConfigName)
 	require.NoError(t, err)
 	require.NotEmpty(t, fetchers)
 
@@ -68,7 +72,7 @@ func mustMakeAWSFetchers(t *testing.T, clients cloud.AWSClients, matchers []type
 func mustMakeAzureFetchers(t *testing.T, clients cloud.AzureClients, matchers []types.AzureMatcher) []common.Fetcher {
 	t.Helper()
 
-	fetchers, err := MakeAzureFetchers(clients, matchers)
+	fetchers, err := MakeAzureFetchers(clients, matchers, "" /* discovery config */)
 	require.NoError(t, err)
 	require.NotEmpty(t, fetchers)
 
@@ -109,6 +113,7 @@ var testAssumeRole = types.AssumeRole{
 type awsFetcherTest struct {
 	name          string
 	inputClients  *cloud.TestCloudClients
+	fetcherCfg    AWSFetcherFactoryConfig
 	inputMatchers []types.AWSMatcher
 	wantDatabases types.Databases
 }
@@ -119,22 +124,30 @@ func testAWSFetchers(t *testing.T, tests ...awsFetcherTest) {
 	t.Helper()
 	for _, test := range tests {
 		test := test
-		require.Nil(t, test.inputClients.STS, "testAWSFetchers injects an STS mock itself, but test input had already configured it. This is a test configuration error.")
-		stsMock := &mocks.STSMock{}
-		test.inputClients.STS = stsMock
+		fakeSTS := &mocks.STSClient{}
+		if test.inputClients != nil {
+			require.Nil(t, test.inputClients.STS, "testAWSFetchers injects an STS mock itself, but test input had already configured it. This is a test configuration error.")
+			test.inputClients.STS = &fakeSTS.STSClientV1
+		}
+		test.fetcherCfg.CloudClients = test.inputClients
+		require.Nil(t, test.fetcherCfg.AWSConfigProvider, "testAWSFetchers injects a fake AWSConfigProvider, but the test input had already configured it. This is a test configuration error.")
+		test.fetcherCfg.AWSConfigProvider = &mocks.AWSConfigProvider{
+			STSClient: fakeSTS,
+		}
 		t.Run(test.name, func(t *testing.T) {
 			t.Helper()
-			fetchers := mustMakeAWSFetchers(t, test.inputClients, test.inputMatchers)
+			fetchers := mustMakeAWSFetchers(t, test.fetcherCfg, test.inputMatchers, "" /* discovery config */)
 			require.ElementsMatch(t, test.wantDatabases, mustGetDatabases(t, fetchers))
 		})
 		t.Run(test.name+" with assume role", func(t *testing.T) {
 			t.Helper()
+			fakeSTS.ResetAssumeRoleHistory()
 			matchers := copyAWSMatchersWithAssumeRole(testAssumeRole, test.inputMatchers...)
 			wantDBs := copyDatabasesWithAWSAssumeRole(testAssumeRole, test.wantDatabases...)
-			fetchers := mustMakeAWSFetchers(t, test.inputClients, matchers)
+			fetchers := mustMakeAWSFetchers(t, test.fetcherCfg, matchers, "" /* discovery config */)
 			require.ElementsMatch(t, wantDBs, mustGetDatabases(t, fetchers))
-			require.Equal(t, []string{testAssumeRole.RoleARN}, stsMock.GetAssumedRoleARNs())
-			require.Equal(t, []string{testAssumeRole.ExternalID}, stsMock.GetAssumedRoleExternalIDs())
+			require.Equal(t, []string{testAssumeRole.RoleARN}, fakeSTS.GetAssumedRoleARNs())
+			require.Equal(t, []string{testAssumeRole.ExternalID}, fakeSTS.GetAssumedRoleExternalIDs())
 		})
 	}
 }

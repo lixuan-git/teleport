@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package proxy
 
@@ -21,26 +25,27 @@ import (
 	"io"
 	"path"
 	"path/filepath"
+	"slices"
 	"testing"
 	"text/template"
 
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/slices"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
 	networkingv1 "k8s.io/api/networking/v1"
 	authv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/kube/proxy/responsewriters"
+	"github.com/gravitational/teleport/lib/utils"
+	tslices "github.com/gravitational/teleport/lib/utils/slices"
 )
 
 func Test_filterBuffer(t *testing.T) {
-	log := logrus.New()
 	type objectAndAPI struct {
 		obj string
 		api string
@@ -119,6 +124,26 @@ func Test_filterBuffer(t *testing.T) {
 				"default/kubernetes",
 			},
 		},
+		{
+			name: "table response full object compressed with gzip",
+			args: args{
+				dataFile:        "testing/data/partial_table_full_obj.json",
+				contentEncoding: "gzip",
+			},
+			want: []string{
+				"default/kubernetes",
+			},
+		},
+		{
+			name: "table response full object uncompressed",
+			args: args{
+				dataFile:        "testing/data/partial_table_full_obj.json",
+				contentEncoding: "",
+			},
+			want: []string{
+				"default/kubernetes",
+			},
+		},
 	}
 	for _, tt := range tests {
 		for _, r := range types.KubernetesResourcesKinds {
@@ -150,7 +175,7 @@ func Test_filterBuffer(t *testing.T) {
 
 				buf, decompress := newMemoryResponseWriter(t, data.Bytes(), tt.args.contentEncoding)
 
-				err = filterBuffer(newResourceFilterer(r, types.KubeVerbList, &globalKubeCodecs, allowedResources, nil, log), buf)
+				err = filterBuffer(newResourceFilterer(r, types.KubeVerbList, &globalKubeCodecs, allowedResources, nil, utils.NewSlogLoggerForTests()), buf)
 				require.NoError(t, err)
 
 				// Decompress the buffer to compare the result.
@@ -163,42 +188,50 @@ func Test_filterBuffer(t *testing.T) {
 				var resources []string
 				switch o := obj.(type) {
 				case *corev1.SecretList:
-					resources = collectResourcesFromResponse(arrayToPointerArray(o.Items))
+					resources = collectResourcesFromResponse(tslices.ToPointers(o.Items))
 				case *appsv1.DeploymentList:
-					resources = collectResourcesFromResponse(arrayToPointerArray(o.Items))
+					resources = collectResourcesFromResponse(tslices.ToPointers(o.Items))
 				case *appsv1.DaemonSetList:
-					resources = collectResourcesFromResponse(arrayToPointerArray(o.Items))
+					resources = collectResourcesFromResponse(tslices.ToPointers(o.Items))
 				case *appsv1.StatefulSetList:
-					resources = collectResourcesFromResponse(arrayToPointerArray(o.Items))
+					resources = collectResourcesFromResponse(tslices.ToPointers(o.Items))
 				case *authv1.RoleBindingList:
-					resources = collectResourcesFromResponse(arrayToPointerArray(o.Items))
+					resources = collectResourcesFromResponse(tslices.ToPointers(o.Items))
 				case *batchv1.CronJobList:
-					resources = collectResourcesFromResponse(arrayToPointerArray(o.Items))
+					resources = collectResourcesFromResponse(tslices.ToPointers(o.Items))
 				case *batchv1.JobList:
-					resources = collectResourcesFromResponse(arrayToPointerArray(o.Items))
+					resources = collectResourcesFromResponse(tslices.ToPointers(o.Items))
 				case *corev1.PodList:
-					resources = collectResourcesFromResponse(arrayToPointerArray(o.Items))
+					resources = collectResourcesFromResponse(tslices.ToPointers(o.Items))
 				case *corev1.ConfigMapList:
-					resources = collectResourcesFromResponse(arrayToPointerArray(o.Items))
+					resources = collectResourcesFromResponse(tslices.ToPointers(o.Items))
 				case *corev1.ServiceAccountList:
-					resources = collectResourcesFromResponse(arrayToPointerArray(o.Items))
+					resources = collectResourcesFromResponse(tslices.ToPointers(o.Items))
 				case *appsv1.ReplicaSetList:
-					resources = collectResourcesFromResponse(arrayToPointerArray(o.Items))
+					resources = collectResourcesFromResponse(tslices.ToPointers(o.Items))
 				case *corev1.ServiceList:
-					resources = collectResourcesFromResponse(arrayToPointerArray(o.Items))
+					resources = collectResourcesFromResponse(tslices.ToPointers(o.Items))
 				case *corev1.PersistentVolumeClaimList:
-					resources = collectResourcesFromResponse(arrayToPointerArray(o.Items))
+					resources = collectResourcesFromResponse(tslices.ToPointers(o.Items))
 				case *authv1.RoleList:
-					resources = collectResourcesFromResponse(arrayToPointerArray(o.Items))
+					resources = collectResourcesFromResponse(tslices.ToPointers(o.Items))
 				case *networkingv1.IngressList:
-					resources = collectResourcesFromResponse(arrayToPointerArray(o.Items))
+					resources = collectResourcesFromResponse(tslices.ToPointers(o.Items))
+				case *extensionsv1beta1.IngressList:
+					resources = collectResourcesFromResponse(tslices.ToPointers(o.Items))
+				case *extensionsv1beta1.DaemonSetList:
+					resources = collectResourcesFromResponse(tslices.ToPointers(o.Items))
+				case *extensionsv1beta1.ReplicaSetList:
+					resources = collectResourcesFromResponse(tslices.ToPointers(o.Items))
+				case *extensionsv1beta1.DeploymentList:
+					resources = collectResourcesFromResponse(tslices.ToPointers(o.Items))
 				case *metav1.Table:
 					for i := range o.Rows {
 						row := &(o.Rows[i])
 						if row.Object.Object == nil {
 							var err error
 							// decode only if row.Object.Object was not decoded before.
-							row.Object.Object, err = decodeAndSetGVK(decoder, row.Object.Raw)
+							row.Object.Object, err = decodeAndSetGVK(decoder, row.Object.Raw, nil)
 							require.NoError(t, err)
 						}
 

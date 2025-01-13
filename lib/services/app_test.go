@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
@@ -135,20 +137,51 @@ func TestGetAppName(t *testing.T) {
 	}
 }
 
+func TestGetKubeClusterDomain(t *testing.T) {
+	t.Setenv("KUBERNETES_SERVICE_HOST", "k8s")
+	tests := []struct {
+		name     string
+		envVar   string
+		expected string
+	}{
+		{
+			name:     "service1 fallback to cluster.local",
+			expected: "cluster.local",
+		},
+		{
+			name:     "service1 dns resolution",
+			envVar:   "k8s.com",
+			expected: "k8s.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.envVar != "" {
+				t.Setenv("TELEPORT_KUBE_CLUSTER_DOMAIN", tt.envVar)
+			}
+			require.Equal(t, tt.expected, getClusterDomain())
+		})
+	}
+}
+
 func TestGetServiceFQDN(t *testing.T) {
 	tests := []struct {
 		name         string
+		serviceName  string
 		namespace    string
 		externalName string
 		expected     string
 	}{
 		{
-			name:      "service1",
-			namespace: "ns1",
-			expected:  "service1.ns1.svc.cluster.local",
+			name:        "service1 fallback to cluster.local",
+			serviceName: "service1",
+			namespace:   "ns1",
+			expected:    "service1.ns1.svc.cluster.local",
 		},
 		{
 			name:         "service2",
+			serviceName:  "service2",
 			externalName: "external-service2",
 			namespace:    "ns2",
 			expected:     "external-service2",
@@ -156,10 +189,10 @@ func TestGetServiceFQDN(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.expected, func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
 			service := v1.Service{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      tt.name,
+					Name:      tt.serviceName,
 					Namespace: tt.namespace,
 				},
 				Spec: v1.ServiceSpec{
@@ -169,7 +202,7 @@ func TestGetServiceFQDN(t *testing.T) {
 			if tt.externalName != "" {
 				service.Spec.Type = v1.ServiceTypeExternalName
 			}
-			require.Equal(t, tt.expected, getServiceFQDN(service))
+			require.Equal(t, tt.expected, GetServiceFQDN(service))
 		})
 	}
 }
@@ -202,7 +235,7 @@ func TestBuildAppURI(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		require.Equal(t, buildAppURI(tt.protocol, tt.serviceFQDN, tt.port), tt.expected)
+		require.Equal(t, tt.expected, buildAppURI(tt.protocol, tt.serviceFQDN, tt.port))
 	}
 }
 
@@ -285,6 +318,31 @@ func TestGetAppLabels(t *testing.T) {
 		result, err := getAppLabels(tt.labels, tt.clusterName)
 		require.NoError(t, err)
 
+		require.Equal(t, tt.expected, result)
+	}
+}
+
+func TestInsecureSkipVerify(t *testing.T) {
+	tests := []struct {
+		annotations map[string]string
+		expected    bool
+	}{
+		{
+			annotations: map[string]string{types.DiscoveryAppInsecureSkipVerify: "true"},
+			expected:    true,
+		},
+		{
+			annotations: map[string]string{types.DiscoveryAppInsecureSkipVerify: "false"},
+			expected:    false,
+		},
+		{
+			annotations: map[string]string{},
+			expected:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		result := getTLSInsecureSkipVerify(tt.annotations)
 		require.Equal(t, tt.expected, result)
 	}
 }

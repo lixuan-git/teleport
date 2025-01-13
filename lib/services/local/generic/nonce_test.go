@@ -1,18 +1,20 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package generic
 
@@ -60,7 +62,7 @@ func newNoncedResource(name string, nonce uint64) *noncedResource {
 	}
 }
 
-func fastGetResource[T types.Resource](ctx context.Context, bk backend.Backend, key []byte) (T, error) {
+func fastGetResource[T types.Resource](ctx context.Context, bk backend.Backend, key backend.Key) (T, error) {
 	var value T
 
 	item, err := bk.Get(ctx, key)
@@ -94,52 +96,52 @@ func TestNonceBasics(t *testing.T) {
 	require.NoError(t, err)
 
 	// nonce of 1 is an "update", but resource does not exist yet
-	err = FastUpdateNonceProtectedResource(ctx, bk, []byte("k1"), newNoncedResource("r1", 1))
+	err = FastUpdateNonceProtectedResource(ctx, bk, backend.NewKey("k1"), newNoncedResource("r1", 1))
 	require.ErrorIs(t, err, ErrNonceViolation)
 
 	// nonce of 0 is a valid "create".
-	err = FastUpdateNonceProtectedResource(ctx, bk, []byte("k1"), newNoncedResource("r1", 0))
+	err = FastUpdateNonceProtectedResource(ctx, bk, backend.NewKey("k1"), newNoncedResource("r1", 0))
 	require.NoError(t, err)
 
 	// subsequent calls with nonce of 0 fail.
-	err = FastUpdateNonceProtectedResource(ctx, bk, []byte("k1"), newNoncedResource("r1", 0))
+	err = FastUpdateNonceProtectedResource(ctx, bk, backend.NewKey("k1"), newNoncedResource("r1", 0))
 	require.ErrorIs(t, err, ErrNonceViolation)
 
 	// nonce of 1 is now a valid update
-	err = FastUpdateNonceProtectedResource(ctx, bk, []byte("k1"), newNoncedResource("r1", 1))
+	err = FastUpdateNonceProtectedResource(ctx, bk, backend.NewKey("k1"), newNoncedResource("r1", 1))
 	require.NoError(t, err)
 
 	// loading and then re-inserting should always work since nonce is incremented internally
 	for i := 0; i < 10; i++ {
-		rsc, err := fastGetResource[*noncedResource](ctx, bk, []byte("k1"))
+		rsc, err := fastGetResource[*noncedResource](ctx, bk, backend.NewKey("k1"))
 		require.NoError(t, err)
 
-		err = FastUpdateNonceProtectedResource(ctx, bk, []byte("k1"), rsc)
+		err = FastUpdateNonceProtectedResource(ctx, bk, backend.NewKey("k1"), rsc)
 		require.NoError(t, err)
 	}
 
 	// sanity check: nonce incremented expected number of times
-	err = FastUpdateNonceProtectedResource(ctx, bk, []byte("k1"), newNoncedResource("r1", 12))
+	err = FastUpdateNonceProtectedResource(ctx, bk, backend.NewKey("k1"), newNoncedResource("r1", 12))
 	require.NoError(t, err)
 
 	// max uint64 "forces" update
-	err = FastUpdateNonceProtectedResource(ctx, bk, []byte("k1"), newNoncedResource("r1", math.MaxUint64))
+	err = FastUpdateNonceProtectedResource(ctx, bk, backend.NewKey("k1"), newNoncedResource("r1", math.MaxUint64))
 	require.NoError(t, err)
 
 	// forced update correctly conflicts with what would normally be the "next" valid nonce.
-	err = FastUpdateNonceProtectedResource(ctx, bk, []byte("k1"), newNoncedResource("r1", 13))
+	err = FastUpdateNonceProtectedResource(ctx, bk, backend.NewKey("k1"), newNoncedResource("r1", 13))
 	require.ErrorIs(t, err, ErrNonceViolation)
 
 	// forced update correctly incremented nonce by 1
-	err = FastUpdateNonceProtectedResource(ctx, bk, []byte("k1"), newNoncedResource("r1", 14))
+	err = FastUpdateNonceProtectedResource(ctx, bk, backend.NewKey("k1"), newNoncedResource("r1", 14))
 	require.NoError(t, err)
 
 	// max uint64 "forces" update for nonexistent resources too
-	err = FastUpdateNonceProtectedResource(ctx, bk, []byte("k2"), newNoncedResource("r2", math.MaxUint64))
+	err = FastUpdateNonceProtectedResource(ctx, bk, backend.NewKey("k2"), newNoncedResource("r2", math.MaxUint64))
 	require.NoError(t, err)
 
 	// forced update correctly sets new nonce to 1
-	err = FastUpdateNonceProtectedResource(ctx, bk, []byte("k2"), newNoncedResource("r2", 1))
+	err = FastUpdateNonceProtectedResource(ctx, bk, backend.NewKey("k2"), newNoncedResource("r2", 1))
 	require.NoError(t, err)
 }
 
@@ -186,7 +188,7 @@ func TestNonceParallelism(t *testing.T) {
 			rem := updates
 
 			for rem > 0 {
-				rsc, err := fastGetResource[*noncedResource](ctx, bk, []byte(key))
+				rsc, err := fastGetResource[*noncedResource](ctx, bk, backend.NewKey(key))
 				if err != nil && !trace.IsNotFound(err) {
 					fail(err)
 					return
@@ -197,7 +199,7 @@ func TestNonceParallelism(t *testing.T) {
 					rsc = newNoncedResource(name, 0)
 				}
 
-				err = FastUpdateNonceProtectedResource(ctx, bk, []byte(key), rsc)
+				err = FastUpdateNonceProtectedResource(ctx, bk, backend.NewKey(key), rsc)
 
 				if err != nil {
 					if errors.Is(err, ErrNonceViolation) {
@@ -221,7 +223,7 @@ func TestNonceParallelism(t *testing.T) {
 	require.NoError(t, <-errch)
 
 	// load resource and verify that we hit our exact expected number of updates
-	rsc, err := fastGetResource[*noncedResource](ctx, bk, []byte(key))
+	rsc, err := fastGetResource[*noncedResource](ctx, bk, backend.NewKey(key))
 	require.NoError(t, err)
 	require.Equal(t, routines*updates, int(rsc.Nonce))
 

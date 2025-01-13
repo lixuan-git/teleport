@@ -1,39 +1,67 @@
 /**
- * Copyright 2023 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-import React from 'react';
+
 import { Link } from 'react-router-dom';
-import { ButtonPrimary } from 'design';
+
+import { Button } from 'design';
+import { HoverTooltip } from 'design/Tooltip';
+import { MissingPermissionsTooltip } from 'shared/components/MissingPermissionsTooltip';
 
 import cfg from 'teleport/config';
 
 export function IntegrationsAddButton({
-  canCreate = false,
+  requiredPermissions,
 }: {
-  canCreate: boolean;
+  requiredPermissions: { value: boolean; label: string }[];
 }) {
+  const canCreateIntegrations = requiredPermissions.some(v => v.value);
+  const missingPermissions = requiredPermissions
+    .filter(perm => !perm.value)
+    .map(perm => perm.label);
+
   return (
-    <ButtonPrimary
-      as={Link}
-      ml="auto"
-      width="240px"
-      disabled={!canCreate}
-      to={cfg.getIntegrationEnrollRoute()}
-      title={canCreate ? '' : 'You do not have access to add new integrations'}
+    <HoverTooltip
+      position="bottom"
+      tipContent={
+        canCreateIntegrations ? null : (
+          <MissingPermissionsTooltip
+            requiresAll={false}
+            missingPermissions={missingPermissions}
+          />
+        )
+      }
     >
-      Enroll new integration
-    </ButtonPrimary>
+      <Button
+        intent="primary"
+        fill="border"
+        as={Link}
+        ml="auto"
+        width="240px"
+        disabled={!canCreateIntegrations}
+        to={cfg.getIntegrationEnrollRoute()}
+        title={
+          canCreateIntegrations
+            ? ''
+            : 'You do not have access to add new integrations'
+        }
+      >
+        Enroll New Integration
+      </Button>
+    </HoverTooltip>
   );
 }

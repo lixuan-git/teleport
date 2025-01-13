@@ -1,20 +1,25 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package authz_test
 
 import (
+	"context"
 	"testing"
 
 	"github.com/gravitational/trace"
@@ -48,6 +53,25 @@ func TestIsSSHDeviceVerified(t *testing.T) {
 			}
 		}
 		return authz.IsSSHDeviceVerified(cert)
+	})
+}
+
+func TestHasDeviceTrustExtensions(t *testing.T) {
+	testIsDeviceVerified(t, "HasDeviceTrustExtensions", func(ext *tlsca.DeviceExtensions) bool {
+		if ext == nil {
+			return authz.HasDeviceTrustExtensions(nil)
+		}
+		var extensions []string
+		if ext.DeviceID != "" {
+			extensions = append(extensions, teleport.CertExtensionDeviceID)
+		}
+		if ext.AssetTag != "" {
+			extensions = append(extensions, teleport.CertExtensionDeviceAssetTag)
+		}
+		if ext.CredentialID != "" {
+			extensions = append(extensions, teleport.CertExtensionDeviceCredentialID)
+		}
+		return authz.HasDeviceTrustExtensions(extensions)
 	})
 }
 
@@ -108,7 +132,7 @@ func testIsDeviceVerified(t *testing.T, name string, fn func(ext *tlsca.DeviceEx
 
 func TestVerifyTLSUser(t *testing.T) {
 	runVerifyUserTest(t, "VerifyTLSUser", func(dt *types.DeviceTrust, ext *tlsca.DeviceExtensions) error {
-		return authz.VerifyTLSUser(dt, tlsca.Identity{
+		return authz.VerifyTLSUser(context.Background(), dt, tlsca.Identity{
 			Username:         "llama",
 			DeviceExtensions: *ext,
 		})
@@ -117,7 +141,7 @@ func TestVerifyTLSUser(t *testing.T) {
 
 func TestVerifySSHUser(t *testing.T) {
 	runVerifyUserTest(t, "VerifySSHUser", func(dt *types.DeviceTrust, ext *tlsca.DeviceExtensions) error {
-		return authz.VerifySSHUser(dt, &ssh.Certificate{
+		return authz.VerifySSHUser(context.Background(), dt, &ssh.Certificate{
 			KeyId: "llama",
 			Permissions: ssh.Permissions{
 				Extensions: map[string]string{
@@ -135,7 +159,7 @@ func runVerifyUserTest(t *testing.T, method string, verify func(dt *types.Device
 		assert.NoError(t, err, "%v mismatch", method)
 	}
 	assertDeniedErr := func(t *testing.T, err error) {
-		assert.ErrorContains(t, err, "unauthorized device", "%v mismatch", method)
+		assert.ErrorContains(t, err, "trusted device", "%v mismatch", method)
 		assert.True(t, trace.IsAccessDenied(err), "%v returned an error other than trace.AccessDeniedError: %T", method, err)
 	}
 
@@ -170,13 +194,13 @@ func runVerifyUserTest(t *testing.T, method string, verify func(dt *types.Device
 			assertErr: assertNoErr,
 		},
 		{
-			name:      "OSS mode never enforced",
+			name:      "OSS mode=required (Enterprise Auth)",
 			buildType: modules.BuildOSS,
 			dt: &types.DeviceTrust{
-				Mode: constants.DeviceTrustModeRequired, // Invalid for OSS, treated as "off".
+				Mode: constants.DeviceTrustModeRequired,
 			},
 			ext:       userWithoutExtensions,
-			assertErr: assertNoErr,
+			assertErr: assertDeniedErr,
 		},
 		{
 			name:      "Enterprise mode=off",

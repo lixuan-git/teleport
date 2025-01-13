@@ -1,60 +1,10 @@
-<Tabs>
-<TabItem scope="team" label="Teleport Team">
+{{ version="(=teleport.version=)" }}
 
-- A Teleport Team account. If you don't have an account, sign 
-up to begin your [free trial](https://goteleport.com/signup/).
+- A running Teleport cluster version {{ version }} or above. If you want to get started with Teleport, [sign
+  up](https://goteleport.com/signup) for a free trial or [set up a demo
+  environment](../admin-guides/deploy-a-cluster/linux-demo.mdx).
 
-- The Enterprise `tctl` admin tool and `tsh` client tool, version >= (=teleport.version=).
-  
-  You can download these tools by visiting your [Teleport
-  account workspace](https://teleport.sh).
+- The `tctl` admin tool and `tsh` client tool.
 
-</TabItem>
-<TabItem scope={["oss"]} label="Teleport Community Edition">
-
-- A running Teleport cluster. For details on how to set this up, see the
-  [Getting Started](../index.mdx) guide.
-
-- The `tctl` admin tool and `tsh` client tool version >= (=teleport.version=).
-
-  See [Installation](../installation.mdx) for details.
-
-</TabItem>
-<TabItem
-  scope={["enterprise"]} label="Teleport Enterprise">
-
-- A running Teleport Enterprise cluster. For details on how to set this up, see the Enterprise
-  [Getting Started](../choose-an-edition/teleport-enterprise/introduction.mdx) guide.
-
-- The Enterprise `tctl` admin tool and `tsh` client tool version >=
-  (=teleport.version=).
-  
-  You can download these tools by visiting your [Teleport
-  account workspace](https://teleport.sh).
-
-</TabItem>
-<TabItem scope={["cloud"]}
-  label="Teleport Enterprise Cloud">
-
-- A Teleport Enterprise Cloud account. If you don't have an account, 
-  sign up to begin a [free trial](https://goteleport.com/signup/)  of Teleport Team
-  and upgrade to Teleport Enterprise Cloud. 
-
-- The Enterprise `tctl` admin tool and `tsh` client tool version >= (=cloud.version=).
-</TabItem>
-</Tabs>
-
-  To check version information, run the `tctl version` and `tsh version` commands.
-  For example:
-
-  ```code
-  $ tctl version
-  # Teleport Enterprise v(=cloud.version=) git:(=teleport.git=) go(=teleport.golang=)
-  
-  $ tsh version
-  # Teleport v(=cloud.version=) go(=teleport.golang=)
-  Proxy version: (=cloud.version=)
-  Proxy: (=teleport.url=)
-  ```
-
-
+  Visit [Installation](../installation.mdx) for instructions on downloading
+  `tctl` and `tsh`.

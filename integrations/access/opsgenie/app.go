@@ -1,18 +1,20 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package opsgenie
 
@@ -20,24 +22,25 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	"google.golang.org/grpc"
-	grpcbackoff "google.golang.org/grpc/backoff"
 
 	tp "github.com/gravitational/teleport"
-	"github.com/gravitational/teleport/api/client"
 	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/integrations/access/accessmonitoring"
+	"github.com/gravitational/teleport/integrations/access/common"
 	"github.com/gravitational/teleport/integrations/access/common/teleport"
 	"github.com/gravitational/teleport/integrations/lib"
 	"github.com/gravitational/teleport/integrations/lib/backoff"
-	"github.com/gravitational/teleport/integrations/lib/credentials"
 	"github.com/gravitational/teleport/integrations/lib/logger"
 	"github.com/gravitational/teleport/integrations/lib/watcherjob"
+	"github.com/gravitational/teleport/lib/utils"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
 const (
@@ -45,12 +48,10 @@ const (
 	pluginName = "opsgenie"
 	// minServerVersion is the minimal teleport version the plugin supports.
 	minServerVersion = "6.1.0"
-	// grpcBackoffMaxDelay is a maximum time gRPC client waits before reconnection attempt.
-	grpcBackoffMaxDelay = time.Second * 2
 	// initTimeout is used to bound execution time of health check and teleport version check.
-	initTimeout = time.Second * 10
+	initTimeout = time.Second * 30
 	// handlerTimeout is used to bound the execution time of watcher event handler.
-	handlerTimeout = time.Second * 5
+	handlerTimeout = time.Second * 30
 	// modifyPluginDataBackoffBase is an initial (minimum) backoff value.
 	modifyPluginDataBackoffBase = time.Millisecond
 	// modifyPluginDataBackoffMax is a backoff threshold
@@ -69,19 +70,26 @@ type App struct {
 	opsgenie   *Client
 	mainJob    lib.ServiceJob
 	conf       Config
+
+	accessMonitoringRules *accessmonitoring.RuleHandler
 }
 
 // NewOpsgenieApp initializes a new teleport-opsgenie app and returns it.
 func NewOpsgenieApp(ctx context.Context, conf *Config) (*App, error) {
-	teleportClient, err := conf.GetTeleportClient(ctx)
+	opsgenieApp := &App{
+		PluginName: pluginName,
+		conf:       *conf,
+	}
+	teleClient, err := conf.GetTeleportClient(ctx)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	opsgenieApp := &App{
-		PluginName: pluginName,
-		teleport:   teleportClient,
-		conf:       *conf,
-	}
+	opsgenieApp.accessMonitoringRules = accessmonitoring.NewRuleHandler(accessmonitoring.RuleHandlerConfig{
+		Client:                 teleClient,
+		PluginType:             string(conf.BaseConfig.PluginType),
+		PluginName:             pluginName,
+		FetchRecipientCallback: createScheduleRecipient,
+	})
 	opsgenieApp.mainJob = lib.NewServiceJob(opsgenieApp.run)
 	return opsgenieApp, nil
 }
@@ -109,7 +117,7 @@ func (a *App) run(ctx context.Context) error {
 	var err error
 
 	log := logger.Get(ctx)
-	log.Infof("Starting Teleport Access Opsgenie Plugin")
+	log.InfoContext(ctx, "Starting Teleport Access Opsgenie Plugin")
 
 	if err = a.init(ctx); err != nil {
 		return trace.Wrap(err)
@@ -118,7 +126,10 @@ func (a *App) run(ctx context.Context) error {
 	watcherJob, err := watcherjob.NewJob(
 		a.teleport,
 		watcherjob.Config{
-			Watch:            types.Watch{Kinds: []types.WatchKind{types.WatchKind{Kind: types.KindAccessRequest}}},
+			Watch: types.Watch{Kinds: []types.WatchKind{
+				{Kind: types.KindAccessRequest},
+				{Kind: types.KindAccessMonitoringRule},
+			}},
 			EventFuncTimeout: handlerTimeout,
 		},
 		a.onWatcherEvent,
@@ -132,11 +143,15 @@ func (a *App) run(ctx context.Context) error {
 		return trace.Wrap(err)
 	}
 
+	if err := a.accessMonitoringRules.InitAccessMonitoringRulesCache(ctx); err != nil {
+		return trace.Wrap(err)
+	}
+
 	a.mainJob.SetReady(ok)
 	if ok {
-		log.Info("Plugin is ready")
+		log.InfoContext(ctx, "Plugin is ready")
 	} else {
-		log.Error("Plugin is not ready")
+		log.ErrorContext(ctx, "Plugin is not ready")
 	}
 
 	<-watcherJob.Done()
@@ -147,33 +162,11 @@ func (a *App) run(ctx context.Context) error {
 func (a *App) init(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, initTimeout)
 	defer cancel()
-	log := logger.Get(ctx)
-
-	if validCred, err := credentials.CheckIfExpired(a.conf.Teleport.Credentials()); err != nil {
-		log.Warnf("Invalid Teleport credentials: %v", err)
-		if !validCred {
-			return trace.BadParameter(
-				"No valid credentials found, this likely means credentials are expired. In this case, please sign new credentials and increase their TTL if needed.",
-			)
-		}
-		log.Info("At least one non-expired credential has been found, continuing startup")
-	}
 
 	var err error
-
-	if a.teleport == nil {
-		bk := grpcbackoff.DefaultConfig
-		bk.MaxDelay = grpcBackoffMaxDelay
-		if a.teleport, err = client.New(ctx, client.Config{
-			Addrs:       a.conf.Teleport.GetAddrs(),
-			Credentials: a.conf.Teleport.Credentials(),
-			DialOpts: []grpc.DialOption{
-				grpc.WithConnectParams(grpc.ConnectParams{Backoff: bk, MinConnectTimeout: initTimeout}),
-				grpc.WithReturnConnectionError(),
-			},
-		}); err != nil {
-			return trace.Wrap(err)
-		}
+	a.teleport, err = a.conf.GetTeleportClient(ctx)
+	if err != nil {
+		return trace.Wrap(err, "getting teleport client")
 	}
 
 	if _, err = a.checkTeleportVersion(ctx); err != nil {
@@ -184,66 +177,91 @@ func (a *App) init(ctx context.Context) error {
 	if err != nil {
 		return trace.Wrap(err)
 	}
+
+	log := logger.Get(ctx)
+	log.DebugContext(ctx, "Starting API health check")
+	if err = a.opsgenie.CheckHealth(ctx); err != nil {
+		return trace.Wrap(err, "API health check failed")
+	}
+	log.DebugContext(ctx, "API health check finished ok")
 	return nil
 }
 
 func (a *App) checkTeleportVersion(ctx context.Context) (proto.PingResponse, error) {
 	log := logger.Get(ctx)
-	log.Debug("Checking Teleport server version")
+	log.DebugContext(ctx, "Checking Teleport server version")
 
 	pong, err := a.teleport.Ping(ctx)
 	if err != nil {
 		if trace.IsNotImplemented(err) {
 			return pong, trace.Wrap(err, "server version must be at least %s", minServerVersion)
 		}
-		log.Error("Unable to get Teleport server version")
+		log.ErrorContext(ctx, "Unable to get Teleport server version")
 		return pong, trace.Wrap(err)
 	}
-	err = lib.AssertServerVersion(pong, minServerVersion)
+	err = utils.CheckMinVersion(pong.ServerVersion, minServerVersion)
 	return pong, trace.Wrap(err)
 }
 
+// onWatcherEvent is called for every cluster Event. It will call the handlers
+// for access request and access monitoring rule events.
 func (a *App) onWatcherEvent(ctx context.Context, event types.Event) error {
+	switch event.Resource.GetKind() {
+	case types.KindAccessMonitoringRule:
+		return trace.Wrap(a.accessMonitoringRules.HandleAccessMonitoringRule(ctx, event))
+	case types.KindAccessRequest:
+		return trace.Wrap(a.handleAcessRequest(ctx, event))
+	}
+	return trace.BadParameter("unexpected kind %s", event.Resource.GetKind())
+}
+
+func (a *App) handleAcessRequest(ctx context.Context, event types.Event) error {
 	if kind := event.Resource.GetKind(); kind != types.KindAccessRequest {
 		return trace.Errorf("unexpected kind %s", kind)
 	}
 	op := event.Type
 	reqID := event.Resource.GetName()
-	ctx, _ = logger.WithField(ctx, "request_id", reqID)
+	ctx, _ = logger.With(ctx, "request_id", reqID)
 
 	switch op {
 	case types.OpPut:
-		ctx, _ = logger.WithField(ctx, "request_op", "put")
+		ctx, _ = logger.With(ctx, "request_op", "put")
 		req, ok := event.Resource.(types.AccessRequest)
 		if !ok {
 			return trace.Errorf("unexpected resource type %T", event.Resource)
 		}
-		ctx, log := logger.WithField(ctx, "request_state", req.GetState().String())
+		ctx, log := logger.With(ctx, "request_state", req.GetState().String())
 
 		var err error
 		switch {
 		case req.GetState().IsPending():
 			err = a.onPendingRequest(ctx, req)
-		case req.GetState().IsApproved():
-			err = a.onResolvedRequest(ctx, req)
-		case req.GetState().IsDenied():
+		case req.GetState().IsResolved():
 			err = a.onResolvedRequest(ctx, req)
 		default:
-			log.WithField("event", event).Warn("Unknown request state")
+			log.WarnContext(ctx, "Unknown request state",
+				slog.Group("event",
+					slog.Any("type", logutils.StringerAttr(event.Type)),
+					slog.Group("resource",
+						"kind", event.Resource.GetKind(),
+						"name", event.Resource.GetName(),
+					),
+				),
+			)
 			return nil
 		}
 
 		if err != nil {
-			log.WithError(err).Error("Failed to process request")
+			log.ErrorContext(ctx, "Failed to process request", "error", err)
 			return trace.Wrap(err)
 		}
 
 		return nil
 	case types.OpDelete:
-		ctx, log := logger.WithField(ctx, "request_op", "delete")
+		ctx, log := logger.With(ctx, "request_op", "delete")
 
 		if err := a.onDeletedRequest(ctx, reqID); err != nil {
-			log.WithError(err).Error("Failed to process deleted request")
+			log.ErrorContext(ctx, "Failed to process deleted request", "error", err)
 			return trace.Wrap(err)
 		}
 		return nil
@@ -253,11 +271,6 @@ func (a *App) onWatcherEvent(ctx context.Context, event types.Event) error {
 }
 
 func (a *App) onPendingRequest(ctx context.Context, req types.AccessRequest) error {
-	if len(req.GetSystemAnnotations()) == 0 {
-		logger.Get(ctx).Debug("Cannot proceed further. Request is missing any annotations")
-		return nil
-	}
-
 	// First, try to create a notification alert.
 	isNew, notifyErr := a.tryNotifyService(ctx, req)
 
@@ -267,7 +280,7 @@ func (a *App) onPendingRequest(ctx context.Context, req types.AccessRequest) err
 		return nil
 	}
 	// Don't show the error if the annotation is just missing.
-	if trace.Unwrap(notifyErr) == errMissingAnnotation {
+	if errors.Is(trace.Unwrap(notifyErr), errMissingAnnotation) {
 		notifyErr = nil
 	}
 
@@ -288,6 +301,8 @@ func (a *App) onResolvedRequest(ctx context.Context, req types.AccessRequest) er
 		resolution.Tag = ResolvedApproved
 	case types.RequestState_DENIED:
 		resolution.Tag = ResolvedDenied
+	case types.RequestState_PROMOTED:
+		resolution.Tag = ResolvedPromoted
 	}
 	err := trace.Wrap(a.resolveAlert(ctx, req.GetName(), resolution))
 	return trace.NewAggregate(notifyErr, err)
@@ -297,37 +312,71 @@ func (a *App) onDeletedRequest(ctx context.Context, reqID string) error {
 	return a.resolveAlert(ctx, reqID, Resolution{Tag: ResolvedExpired})
 }
 
-func (a *App) getNotifyServiceNames(req types.AccessRequest) ([]string, error) {
-	services, ok := req.GetSystemAnnotations()[types.TeleportNamespace+types.ReqAnnotationNotifyServicesLabel]
-	if !ok {
-		return nil, trace.NotFound("notify services not specified")
+// getNotifySchedulesAndTeams get schedules and teams to notify from both
+// annotations: /notify-services and /teams, returns an error if both are empty.
+func (a *App) getNotifySchedulesAndTeams(ctx context.Context, req types.AccessRequest) (schedules []string, teams []string, err error) {
+	log := logger.Get(ctx)
+
+	scheduleAnnotationKey := types.TeleportNamespace + types.ReqAnnotationNotifySchedulesLabel
+	schedules, err = common.GetNamesFromAnnotations(req, scheduleAnnotationKey)
+	if err != nil {
+		log.DebugContext(ctx, "No schedules to notify", "schedule", scheduleAnnotationKey)
 	}
-	return services, nil
+
+	teamAnnotationKey := types.TeleportNamespace + types.ReqAnnotationTeamsLabel
+	teams, err = common.GetNamesFromAnnotations(req, teamAnnotationKey)
+	if err != nil {
+		log.DebugContext(ctx, "No teams to notify", "teams", teamAnnotationKey)
+	}
+
+	if len(schedules) == 0 && len(teams) == 0 {
+		return nil, nil, trace.NotFound("no schedules or teams to notify")
+	}
+
+	return schedules, teams, nil
 }
 
 func (a *App) getOnCallServiceNames(req types.AccessRequest) ([]string, error) {
-	services, ok := req.GetSystemAnnotations()[types.TeleportNamespace+types.ReqAnnotationSchedulesLabel]
-	if !ok {
-		return nil, trace.NotFound("on-call schedules not specified")
-	}
-	return services, nil
+	annotationKey := types.TeleportNamespace + types.ReqAnnotationApproveSchedulesLabel
+	return common.GetNamesFromAnnotations(req, annotationKey)
 }
 
 func (a *App) tryNotifyService(ctx context.Context, req types.AccessRequest) (bool, error) {
 	log := logger.Get(ctx)
 
-	serviceNames, err := a.getNotifyServiceNames(req)
+	recipientSchedules, recipientTeams, err := a.getMessageRecipients(ctx, req)
 	if err != nil {
-		log.Debugf("Skipping the notification: %s", err)
+		log.DebugContext(ctx, "Skipping notification", "error", err)
 		return false, trace.Wrap(errMissingAnnotation)
 	}
 
 	reqID := req.GetName()
+	annotations := types.Labels{}
+	for k, v := range req.GetSystemAnnotations() {
+		annotations[k] = v
+	}
+
+	if len(recipientTeams) != 0 {
+		teams := make([]string, 0, len(recipientTeams))
+		for _, t := range recipientTeams {
+			teams = append(teams, t.Name)
+		}
+		annotations[types.TeleportNamespace+types.ReqAnnotationTeamsLabel] = teams
+	}
+	if len(recipientSchedules) != 0 {
+		schedules := make([]string, 0, len(recipientSchedules))
+		for _, s := range recipientSchedules {
+			schedules = append(schedules, s.Name)
+		}
+		annotations[types.TeleportNamespace+types.ReqAnnotationNotifySchedulesLabel] = schedules
+	}
+
 	reqData := RequestData{
-		User:          req.GetUser(),
-		Roles:         req.GetRoles(),
-		Created:       req.GetCreationTime(),
-		RequestReason: req.GetRequestReason(),
+		User:              req.GetUser(),
+		Roles:             req.GetRoles(),
+		Created:           req.GetCreationTime(),
+		RequestReason:     req.GetRequestReason(),
+		SystemAnnotations: annotations,
 	}
 
 	// Create plugin data if it didn't exist before.
@@ -342,12 +391,8 @@ func (a *App) tryNotifyService(ctx context.Context, req types.AccessRequest) (bo
 	}
 
 	if isNew {
-		for _, serviceName := range serviceNames {
-			alertCtx, _ := logger.WithField(ctx, "opsgenie_service_name", serviceName)
-
-			if err = a.createAlert(alertCtx, serviceName, reqID, reqData); err != nil {
-				return isNew, trace.Wrap(err, "creating Opsgenie alert")
-			}
+		if err = a.createAlert(ctx, reqID, reqData); err != nil {
+			return isNew, trace.Wrap(err, "creating Opsgenie alert")
 		}
 
 		if reqReviews := req.GetReviews(); len(reqReviews) > 0 {
@@ -359,14 +404,48 @@ func (a *App) tryNotifyService(ctx context.Context, req types.AccessRequest) (bo
 	return isNew, nil
 }
 
+func (a *App) getMessageRecipients(ctx context.Context, req types.AccessRequest) ([]common.Recipient, []common.Recipient, error) {
+	recipientSetSchedules := common.NewRecipientSet()
+	recipientSchedules := a.accessMonitoringRules.RecipientsFromAccessMonitoringRules(ctx, req)
+	recipientSchedules.ForEach(func(r common.Recipient) {
+		recipientSetSchedules.Add(r)
+	})
+	// Access Monitoring Rules recipients does not have a way to handle separate recipient types currently.
+	// Recipients from Access Monitoring Rules will be schedules only currently.
+	if recipientSetSchedules.Len() != 0 {
+		return recipientSetSchedules.ToSlice(), nil, nil
+	}
+	rawSchedules, rawTeams, err := a.getNotifySchedulesAndTeams(ctx, req)
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+	for _, rawSchedule := range rawSchedules {
+		recipientSetSchedules.Add(common.Recipient{
+			Name: rawSchedule,
+			ID:   rawSchedule,
+			Kind: common.RecipientKindSchedule,
+		})
+	}
+
+	recipientSetTeams := common.NewRecipientSet()
+	for _, rawTeam := range rawTeams {
+		recipientSetTeams.Add(common.Recipient{
+			Name: rawTeam,
+			ID:   rawTeam,
+			Kind: common.RecipientKindTeam,
+		})
+	}
+	return recipientSetSchedules.ToSlice(), nil, nil
+}
+
 // createAlert posts an alert with request information.
-func (a *App) createAlert(ctx context.Context, serviceID, reqID string, reqData RequestData) error {
+func (a *App) createAlert(ctx context.Context, reqID string, reqData RequestData) error {
 	data, err := a.opsgenie.CreateAlert(ctx, reqID, reqData)
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	ctx, log := logger.WithField(ctx, "opsgenie_alert_id", data.AlertID)
-	log.Info("Successfully created Opsgenie alert")
+	ctx, log := logger.With(ctx, "opsgenie_alert_id", data.AlertID)
+	log.InfoContext(ctx, "Successfully created Opsgenie alert")
 
 	// Save opsgenie alert info in plugin data.
 	_, err = a.modifyPluginData(ctx, reqID, func(existing *PluginData) (PluginData, bool) {
@@ -410,10 +489,10 @@ func (a *App) postReviewNotes(ctx context.Context, reqID string, reqReviews []ty
 		return trace.Wrap(err)
 	}
 	if !ok {
-		logger.Get(ctx).Debug("Failed to post the note: plugin data is missing")
+		logger.Get(ctx).DebugContext(ctx, "Failed to post the note: plugin data is missing")
 		return nil
 	}
-	ctx, _ = logger.WithField(ctx, "opsgenie_alert_id", data.AlertID)
+	ctx, _ = logger.With(ctx, "opsgenie_alert_id", data.AlertID)
 
 	slice := reqReviews[oldCount:]
 	if len(slice) == 0 {
@@ -435,7 +514,7 @@ func (a *App) tryApproveRequest(ctx context.Context, req types.AccessRequest) er
 
 	serviceNames, err := a.getOnCallServiceNames(req)
 	if err != nil {
-		logger.Get(ctx).Debugf("Skipping the approval: %s", err)
+		logger.Get(ctx).DebugContext(ctx, "Skipping approval", "error", err)
 		return nil
 	}
 
@@ -458,7 +537,7 @@ func (a *App) tryApproveRequest(ctx context.Context, req types.AccessRequest) er
 		if _, err := a.teleport.SubmitAccessReview(ctx, types.AccessReviewSubmission{
 			RequestID: req.GetName(),
 			Review: types.AccessReview{
-				Author:        tp.SystemAccessApproverUserName,
+				Author:        a.conf.TeleportUserName,
 				ProposedState: types.RequestState_APPROVED,
 				Reason: fmt.Sprintf("Access requested by user %s who is on call on service(s) %s",
 					tp.SystemAccessApproverUserName,
@@ -468,14 +547,14 @@ func (a *App) tryApproveRequest(ctx context.Context, req types.AccessRequest) er
 			},
 		}); err != nil {
 			if strings.HasSuffix(err.Error(), "has already reviewed this request") {
-				log.Debug("Already reviewed the request")
+				log.DebugContext(ctx, "Already reviewed the request")
 				return nil
 			}
 			return trace.Wrap(err, "submitting access request")
 		}
 
 	}
-	log.Info("Successfully submitted a request approval")
+	log.InfoContext(ctx, "Successfully submitted a request approval")
 	return nil
 }
 
@@ -507,15 +586,15 @@ func (a *App) resolveAlert(ctx context.Context, reqID string, resolution Resolut
 		return trace.Wrap(err)
 	}
 	if !ok {
-		logger.Get(ctx).Debug("Failed to resolve the alert: plugin data is missing")
+		logger.Get(ctx).DebugContext(ctx, "Failed to resolve the alert: plugin data is missing")
 		return nil
 	}
 
-	ctx, log := logger.WithField(ctx, "opsgenie_alert_id", alertID)
+	ctx, log := logger.With(ctx, "opsgenie_alert_id", alertID)
 	if err := a.opsgenie.ResolveAlert(ctx, alertID, resolution); err != nil {
 		return trace.Wrap(err)
 	}
-	log.Info("Successfully resolved the alert")
+	log.InfoContext(ctx, "Successfully resolved the alert")
 
 	return nil
 }

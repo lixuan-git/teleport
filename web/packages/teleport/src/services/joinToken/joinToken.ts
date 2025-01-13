@@ -1,46 +1,112 @@
-/*
-Copyright 2022 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import api from 'teleport/services/api';
 import cfg from 'teleport/config';
+import api from 'teleport/services/api';
 
 import { makeLabelMapOfStrArrs } from '../agents/make';
-
+import { withUnsupportedLabelFeatureErrorConversion } from '../version/unsupported';
 import makeJoinToken from './makeJoinToken';
-import { JoinToken, JoinRule, JoinTokenRequest } from './types';
+import { JoinRule, JoinToken, JoinTokenRequest } from './types';
+
+const TeleportTokenNameHeader = 'X-Teleport-TokenName';
 
 class JoinTokenService {
+  // TODO (avatus) refactor this code to eventually use `createJoinToken`
   fetchJoinToken(
     req: JoinTokenRequest,
     signal: AbortSignal = null
   ): Promise<JoinToken> {
+    // TODO(kimlisa): DELETE IN 19.0 - replaced by v2 endpoint.
+    if (!req.suggestedLabels?.length) {
+      return api
+        .post(
+          cfg.api.discoveryJoinToken.create,
+          {
+            roles: req.roles,
+            join_method: req.method || 'token',
+            allow: makeAllowField(req.rules || []),
+            suggested_agent_matcher_labels: makeLabelMapOfStrArrs(
+              req.suggestedAgentMatcherLabels
+            ),
+          },
+          signal
+        )
+        .then(makeJoinToken);
+    }
+
+    return (
+      api
+        .post(
+          cfg.api.discoveryJoinToken.createV2,
+          {
+            roles: req.roles,
+            join_method: req.method || 'token',
+            allow: makeAllowField(req.rules || []),
+            suggested_agent_matcher_labels: makeLabelMapOfStrArrs(
+              req.suggestedAgentMatcherLabels
+            ),
+            suggested_labels: makeLabelMapOfStrArrs(req.suggestedLabels),
+          },
+          signal
+        )
+        .then(makeJoinToken)
+        // TODO(kimlisa): DELETE IN 19.0
+        .catch(withUnsupportedLabelFeatureErrorConversion)
+    );
+  }
+
+  upsertJoinTokenYAML(
+    req: JoinTokenRequest,
+    tokenName: string
+  ): Promise<JoinToken> {
     return api
-      .post(
-        cfg.getJoinTokenUrl(),
+      .putWithHeaders(
+        cfg.getJoinTokenYamlUrl(),
         {
-          roles: req.roles,
-          join_method: req.method || 'token',
-          allow: makeAllowField(req.rules || []),
-          suggested_agent_matcher_labels: makeLabelMapOfStrArrs(
-            req.suggestedAgentMatcherLabels
-          ),
+          content: req.content,
         },
-        signal
+        {
+          [TeleportTokenNameHeader]: tokenName,
+          'Content-Type': 'application/json',
+        }
       )
       .then(makeJoinToken);
+  }
+
+  createJoinToken(req: JoinTokenRequest): Promise<JoinToken> {
+    return api.post(cfg.getJoinTokensUrl(), req).then(makeJoinToken);
+  }
+
+  fetchJoinTokens(signal: AbortSignal = null): Promise<{ items: JoinToken[] }> {
+    return api.get(cfg.getJoinTokensUrl(), signal).then(resp => {
+      return {
+        items: resp.items?.map(makeJoinToken) || [],
+      };
+    });
+  }
+
+  deleteJoinToken(id: string, signal: AbortSignal = null) {
+    return api.deleteWithHeaders(
+      cfg.getJoinTokensUrl(),
+      { [TeleportTokenNameHeader]: id },
+      signal
+    );
   }
 }
 

@@ -3,19 +3,22 @@ kind: ClusterConfig
 metadata:
   name:
   region:
-  version: "1.23"
+  version: "1.29"
+  tags:
+    teleport.dev/creator:
 
 iam:
   withOIDC: true
 
 addons:
   - name: aws-ebs-csi-driver
-    version: v1.11.4-eksbuild.1
     attachPolicyARNs:
       - arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy
 
 managedNodeGroups:
   - name:
     instanceType: m5.4xlarge
-    minSize: 2
+    minSize: 3
     maxSize: 10
+    tags:
+      teleport.dev/creator:

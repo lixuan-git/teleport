@@ -1,16 +1,20 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package athena
 
@@ -76,25 +80,28 @@ func TestConfig_SetFromURL(t *testing.T) {
 		},
 		{
 			name: "params to querier - part 2",
-			url:  "athena://db.tbl/?getQueryResultsInterval=200ms&limiterRefillAmount=2&&limiterRefillTime=2s&limiterBurst=3",
+			url:  "athena://db.tbl/?getQueryResultsInterval=200ms&limiterRefillAmount=2&&limiterRefillTime=2s&limiterBurst=3&disableSearchCostOptimization=true",
 			want: Config{
-				TableName:               "tbl",
-				Database:                "db",
-				GetQueryResultsInterval: 200 * time.Millisecond,
-				LimiterRefillAmount:     2,
-				LimiterRefillTime:       2 * time.Second,
-				LimiterBurst:            3,
+				TableName:                     "tbl",
+				Database:                      "db",
+				GetQueryResultsInterval:       200 * time.Millisecond,
+				LimiterRefillAmount:           2,
+				LimiterRefillTime:             2 * time.Second,
+				LimiterBurst:                  3,
+				DisableSearchCostOptimization: true,
 			},
 		},
 		{
 			name: "params to batcher",
-			url:  "athena://db.tbl/?queueURL=https://queueURL&batchMaxItems=1000&batchMaxInterval=10s",
+			url:  "athena://db.tbl/?queueURL=https://queueURL&batchMaxItems=1000&batchMaxInterval=10s&consumerLockName=mylock&consumerDisabled=true",
 			want: Config{
 				TableName:        "tbl",
 				Database:         "db",
 				QueueURL:         "https://queueURL",
 				BatchMaxItems:    1000,
 				BatchMaxInterval: 10 * time.Second,
+				ConsumerLockName: "mylock",
+				ConsumerDisabled: true,
 			},
 		},
 		{
@@ -147,15 +154,17 @@ func TestConfig_CheckAndSetDefaults(t *testing.T) {
 		backend.Backend
 	}
 
+	dummyAWSCfg := &aws.Config{}
 	validConfig := Config{
-		Database:      "db",
-		TableName:     "tbl",
-		TopicARN:      "arn:topic",
-		LargeEventsS3: "s3://large-payloads-bucket",
-		LocationS3:    "s3://events-bucket",
-		QueueURL:      "https://queue-url",
-		AWSConfig:     &aws.Config{},
-		Backend:       mockBackend{},
+		Database:                   "db",
+		TableName:                  "tbl",
+		TopicARN:                   "arn:topic",
+		LargeEventsS3:              "s3://large-payloads-bucket",
+		LocationS3:                 "s3://events-bucket",
+		QueueURL:                   "https://queue-url",
+		PublisherConsumerAWSConfig: dummyAWSCfg,
+		Backend:                    mockBackend{},
+		metrics:                    &athenaMetrics{},
 	}
 	tests := []struct {
 		name    string
@@ -169,19 +178,21 @@ func TestConfig_CheckAndSetDefaults(t *testing.T) {
 				return validConfig
 			},
 			want: Config{
-				Database:                "db",
-				TableName:               "tbl",
-				TopicARN:                "arn:topic",
-				LargeEventsS3:           "s3://large-payloads-bucket",
-				largeEventsBucket:       "large-payloads-bucket",
-				LocationS3:              "s3://events-bucket",
-				locationS3Bucket:        "events-bucket",
-				QueueURL:                "https://queue-url",
-				GetQueryResultsInterval: 100 * time.Millisecond,
-				BatchMaxItems:           20000,
-				BatchMaxInterval:        1 * time.Minute,
-				AWSConfig:               &aws.Config{},
-				Backend:                 mockBackend{},
+				Database:                   "db",
+				TableName:                  "tbl",
+				TopicARN:                   "arn:topic",
+				LargeEventsS3:              "s3://large-payloads-bucket",
+				largeEventsBucket:          "large-payloads-bucket",
+				LocationS3:                 "s3://events-bucket",
+				locationS3Bucket:           "events-bucket",
+				QueueURL:                   "https://queue-url",
+				GetQueryResultsInterval:    100 * time.Millisecond,
+				BatchMaxItems:              20000,
+				BatchMaxInterval:           1 * time.Minute,
+				ConsumerLockName:           "",
+				PublisherConsumerAWSConfig: dummyAWSCfg,
+				StorerQuerierAWSConfig:     dummyAWSCfg,
+				Backend:                    mockBackend{},
 			},
 		},
 		{
@@ -193,22 +204,24 @@ func TestConfig_CheckAndSetDefaults(t *testing.T) {
 				return cfg
 			},
 			want: Config{
-				Database:                "db",
-				TableName:               "tbl",
-				TopicARN:                "arn:topic",
-				LargeEventsS3:           "s3://large-payloads-bucket",
-				largeEventsBucket:       "large-payloads-bucket",
-				LocationS3:              "s3://events-bucket",
-				locationS3Bucket:        "events-bucket",
-				QueueURL:                "https://queue-url",
-				GetQueryResultsInterval: 100 * time.Millisecond,
-				BatchMaxItems:           20000,
-				BatchMaxInterval:        1 * time.Minute,
-				AWSConfig:               &aws.Config{},
-				Backend:                 mockBackend{},
-				LimiterRefillTime:       1 * time.Second,
-				LimiterBurst:            10,
-				LimiterRefillAmount:     5,
+				Database:                   "db",
+				TableName:                  "tbl",
+				TopicARN:                   "arn:topic",
+				LargeEventsS3:              "s3://large-payloads-bucket",
+				largeEventsBucket:          "large-payloads-bucket",
+				LocationS3:                 "s3://events-bucket",
+				locationS3Bucket:           "events-bucket",
+				QueueURL:                   "https://queue-url",
+				GetQueryResultsInterval:    100 * time.Millisecond,
+				BatchMaxItems:              20000,
+				BatchMaxInterval:           1 * time.Minute,
+				ConsumerLockName:           "",
+				PublisherConsumerAWSConfig: dummyAWSCfg,
+				StorerQuerierAWSConfig:     dummyAWSCfg,
+				Backend:                    mockBackend{},
+				LimiterRefillTime:          1 * time.Second,
+				LimiterBurst:               10,
+				LimiterRefillAmount:        5,
 			},
 		},
 		{
@@ -227,7 +240,7 @@ func TestConfig_CheckAndSetDefaults(t *testing.T) {
 				cfg.TableName = "table with space"
 				return cfg
 			},
-			wantErr: "TableName can contains only alphanumeric or underscore character",
+			wantErr: "TableName can only contain alphanumeric or underscore character",
 		},
 		{
 			name: "missing topicARN",
@@ -301,7 +314,7 @@ func TestConfig_CheckAndSetDefaults(t *testing.T) {
 			err := cfg.CheckAndSetDefaults(context.Background())
 			if tt.wantErr == "" {
 				require.NoError(t, err, "CheckAndSetDefaults return unexpected err")
-				require.Empty(t, cmp.Diff(tt.want, cfg, cmpopts.EquateApprox(0, 0.0001), cmpopts.IgnoreFields(Config{}, "Clock", "UIDGenerator", "LogEntry", "Tracer"), cmp.AllowUnexported(Config{})))
+				require.Empty(t, cmp.Diff(tt.want, cfg, cmpopts.EquateApprox(0, 0.0001), cmpopts.IgnoreFields(Config{}, "Clock", "UIDGenerator", "Logger", "Tracer", "metrics", "ObserveWriteEventsError"), cmp.AllowUnexported(Config{})))
 			} else {
 				require.ErrorContains(t, err, tt.wantErr)
 			}
@@ -326,7 +339,7 @@ func TestPublisherConsumer(t *testing.T) {
 			ID:   uuid.NewString(),
 			Time: time.Now().UTC(),
 			Type: events.AppCreateEvent,
-			Code: strings.Repeat("d", 2*maxSNSMessageSize),
+			Code: strings.Repeat("d", 2*maxDirectMessageSize),
 		},
 		AppMetadata: apievents.AppMetadata{
 			AppName: "app-large",
@@ -409,8 +422,8 @@ func TestPublisherConsumer(t *testing.T) {
 			fq := newFakeQueue()
 			p := &publisher{
 				PublisherConfig: PublisherConfig{
-					SNSPublisher: fq,
-					Uploader:     fS3,
+					MessagePublisher: fq,
+					Uploader:         fS3,
 				},
 			}
 			cfg := validCollectCfgForTests(t)

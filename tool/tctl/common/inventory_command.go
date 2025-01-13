@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package common
 
@@ -29,10 +31,12 @@ import (
 	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/asciitable"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/service/servicecfg"
 	"github.com/gravitational/teleport/lib/utils"
 	vc "github.com/gravitational/teleport/lib/versioncontrol"
+	commonclient "github.com/gravitational/teleport/tool/tctl/common/client"
+	tctlcfg "github.com/gravitational/teleport/tool/tctl/common/config"
 )
 
 // InventoryCommand implements the `tctl inventory` family of commands.
@@ -62,7 +66,7 @@ type InventoryCommand struct {
 }
 
 // Initialize allows AccessRequestCommand to plug itself into the CLI parser
-func (c *InventoryCommand) Initialize(app *kingpin.Application, config *servicecfg.Config) {
+func (c *InventoryCommand) Initialize(app *kingpin.Application, _ *tctlcfg.GlobalCLIFlags, config *servicecfg.Config) {
 	c.config = config
 	inventory := app.Command("inventory", "Manage Teleport instance inventory.").Hidden()
 
@@ -83,21 +87,29 @@ func (c *InventoryCommand) Initialize(app *kingpin.Application, config *servicec
 }
 
 // TryRun takes the CLI command as an argument (like "inventory status") and executes it.
-func (c *InventoryCommand) TryRun(ctx context.Context, cmd string, client auth.ClientI) (match bool, err error) {
+func (c *InventoryCommand) TryRun(ctx context.Context, cmd string, clientFunc commonclient.InitFunc) (match bool, err error) {
+	var commandFunc func(ctx context.Context, client *authclient.Client) error
 	switch cmd {
 	case c.inventoryStatus.FullCommand():
-		err = c.Status(ctx, client)
+		commandFunc = c.Status
 	case c.inventoryList.FullCommand():
-		err = c.List(ctx, client)
+		commandFunc = c.List
 	case c.inventoryPing.FullCommand():
-		err = c.Ping(ctx, client)
+		commandFunc = c.Ping
 	default:
 		return false, nil
 	}
+	client, closeFn, err := clientFunc(ctx)
+	if err != nil {
+		return false, trace.Wrap(err)
+	}
+	err = commandFunc(ctx, client)
+	closeFn(ctx)
+
 	return true, trace.Wrap(err)
 }
 
-func (c *InventoryCommand) Status(ctx context.Context, client auth.ClientI) error {
+func (c *InventoryCommand) Status(ctx context.Context, client *authclient.Client) error {
 	rsp, err := client.GetInventoryStatus(ctx, proto.InventoryStatusRequest{
 		Connected: c.getConnected,
 	})
@@ -172,15 +184,23 @@ func printHierarchicalData(data map[string]any, indent string, depth int) {
 	}
 }
 
-func (c *InventoryCommand) List(ctx context.Context, client auth.ClientI) error {
+func (c *InventoryCommand) List(ctx context.Context, client *authclient.Client) error {
 	var services []types.SystemRole
 	var err error
+	var omitControlPlane bool
 	if c.services != "" {
 		services, err = types.ParseTeleportRoles(c.services)
 		if err != nil {
 			return trace.Wrap(err)
 		}
+	} else {
+		resp, err := client.Ping(ctx)
+		if err != nil {
+			return trace.Wrap(err)
+		}
+		omitControlPlane = resp.GetServerFeatures().GetCloud()
 	}
+
 	upgrader := c.upgrader
 	var noUpgrader bool
 	if upgrader == "none" {
@@ -200,9 +220,16 @@ func (c *InventoryCommand) List(ctx context.Context, client auth.ClientI) error 
 
 	switch c.format {
 	case teleport.Text:
-		table := asciitable.MakeTable([]string{"Server ID", "Hostname", "Services", "Version", "Upgrader"})
+		table := asciitable.MakeTable([]string{"Server ID", "Hostname", "Services", "Agent Version", "Upgrader", "Upgrader Version"})
 		for instances.Next() {
 			instance := instances.Item()
+
+			// The auth and proxy services should be omitted from the inventory list
+			// on Managed Teleport Enterprise (Cloud-Hosted) instances.
+			if omitControlPlane && (instance.HasService(types.RoleAuth) || instance.HasService(types.RoleProxy)) {
+				continue
+			}
+
 			services := make([]string, 0, len(instance.GetServices()))
 			for _, s := range instance.GetServices() {
 				services = append(services, string(s))
@@ -213,12 +240,18 @@ func (c *InventoryCommand) List(ctx context.Context, client auth.ClientI) error 
 				upgrader = "none"
 			}
 
+			upgraderVersion := instance.GetExternalUpgraderVersion()
+			if upgraderVersion == "" {
+				upgraderVersion = "none"
+			}
+
 			table.AddRow([]string{
 				instance.GetName(),
 				instance.GetHostname(),
 				strings.Join(services, ","),
 				instance.GetTeleportVersion(),
 				upgrader,
+				upgraderVersion,
 			})
 		}
 
@@ -239,7 +272,7 @@ func (c *InventoryCommand) List(ctx context.Context, client auth.ClientI) error 
 	}
 }
 
-func (c *InventoryCommand) Ping(ctx context.Context, client auth.ClientI) error {
+func (c *InventoryCommand) Ping(ctx context.Context, client *authclient.Client) error {
 	rsp, err := client.PingInventory(ctx, proto.InventoryPingRequest{
 		ServerID:   c.serverID,
 		ControlLog: c.controlLog,

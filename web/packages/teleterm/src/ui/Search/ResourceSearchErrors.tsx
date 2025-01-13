@@ -1,36 +1,37 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React from 'react';
+import { ButtonIcon, ButtonSecondary, H2, Text } from 'design';
 import DialogConfirmation, {
   DialogContent,
   DialogFooter,
   DialogHeader,
 } from 'design/DialogConfirmation';
-import { ButtonIcon, ButtonSecondary, Text } from 'design';
 import { Cross } from 'design/Icon';
 
 import { ResourceSearchError } from 'teleterm/ui/services/resources';
-
 import type * as uri from 'teleterm/ui/uri';
 
 export function ResourceSearchErrors(props: {
   errors: ResourceSearchError[];
   getClusterName: (resourceUri: uri.ClusterOrResourceUri) => string;
   onCancel: () => void;
+  hidden?: boolean;
 }) {
   const formattedErrorText = props.errors
     .map(error => error.messageAndCauseWithClusterName(props.getClusterName))
@@ -38,17 +39,16 @@ export function ResourceSearchErrors(props: {
 
   return (
     <DialogConfirmation
-      open={true}
+      open={!props.hidden}
+      keepInDOMAfterClose
       onClose={props.onCancel}
       dialogCss={() => ({
         maxWidth: '800px',
         width: '100%',
       })}
     >
-      <DialogHeader justifyContent="space-between" mb={0} alignItems="baseline">
-        <Text typography="h4" bold>
-          Resource search errors
-        </Text>
+      <DialogHeader justifyContent="space-between" alignItems="baseline">
+        <H2>Resource search errors</H2>
         <ButtonIcon
           type="button"
           onClick={props.onCancel}
@@ -58,7 +58,7 @@ export function ResourceSearchErrors(props: {
         </ButtonIcon>
       </DialogHeader>
       <DialogContent mb={4}>
-        <Text typography="body1" color="text.slightlyMuted">
+        <Text typography="body2" color="text.slightlyMuted">
           <pre
             css={`
               padding: ${props => props.theme.space[2]}px;

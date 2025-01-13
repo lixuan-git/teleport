@@ -1,33 +1,36 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package common
 
 import (
 	"context"
-	"fmt"
+	"encoding/hex"
+	"log/slog"
 	"time"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	"github.com/sirupsen/logrus"
 
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/api/utils/retryutils"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/services"
 )
@@ -35,11 +38,11 @@ import (
 // UserProvisioner handles automatic database user creation.
 type UserProvisioner struct {
 	// AuthClient is the cluster auth server client.
-	AuthClient *auth.Client
+	AuthClient *authclient.Client
 	// Backend is the particular database implementation.
 	Backend AutoUsers
 	// Log is the logger.
-	Log logrus.FieldLogger
+	Log *slog.Logger
 	// Clock is the clock to use.
 	Clock clockwork.Clock
 }
@@ -50,7 +53,7 @@ type UserProvisioner struct {
 // database has been established to release the cluster lock acquired by this
 // function to make sure no 2 processes run user activation simultaneously.
 func (a *UserProvisioner) Activate(ctx context.Context, sessionCtx *Session) (func(), error) {
-	if !sessionCtx.AutoCreateUser {
+	if !sessionCtx.AutoCreateUserMode.IsEnabled() {
 		return func() {}, nil
 	}
 
@@ -61,16 +64,20 @@ func (a *UserProvisioner) Activate(ctx context.Context, sessionCtx *Session) (fu
 				"administrator")
 	}
 
-	if sessionCtx.Database.GetAdminUser() == "" {
+	if sessionCtx.Database.GetAdminUser().Name == "" {
 		return nil, trace.BadParameter(
 			"your Teleport role requires automatic database user provisioning " +
 				"but this database doesn't have admin user configured, contact " +
 				"your Teleport administrator")
 	}
 
+	// Observe.
+	defer methodCallMetrics("UserProvisioner:Activate", teleport.ComponentDatabase, sessionCtx.Database)()
+
 	retryCtx, cancel := context.WithTimeout(ctx, defaults.DatabaseConnectTimeout)
 	defer cancel()
 
+	a.Log.DebugContext(ctx, "Activating database user", "user", sessionCtx.DatabaseUser)
 	lease, err := services.AcquireSemaphoreWithRetry(retryCtx, a.makeAcquireSemaphoreConfig(sessionCtx))
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -79,7 +86,7 @@ func (a *UserProvisioner) Activate(ctx context.Context, sessionCtx *Session) (fu
 	release := func() {
 		err := a.AuthClient.CancelSemaphoreLease(ctx, *lease)
 		if err != nil {
-			a.Log.WithError(err).Errorf("Failed to cancel lease: %v.", lease)
+			a.Log.ErrorContext(ctx, "Failed to cancel lease.", "lease", lease, "error", err)
 		}
 	}
 
@@ -95,11 +102,24 @@ func (a *UserProvisioner) Activate(ctx context.Context, sessionCtx *Session) (fu
 	return release, nil
 }
 
-// Deactivate disables a database user.
-func (a *UserProvisioner) Deactivate(ctx context.Context, sessionCtx *Session) error {
-	if !sessionCtx.AutoCreateUser {
-		return nil
+// Teardown chooses and call the auto provisioner method used to cleanup a
+// database user.
+func (a *UserProvisioner) Teardown(ctx context.Context, sessionCtx *Session) error {
+	var err error
+	switch sessionCtx.AutoCreateUserMode {
+	case types.CreateDatabaseUserMode_DB_USER_MODE_KEEP:
+		err = a.deactivate(ctx, sessionCtx)
+	case types.CreateDatabaseUserMode_DB_USER_MODE_BEST_EFFORT_DROP:
+		err = a.delete(ctx, sessionCtx)
 	}
+
+	return trace.Wrap(err)
+}
+
+// deactivate disables a database user.
+func (a *UserProvisioner) deactivate(ctx context.Context, sessionCtx *Session) error {
+	defer methodCallMetrics("UserProvisioner:Deactivate", teleport.ComponentDatabase, sessionCtx.Database)()
+	a.Log.DebugContext(ctx, "Deactivating database user", "user", sessionCtx.DatabaseUser)
 
 	retryCtx, cancel := context.WithTimeout(ctx, defaults.DatabaseConnectTimeout)
 	defer cancel()
@@ -112,11 +132,40 @@ func (a *UserProvisioner) Deactivate(ctx context.Context, sessionCtx *Session) e
 	defer func() {
 		err := a.AuthClient.CancelSemaphoreLease(ctx, *lease)
 		if err != nil {
-			a.Log.WithError(err).Errorf("Failed to cancel lease: %v.", lease)
+			a.Log.ErrorContext(ctx, "Failed to cancel lease.", "lease", lease, "error", err)
 		}
 	}()
 
 	err = a.Backend.DeactivateUser(ctx, sessionCtx)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	return nil
+}
+
+// delete deletes a database user.
+func (a *UserProvisioner) delete(ctx context.Context, sessionCtx *Session) error {
+	// Observe.
+	defer methodCallMetrics("UserProvisioner:Delete", teleport.ComponentDatabase, sessionCtx.Database)()
+	a.Log.DebugContext(ctx, "Deleting database user", "user", sessionCtx.DatabaseUser)
+
+	retryCtx, cancel := context.WithTimeout(ctx, defaults.DatabaseConnectTimeout)
+	defer cancel()
+
+	lease, err := services.AcquireSemaphoreWithRetry(retryCtx, a.makeAcquireSemaphoreConfig(sessionCtx))
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	defer func() {
+		err := a.AuthClient.CancelSemaphoreLease(ctx, *lease)
+		if err != nil {
+			a.Log.ErrorContext(ctx, "Failed to cancel lease.", "lease", lease, "error", err)
+		}
+	}()
+
+	err = a.Backend.DeleteUser(ctx, sessionCtx)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -132,7 +181,9 @@ func (a *UserProvisioner) makeAcquireSemaphoreConfig(sessionCtx *Session) servic
 		// in a minute anyway.
 		Request: types.AcquireSemaphoreRequest{
 			SemaphoreKind: "db-auto-users",
-			SemaphoreName: fmt.Sprintf("%v-%v", sessionCtx.Database.GetName(), sessionCtx.DatabaseUser),
+			// The name of the sempahore is encoded to prevent any invalid characters
+			// in a user's name from being rejected by the backend when creating the semaphore.
+			SemaphoreName: hex.EncodeToString([]byte(sessionCtx.Database.GetName() + "-" + sessionCtx.DatabaseUser)),
 			MaxLeases:     1,
 			Expires:       a.Clock.Now().Add(time.Minute),
 		},

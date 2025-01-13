@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package proxy
 
@@ -30,7 +32,6 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/uuid"
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
@@ -49,6 +50,7 @@ import (
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/kube/proxy/responsewriters"
 	testingkubemock "github.com/gravitational/teleport/lib/kube/proxy/testing/kube_server"
+	"github.com/gravitational/teleport/lib/utils"
 )
 
 func TestListPodRBAC(t *testing.T) {
@@ -58,6 +60,7 @@ func TestListPodRBAC(t *testing.T) {
 		usernameWithLimitedAccess     = "limited_user"
 		usernameWithDenyRule          = "denied_user"
 		usernameWithoutListVerbAccess = "no_list_user"
+		usernameWithTraits            = "trait_user"
 		testPodName                   = "test"
 	)
 	// kubeMock is a Kubernetes API mock for the session tests.
@@ -119,6 +122,31 @@ func TestListPodRBAC(t *testing.T) {
 							Kind:      types.KindKubePod,
 							Name:      types.Wildcard,
 							Namespace: metav1.NamespaceDefault,
+							Verbs:     []string{types.Wildcard},
+						},
+					})
+			},
+		},
+	)
+
+	userWithTraits, _ := testCtx.CreateUserWithTraitsAndRole(
+		testCtx.Context,
+		t,
+		usernameWithTraits,
+		map[string][]string{
+			"namespaces": {metav1.NamespaceDefault},
+		},
+		RoleSpec{
+			Name:       usernameWithTraits,
+			KubeUsers:  roleKubeUsers,
+			KubeGroups: roleKubeGroups,
+			SetupRoleFunc: func(r types.Role) {
+				r.SetKubeResources(types.Allow,
+					[]types.KubernetesResource{
+						{
+							Kind:      types.KindKubePod,
+							Name:      types.Wildcard,
+							Namespace: "{{external.namespaces}}",
 							Verbs:     []string{types.Wildcard},
 						},
 					})
@@ -217,6 +245,7 @@ func TestListPodRBAC(t *testing.T) {
 	}
 	type want struct {
 		listPodsResult   []string
+		listPodErr       error
 		getTestPodResult error
 	}
 	tests := []struct {
@@ -272,6 +301,34 @@ func TestListPodRBAC(t *testing.T) {
 			name: "list pods in every namespace for user with default namespace",
 			args: args{
 				user:      userWithNamespaceAccess,
+				namespace: metav1.NamespaceAll,
+			},
+			want: want{
+				listPodsResult: []string{
+					"default/nginx-1",
+					"default/nginx-2",
+					"default/test",
+				},
+			},
+		},
+		{
+			name: "list default namespace pods for user with traits for default namespace",
+			args: args{
+				user:      userWithTraits,
+				namespace: metav1.NamespaceDefault,
+			},
+			want: want{
+				listPodsResult: []string{
+					"default/nginx-1",
+					"default/nginx-2",
+					"default/test",
+				},
+			},
+		},
+		{
+			name: "list pods in every namespace for user with default namespace traits",
+			args: args{
+				user:      userWithTraits,
 				namespace: metav1.NamespaceAll,
 			},
 			want: want{
@@ -373,6 +430,14 @@ func TestListPodRBAC(t *testing.T) {
 			},
 			want: want{
 				listPodsResult: []string{},
+				listPodErr: &kubeerrors.StatusError{
+					ErrStatus: metav1.Status{
+						Status:  "Failure",
+						Message: "pods is forbidden: User \"limited_user\" cannot list resource \"pods\" in API group \"\" in the namespace \"default\"",
+						Code:    403,
+						Reason:  metav1.StatusReasonForbidden,
+					},
+				},
 				getTestPodResult: &kubeerrors.StatusError{
 					ErrStatus: metav1.Status{
 						Status:  "Failure",
@@ -392,6 +457,14 @@ func TestListPodRBAC(t *testing.T) {
 			},
 			want: want{
 				listPodsResult: []string{},
+				listPodErr: &kubeerrors.StatusError{
+					ErrStatus: metav1.Status{
+						Status:  "Failure",
+						Message: "pods is forbidden: User \"no_list_user\" cannot list resource \"pods\" in API group \"\" in the namespace \"default\"",
+						Code:    403,
+						Reason:  metav1.StatusReasonForbidden,
+					},
+				},
 			},
 		},
 	}
@@ -418,8 +491,12 @@ func TestListPodRBAC(t *testing.T) {
 				testCtx.Context,
 				metav1.ListOptions{},
 			)
-			require.NoError(t, err)
-
+			if tt.want.listPodErr != nil {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tt.want.listPodErr.Error())
+			} else {
+				require.NoError(t, err)
+			}
 			require.Equal(t, tt.want.listPodsResult, getPodsFromPodList(rsp.Items))
 
 			_, err = client.CoreV1().Pods(metav1.NamespaceDefault).Get(
@@ -441,8 +518,6 @@ func TestListPodRBAC(t *testing.T) {
 func TestWatcherResponseWriter(t *testing.T) {
 	defaultNamespace := "default"
 	devNamespace := "dev"
-	log := logrus.New()
-	log.SetLevel(logrus.DebugLevel)
 	t.Parallel()
 	statusErr := &metav1.Status{
 		TypeMeta: metav1.TypeMeta{
@@ -556,7 +631,7 @@ func TestWatcherResponseWriter(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			userReader, userWriter := io.Pipe()
 			negotiator := newClientNegotiator(&globalKubeCodecs)
-			filterWrapper := newResourceFilterer(types.KindKubePod, types.KubeVerbWatch, &globalKubeCodecs, tt.args.allowed, tt.args.denied, log)
+			filterWrapper := newResourceFilterer(types.KindKubePod, types.KubeVerbWatch, &globalKubeCodecs, tt.args.allowed, tt.args.denied, utils.NewSlogLoggerForTests())
 			// watcher parses the data written into itself and if the user is allowed to
 			// receive the update, it writes the event into target.
 			watcher, err := responsewriters.NewWatcherResponseWriter(newFakeResponseWriter(userWriter) /*target*/, negotiator, filterWrapper)
@@ -854,6 +929,7 @@ func TestDeletePodCollectionRBAC(t *testing.T) {
 		name        string
 		args        args
 		deletedPods []string
+		wantErr     bool
 	}{
 		{
 			name: "delete pods in default namespace for user with full access",
@@ -886,6 +962,7 @@ func TestDeletePodCollectionRBAC(t *testing.T) {
 				user:      userWithNamespaceAccess,
 				namespace: "dev",
 			},
+			wantErr:     true,
 			deletedPods: []string{},
 		},
 		{
@@ -925,8 +1002,11 @@ func TestDeletePodCollectionRBAC(t *testing.T) {
 				},
 				metav1.ListOptions{},
 			)
-			require.NoError(t, err)
-
+			if tt.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
 			require.Equal(t, tt.deletedPods, kubeMock.DeletedPods(string(requestID)))
 		})
 	}
@@ -1011,6 +1091,7 @@ func TestListClusterRoleRBAC(t *testing.T) {
 	}
 	type want struct {
 		listClusterRolesResult []string
+		listClusterErr         error
 		getTestResult          error
 	}
 	tests := []struct {
@@ -1069,6 +1150,14 @@ func TestListClusterRoleRBAC(t *testing.T) {
 			},
 			want: want{
 				listClusterRolesResult: []string{},
+				listClusterErr: &kubeerrors.StatusError{
+					ErrStatus: metav1.Status{
+						Status:  "Failure",
+						Message: "clusterroles is forbidden: User \"limited_user\" cannot list resource \"clusterroles\" in API group \"rbac.authorization.k8s.io\" ",
+						Code:    403,
+						Reason:  metav1.StatusReasonForbidden,
+					},
+				},
 				getTestResult: &kubeerrors.StatusError{
 					ErrStatus: metav1.Status{
 						Status:  "Failure",
@@ -1105,8 +1194,12 @@ func TestListClusterRoleRBAC(t *testing.T) {
 				testCtx.Context,
 				metav1.ListOptions{},
 			)
-			require.NoError(t, err)
-
+			if tt.want.listClusterErr != nil {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tt.want.listClusterErr.Error())
+			} else {
+				require.NoError(t, err)
+			}
 			require.Equal(t, tt.want.listClusterRolesResult, getClusterRolesFromList(rsp.Items))
 
 			_, err = client.RbacV1().ClusterRoles().Get(
@@ -1221,6 +1314,7 @@ func TestCustomResourcesRBAC(t *testing.T) {
 	}
 	type want struct {
 		listTeleportRolesResult []string
+		wantListErr             bool
 		getTestResult           error
 	}
 	tests := []struct {
@@ -1281,6 +1375,7 @@ func TestCustomResourcesRBAC(t *testing.T) {
 				},
 			},
 			want: want{
+				wantListErr: true,
 				getTestResult: &kubeerrors.StatusError{
 					ErrStatus: metav1.Status{
 						Status:  "Failure",
@@ -1340,21 +1435,26 @@ func TestCustomResourcesRBAC(t *testing.T) {
 			list := getTeleroleUnstructured("TeleportRole")
 
 			err = client.List(context.Background(), list)
-			require.NoError(t, err)
-
-			require.True(t, list.IsList())
 			var teleportRolesList []string
-			// iterate over the list of teleport roles and get the namespace and name
-			// of each role in the format <namespace>/<name>
-			require.NoError(
-				t,
-				list.EachListItem(
-					func(itemI runtime.Object) error {
-						item := itemI.(*unstructured.Unstructured)
-						teleportRolesList = append(teleportRolesList, item.GetNamespace()+"/"+item.GetName())
-						return nil
-					},
-				))
+			if tt.want.wantListErr {
+				require.Error(t, err)
+				return
+			} else {
+				require.NoError(t, err)
+				require.True(t, list.IsList())
+
+				// iterate over the list of teleport roles and get the namespace and name
+				// of each role in the format <namespace>/<name>
+				require.NoError(
+					t,
+					list.EachListItem(
+						func(itemI runtime.Object) error {
+							item := itemI.(*unstructured.Unstructured)
+							teleportRolesList = append(teleportRolesList, item.GetNamespace()+"/"+item.GetName())
+							return nil
+						},
+					))
+			}
 
 			require.ElementsMatch(t, tt.want.listTeleportRolesResult, teleportRolesList)
 

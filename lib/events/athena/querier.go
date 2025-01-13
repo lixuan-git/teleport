@@ -1,24 +1,32 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package athena
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -26,14 +34,21 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/athena"
 	athenaTypes "github.com/aws/aws-sdk-go-v2/service/athena/types"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go/tracing/smithyoteltracing"
+	"github.com/dustin/go-humanize"
 	"github.com/google/uuid"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	log "github.com/sirupsen/logrus"
+	"github.com/parquet-go/parquet-go"
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	oteltrace "go.opentelemetry.io/otel/trace"
 
 	"github.com/gravitational/teleport"
+	auditlogpb "github.com/gravitational/teleport/api/gen/proto/go/teleport/auditlog/v1"
+	"github.com/gravitational/teleport/api/internalutils/stream"
 	"github.com/gravitational/teleport/api/types"
 	apievents "github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/lib/defaults"
@@ -58,6 +73,7 @@ type querier struct {
 	querierConfig
 
 	athenaClient athenaClient
+	s3Getter     s3Getter
 }
 
 type athenaClient interface {
@@ -66,16 +82,28 @@ type athenaClient interface {
 	GetQueryResults(ctx context.Context, params *athena.GetQueryResultsInput, optFns ...func(*athena.Options)) (*athena.GetQueryResultsOutput, error)
 }
 
+type s3Getter interface {
+	GetObject(ctx context.Context, params *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error)
+	ListObjectsV2(ctx context.Context, params *s3.ListObjectsV2Input, optFns ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
+}
+
 type querierConfig struct {
 	tablename               string
 	database                string
 	workgroup               string
 	queryResultsS3          string
+	locationS3Bucket        string
+	locationS3Prefix        string
 	getQueryResultsInterval time.Duration
+	// getQueryResultsInitialDelay allows to set custom getQueryResultsInitialDelay.
+	// If not provided, default will be used.
+	getQueryResultsInitialDelay time.Duration
+
+	disableQueryCostOptimization bool
 
 	clock  clockwork.Clock
 	awsCfg *aws.Config
-	logger log.FieldLogger
+	logger *slog.Logger
 
 	// tracer is used to create spans
 	tracer oteltrace.Tracer
@@ -97,10 +125,13 @@ func (cfg *querierConfig) CheckAndSetDefaults() error {
 		return trace.BadParameter("empty awsCfg in athena querier")
 	}
 
+	if cfg.getQueryResultsInitialDelay == 0 {
+		cfg.getQueryResultsInitialDelay = getQueryResultsInitialDelay
+	}
+
 	if cfg.logger == nil {
-		cfg.logger = log.WithFields(log.Fields{
-			trace.Component: teleport.ComponentAthena,
-		})
+		cfg.logger = slog.With(teleport.ComponentKey, teleport.ComponentAthena)
+
 	}
 	if cfg.clock == nil {
 		cfg.clock = clockwork.NewRealClock()
@@ -119,7 +150,12 @@ func newQuerier(cfg querierConfig) (*querier, error) {
 		return nil, trace.Wrap(err)
 	}
 	return &querier{
-		athenaClient:  athena.NewFromConfig(*cfg.awsCfg),
+		athenaClient: athena.NewFromConfig(*cfg.awsCfg, func(o *athena.Options) {
+			o.TracerProvider = smithyoteltracing.Adapt(otel.GetTracerProvider())
+		}),
+		s3Getter: s3.NewFromConfig(*cfg.awsCfg, func(o *s3.Options) {
+			o.TracerProvider = smithyoteltracing.Adapt(otel.GetTracerProvider())
+		}),
 		querierConfig: cfg,
 	}, nil
 }
@@ -135,17 +171,374 @@ func (q *querier) SearchEvents(ctx context.Context, req events.SearchEventsReque
 		),
 	)
 	defer span.End()
-	filter := searchEventsFilter{eventTypes: req.EventTypes}
+
+	var startKeyset *keyset
+	if req.StartKey != "" {
+		var err error
+		startKeyset, err = fromKey(req.StartKey, req.Order)
+		if err != nil {
+			return nil, "", trace.BadParameter("unsupported keyset format: %v", err)
+		}
+	}
+
+	from := req.From
+	to := req.To
+	// If startKeyset is not nil, we can take shorten time range by taking value
+	// from key set. From ASC order we modify 'from', for desc - 'to'.
+	// This is useful because event-exporter plugin is using always quering with
+	// the same from value, and it's using keyset to query for further data.
+	// For example if exporter started 2023-01-01 and today is 2023-06-01, it will
+	// call with value from=2023-01-01, to=2023-06-01 and ketset.T = 2023-06-01.
+	// Values before 2023-06-01 will be filtered by athena engine, however
+	// it will cause data scans on large timerange.
+	if startKeyset != nil {
+		if req.Order == types.EventOrderAscending && startKeyset.t.After(from) {
+			from = startKeyset.t.UTC()
+		}
+		if req.Order == types.EventOrderDescending && startKeyset.t.Before(to) {
+			to = startKeyset.t.UTC()
+		}
+	}
+
+	// If pagination key was used and range is big, try to optimize costs by
+	// doing queries on smaller range.
+	// This is temporary workaround for polling of event exporter
+	// until we have new API for exporting events.
+	if q.canOptimizePaginatedSearchCosts(ctx, startKeyset, from, to) {
+		events, keyset, err := q.costOptimizedPaginatedSearch(ctx, searchEventsRequest{
+			fromUTC:   from.UTC(),
+			toUTC:     to.UTC(),
+			limit:     req.Limit,
+			order:     req.Order,
+			startKey:  startKeyset,
+			filter:    searchEventsFilter{eventTypes: req.EventTypes},
+			sessionID: "",
+		})
+		return events, keyset, trace.Wrap(err)
+	}
+
 	events, keyset, err := q.searchEvents(ctx, searchEventsRequest{
-		fromUTC:   req.From.UTC(),
-		toUTC:     req.To.UTC(),
+		fromUTC:   from.UTC(),
+		toUTC:     to.UTC(),
 		limit:     req.Limit,
 		order:     req.Order,
-		startKey:  req.StartKey,
-		filter:    filter,
+		startKey:  startKeyset,
+		filter:    searchEventsFilter{eventTypes: req.EventTypes},
 		sessionID: "",
 	})
 	return events, keyset, trace.Wrap(err)
+}
+
+// ExportUnstructuredEvents exports events from a given event chunk returned by GetEventExportChunks. This API prioritizes
+// performance over ordering and filtering, and is intended for bulk export of events.
+func (q *querier) ExportUnstructuredEvents(ctx context.Context, req *auditlogpb.ExportUnstructuredEventsRequest) stream.Stream[*auditlogpb.ExportEventUnstructured] {
+	startTime := req.Date.AsTime()
+	if startTime.IsZero() {
+		return stream.Fail[*auditlogpb.ExportEventUnstructured](trace.BadParameter("missing required parameter 'date'"))
+	}
+
+	if req.Chunk == "" {
+		return stream.Fail[*auditlogpb.ExportEventUnstructured](trace.BadParameter("missing required parameter 'chunk'"))
+	}
+
+	date := startTime.Format(time.DateOnly)
+
+	var cursor athenaExportCursor
+
+	if req.Cursor != "" {
+		if err := cursor.Decode(req.Cursor); err != nil {
+			return stream.Fail[*auditlogpb.ExportEventUnstructured](trace.Wrap(err))
+		}
+	}
+
+	events := q.streamEventsFromChunk(ctx, date, req.Chunk)
+
+	events = stream.Skip(events, int(cursor.pos))
+
+	return stream.FilterMap(events, func(e eventParquet) (*auditlogpb.ExportEventUnstructured, bool) {
+		cursor.pos++
+		event, err := auditEventFromParquet(e)
+		if err != nil {
+			q.logger.WarnContext(ctx, "skipping export of audit event due to failed decoding",
+				"error", err,
+				"date", date,
+				"chunk", req.Chunk,
+				"pos", cursor.pos,
+			)
+			return nil, false
+		}
+
+		unstructuredEvent, err := apievents.ToUnstructured(event)
+		if err != nil {
+			q.logger.WarnContext(ctx, "skipping export of audit event due to failed conversion to unstructured event",
+				"error", err,
+				"date", date,
+				"chunk", req.Chunk,
+				"pos", cursor.pos,
+			)
+
+			return nil, false
+		}
+
+		return &auditlogpb.ExportEventUnstructured{
+			Event:  unstructuredEvent,
+			Cursor: cursor.Encode(),
+		}, true
+	})
+}
+
+// athenaExportCursors follow the format a1:<pos>.
+type athenaExportCursor struct {
+	pos int64
+}
+
+func (c *athenaExportCursor) Encode() string {
+	return fmt.Sprintf("a1:%d", c.pos)
+}
+
+func (c *athenaExportCursor) Decode(key string) error {
+	parts := strings.Split(key, ":")
+	if len(parts) != 2 {
+		return trace.BadParameter("invalid key format")
+	}
+	if parts[0] != "a1" {
+		return trace.BadParameter("unsupported cursor format (expected a1, got %q)", parts[0])
+	}
+	pos, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	c.pos = pos
+	return nil
+}
+
+// GetEventExportChunks returns a stream of event chunks that can be exported via ExportUnstructuredEvents. The returned
+// list isn't ordered and polling for new chunks requires re-consuming the entire stream from the beginning.
+func (q *querier) GetEventExportChunks(ctx context.Context, req *auditlogpb.GetEventExportChunksRequest) stream.Stream[*auditlogpb.EventExportChunk] {
+	dt := req.Date.AsTime()
+	if dt.IsZero() {
+		return stream.Fail[*auditlogpb.EventExportChunk](trace.BadParameter("missing required parameter 'date'"))
+	}
+
+	date := dt.Format(time.DateOnly)
+
+	prefix := fmt.Sprintf("%s/%s/", q.locationS3Prefix, date)
+
+	var continuationToken *string
+	firstPage := true
+
+	return stream.PageFunc(func() ([]*auditlogpb.EventExportChunk, error) {
+		if !firstPage && continuationToken == nil {
+			// no more pages available.
+			return nil, io.EOF
+		}
+
+		firstPage = false
+
+		rsp, err := q.s3Getter.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(q.locationS3Bucket),
+			Prefix:            aws.String(prefix),
+			ContinuationToken: continuationToken,
+		})
+		if err != nil {
+			var nsk *s3types.NoSuchKey
+			if continuationToken == nil && errors.As(err, &nsk) {
+				q.logger.DebugContext(ctx, "no event chunks found for date",
+					"date", date,
+					"error", err,
+				)
+				// no pages available
+				return nil, io.EOF
+			}
+			q.logger.ErrorContext(ctx, "failed to list event chunk objects in S3",
+				"error", err,
+				"date", date,
+			)
+			return nil, trace.Wrap(err)
+		}
+
+		continuationToken = rsp.NextContinuationToken
+
+		chunks := make([]*auditlogpb.EventExportChunk, 0, len(rsp.Contents))
+
+		for _, obj := range rsp.Contents {
+			fullKey := aws.ToString(obj.Key)
+
+			if !strings.HasSuffix(fullKey, ".parquet") {
+				q.logger.DebugContext(ctx, "skipping non-parquet s3 file",
+					"key", fullKey,
+					"date", date,
+				)
+				continue
+			}
+
+			chunkID := strings.TrimSuffix(strings.TrimPrefix(fullKey, prefix), ".parquet")
+			if chunkID == "" {
+				q.logger.WarnContext(ctx, "skipping empty parquet file name",
+					"key", fullKey,
+					"date", date,
+				)
+				continue
+			}
+
+			chunks = append(chunks, &auditlogpb.EventExportChunk{
+				Chunk: chunkID,
+			})
+		}
+
+		return chunks, nil
+	})
+}
+
+func (q *querier) streamEventsFromChunk(ctx context.Context, date, chunk string) stream.Stream[eventParquet] {
+	data, err := q.readEventChunk(ctx, date, chunk)
+	if err != nil {
+		return stream.Fail[eventParquet](err)
+	}
+
+	reader := parquet.NewGenericReader[eventParquet](bytes.NewReader(data))
+
+	closer := func() {
+		reader.Close()
+	}
+
+	return stream.Func(func() (eventParquet, error) {
+		// conventional wisdom says that we should use a larger persistent buffer here
+		// but in loadtesting this API was abserved having almost twice the throughput
+		// with a single element local buf variable instead.
+		var buf [1]eventParquet
+		_, err := reader.Read(buf[:])
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return eventParquet{}, io.EOF
+			}
+			return eventParquet{}, trace.Wrap(err)
+		}
+		return buf[0], nil
+	}, closer)
+}
+
+func (q *querier) readEventChunk(ctx context.Context, date, chunk string) ([]byte, error) {
+	getObjectInput := &s3.GetObjectInput{
+		Bucket: aws.String(q.locationS3Bucket),
+		Key:    aws.String(fmt.Sprintf("%s/%s/%s.parquet", q.locationS3Prefix, date, chunk)),
+	}
+	getObjectOutput, err := q.s3Getter.GetObject(ctx, getObjectInput)
+	if err != nil {
+		var nsk *s3types.NoSuchKey
+		if errors.As(err, &nsk) {
+			q.logger.DebugContext(ctx, "event chunk not found",
+				"date", date,
+				"chunk", chunk,
+				"error", err,
+			)
+			return nil, trace.NotFound("event chunk %q not found", chunk)
+		}
+		q.logger.ErrorContext(ctx, "failed to get event chunk",
+			"error", err,
+			"date", date,
+		)
+
+		return nil, trace.Wrap(err)
+	}
+
+	defer getObjectOutput.Body.Close()
+
+	// ideally we'd start streaming events immediately without waiting for the read to
+	// complete. in practice thats tricky since the parquet reader wants methods that aren't
+	// typically available on lazy readers. we may be able to eek out a bit more performance by
+	// implementing a custom wrapper that lazily loads all bytes into an unlimited size buffer
+	// so that we can support methods like Seek and ReadAt, which aren't available on buffered
+	// readers with fixed sizes.
+	return io.ReadAll(getObjectOutput.Body)
+}
+
+func (q *querier) canOptimizePaginatedSearchCosts(ctx context.Context, startKey *keyset, from, to time.Time) bool {
+	return !q.disableQueryCostOptimization && startKey != nil && to.Sub(from) > 24*time.Hour
+}
+
+// costOptimizedPaginatedSearch instead of scanning data on big time range from request
+// do scans on smaller ranges first and if there are not enough results,
+// it extends range using steps, up to original time range.
+// It's temporary workaround to reduce costs when event exporter is executing
+// search events endpoint using big time range and requesting only small amount
+// of data.
+// Ex. For timerange (2023-04-01 12:00, 2023-08-01 12:00) we will do following calls:
+// - 1. (2023-04-01 12:00, 2023-04-01 13:00) - 1h increase
+// - 2. (2023-04-01 12:00, 2023-04-02 12:00) - 24h increase
+// - 3. (2023-04-01 12:00, 2023-04-08 12:00) - 24*7h increase
+// - 4. (2023-04-01 12:00, 2023-05-01 12:00) - 24*30h increase
+// - 5. (2023-04-01 12:00, 2023-08-01 12:00) - original range.
+// If any of steps returns enough data based on limit, we return immediately.
+func (q *querier) costOptimizedPaginatedSearch(ctx context.Context, req searchEventsRequest) ([]apievents.AuditEvent, string, error) {
+	var events []apievents.AuditEvent
+	var err error
+	var keyset string
+
+	toUTC := req.toUTC
+	fromUTC := req.fromUTC
+
+	for _, dateToMod := range prepareTimeRangesForCostOptimizedSearch(req.fromUTC, req.toUTC, req.order) {
+		if req.order == types.EventOrderAscending {
+			toUTC = dateToMod.UTC()
+			q.logger.DebugContext(ctx, "Doing cost optimized query by modifying to date", "requested_dated", req.toUTC, "modified_date", toUTC)
+		} else {
+			fromUTC = dateToMod.UTC()
+			q.logger.DebugContext(ctx, "Doing cost optimized query by modifying from date", "requested_date", req.fromUTC, "modified_date", fromUTC)
+
+		}
+		events, keyset, err = q.searchEvents(ctx, searchEventsRequest{
+			fromUTC:   fromUTC,
+			toUTC:     toUTC,
+			limit:     req.limit,
+			order:     req.order,
+			startKey:  req.startKey,
+			filter:    req.filter,
+			sessionID: req.sessionID,
+		})
+		if err != nil {
+			return nil, "", trace.Wrap(err)
+		}
+
+		if keyset != "" {
+			// means limit is reached, we can return now.
+			return events, keyset, nil
+		}
+	}
+	// if we never had non empty keyset, we return just last response
+	// which was on original range.
+	return events, keyset, nil
+}
+
+// prepareTimeRangesForCostOptimizedSearch based on order, prepare slice of timestamps
+// which should be used for modification of to/from in searchEvents call.
+func prepareTimeRangesForCostOptimizedSearch(from, to time.Time, order types.EventOrder) []time.Time {
+	stepsToIncrease := []time.Duration{
+		1 * time.Hour,
+		24 * time.Hour,
+		7 * 24 * time.Hour,
+		30 * 24 * time.Hour,
+	}
+	var out []time.Time
+
+	if order == types.EventOrderAscending {
+		for _, durationToAdd := range stepsToIncrease {
+			if newTo := from.Add(durationToAdd); newTo.Before(to) {
+				out = append(out, newTo)
+			}
+		}
+		// at the end add original range.
+		out = append(out, to)
+	} else {
+		for _, durationToAdd := range stepsToIncrease {
+			if newFrom := to.Add(-1 * durationToAdd); newFrom.After(from) {
+				out = append(out, newFrom)
+			}
+		}
+		// at the end add original range.
+		out = append(out, from)
+	}
+	return out
 }
 
 func (q *querier) SearchSessionEvents(ctx context.Context, req events.SearchSessionEventsRequest) ([]apievents.AuditEvent, string, error) {
@@ -161,7 +554,7 @@ func (q *querier) SearchSessionEvents(ctx context.Context, req events.SearchSess
 	defer span.End()
 	// TODO(tobiaszheller): maybe if fromUTC is 0000-00-00, ask first last 30days and fallback to -inf - now-30
 	// for sessionID != "". This kind of call is done on RBAC to check if user can access that session.
-	filter := searchEventsFilter{eventTypes: []string{events.SessionEndEvent, events.WindowsDesktopSessionEndEvent}}
+	filter := searchEventsFilter{eventTypes: events.SessionRecordingEvents}
 	if req.Cond != nil {
 		condFn, err := utils.ToFieldsCondition(req.Cond)
 		if err != nil {
@@ -169,12 +562,41 @@ func (q *querier) SearchSessionEvents(ctx context.Context, req events.SearchSess
 		}
 		filter.condition = condFn
 	}
+
+	var startKeyset *keyset
+	if req.StartKey != "" {
+		var err error
+		startKeyset, err = fromKey(req.StartKey, req.Order)
+		if err != nil {
+			return nil, "", trace.BadParameter("unsupported keyset format: %v", err)
+		}
+	}
+
+	from := req.From
+	to := req.To
+	// If startKeyset is not nil, we can take shorten time range by taking value
+	// from key set. From ASC order we modify 'from', for desc - 'to'.
+	// This is useful because event-exporter plugin is using always quering with
+	// the same from value, and it's using keyset to query for further data.
+	// For example if exporter started 2023-01-01 and today is 2023-06-01, it will
+	// call with value from=2023-01-01, to=2023-06-01 and ketset.T = 2023-06-01.
+	// Values before 2023-06-01 will be filtered by athena engine, however
+	// it will cause data scans on large timerange.
+	if startKeyset != nil {
+		if req.Order == types.EventOrderAscending && startKeyset.t.After(from) {
+			from = startKeyset.t.UTC()
+		}
+		if req.Order == types.EventOrderDescending && startKeyset.t.Before(to) {
+			to = startKeyset.t.UTC()
+		}
+	}
+
 	events, keyset, err := q.searchEvents(ctx, searchEventsRequest{
-		fromUTC:   req.From.UTC(),
-		toUTC:     req.To.UTC(),
+		fromUTC:   from,
+		toUTC:     to,
 		limit:     req.Limit,
 		order:     req.Order,
-		startKey:  req.StartKey,
+		startKey:  startKeyset,
 		filter:    filter,
 		sessionID: req.SessionID,
 	})
@@ -185,7 +607,7 @@ type searchEventsRequest struct {
 	fromUTC, toUTC time.Time
 	limit          int
 	order          types.EventOrder
-	startKey       string
+	startKey       *keyset
 	filter         searchEventsFilter
 	sessionID      string
 }
@@ -200,24 +622,28 @@ func (q *querier) searchEvents(ctx context.Context, req searchEventsRequest) ([]
 	}
 
 	query, params, err := prepareQuery(searchParams{
-		fromUTC:   req.fromUTC,
-		toUTC:     req.toUTC,
-		order:     req.order,
-		limit:     limit,
-		startKey:  req.startKey,
-		filter:    req.filter,
-		sessionID: req.sessionID,
-		tablename: q.tablename,
+		fromUTC:     req.fromUTC,
+		toUTC:       req.toUTC,
+		order:       req.order,
+		limit:       limit,
+		startKeyset: req.startKey,
+		filter:      req.filter,
+		sessionID:   req.sessionID,
+		tablename:   q.tablename,
 	})
 	if err != nil {
 		return nil, "", trace.Wrap(err)
 	}
 
-	q.logger.WithField("query", query).
-		WithField("params", params).
-		WithField("startKey", req.startKey).
-		Debug("Executing events query on Athena")
-
+	startTime := time.Now()
+	defer func() {
+		q.logger.DebugContext(ctx, "Executed events query on Athena",
+			"query", query,
+			"params", params,
+			"start_key", req.startKey,
+			"duration", time.Since(startTime),
+		)
+	}()
 	queryId, err := q.startQueryExecution(ctx, query, params)
 	if err != nil {
 		return nil, "", trace.Wrap(err)
@@ -272,7 +698,7 @@ type searchParams struct {
 	fromUTC, toUTC time.Time
 	limit          int
 	order          types.EventOrder
-	startKey       string
+	startKeyset    *keyset
 	filter         searchEventsFilter
 	sessionID      string
 	tablename      string
@@ -282,15 +708,6 @@ type searchParams struct {
 // To prevent SQL injection, Athena supports parametrized query.
 // As parameter placeholder '?' should be used.
 func prepareQuery(params searchParams) (query string, execParams []string, err error) {
-	var startKeyset *keyset
-	if params.startKey != "" {
-		var err error
-		startKeyset, err = fromKey(params.startKey, params.order)
-		if err != nil {
-			return "", nil, trace.BadParameter("unsupported keyset format: %v", err)
-		}
-	}
-
 	qb := &queryBuilder{}
 	qb.Append(`SELECT DISTINCT uid, event_time, event_data FROM `)
 	// tablename is validated during config validation.
@@ -299,28 +716,9 @@ func prepareQuery(params searchParams) (query string, execParams []string, err e
 	// Athena does not support passing table name as query parameters.
 	qb.Append(params.tablename)
 
-	from := params.fromUTC
-	to := params.toUTC
-	// If startKeyset is not nil, we can take shorten time range by taking value
-	// from key set. From ASC order we modify 'from', for desc - 'to'.
-	// This is useful because event-exporter plugin is using always quering with
-	// the same from value, and it's using keyset to query for further data.
-	// For example if exporter started 2023-01-01 and today is 2023-06-01, it will
-	// call with value from=2023-01-01, to=2023-06-01 and ketset.T = 2023-06-01.
-	// Values before 2023-06-01 will be filtered by athena engine, however
-	// it will cause data scans on large timerange.
-	if startKeyset != nil {
-		if params.order == types.EventOrderAscending && startKeyset.t.After(from) {
-			from = startKeyset.t.UTC()
-		}
-		if params.order == types.EventOrderDescending && startKeyset.t.Before(to) {
-			to = startKeyset.t.UTC()
-		}
-	}
-
-	qb.Append(` WHERE event_date BETWEEN date(?) AND date(?)`, withTicks(from.Format(time.DateOnly)), withTicks(to.Format(time.DateOnly)))
+	qb.Append(` WHERE event_date BETWEEN date(?) AND date(?)`, withTicks(params.fromUTC.Format(time.DateOnly)), withTicks(params.toUTC.Format(time.DateOnly)))
 	qb.Append(` AND event_time BETWEEN ? and ?`,
-		fmt.Sprintf("timestamp '%s'", from.Format(athenaTimestampFormat)), fmt.Sprintf("timestamp '%s'", to.Format(athenaTimestampFormat)))
+		fmt.Sprintf("timestamp '%s'", params.fromUTC.Format(athenaTimestampFormat)), fmt.Sprintf("timestamp '%s'", params.toUTC.Format(athenaTimestampFormat)))
 
 	if params.sessionID != "" {
 		qb.Append(" AND session_id = ?", withTicks(params.sessionID))
@@ -340,16 +738,16 @@ func prepareQuery(params searchParams) (query string, execParams []string, err e
 	}
 
 	if params.order == types.EventOrderAscending {
-		if startKeyset != nil {
+		if params.startKeyset != nil {
 			qb.Append(` AND (event_time, uid) > (?,?)`,
-				fmt.Sprintf("timestamp '%s'", startKeyset.t.Format(athenaTimestampFormat)), fmt.Sprintf("'%s'", startKeyset.uid.String()))
+				fmt.Sprintf("timestamp '%s'", params.startKeyset.t.Format(athenaTimestampFormat)), fmt.Sprintf("'%s'", params.startKeyset.uid.String()))
 		}
 
 		qb.Append(` ORDER BY event_time ASC, uid ASC`)
 	} else {
-		if startKeyset != nil {
+		if params.startKeyset != nil {
 			qb.Append(` AND (event_time, uid) < (?,?)`,
-				fmt.Sprintf("timestamp '%s'", startKeyset.t.Format(athenaTimestampFormat)), fmt.Sprintf("'%s'", startKeyset.uid.String()))
+				fmt.Sprintf("timestamp '%s'", params.startKeyset.t.Format(athenaTimestampFormat)), fmt.Sprintf("'%s'", params.startKeyset.uid.String()))
 		}
 		qb.Append(` ORDER BY event_time DESC, uid DESC`)
 	}
@@ -406,7 +804,7 @@ func (q *querier) waitForSuccess(ctx context.Context, queryId string) error {
 		if i == 0 {
 			// we want a longer initial delay because processing execution on athena takes some time
 			// and that's no real benefit to ask earlier.
-			interval = getQueryResultsInitialDelay
+			interval = q.getQueryResultsInitialDelay
 		}
 		select {
 		case <-ctx.Done():
@@ -445,7 +843,9 @@ func (q *querier) fetchResults(ctx context.Context, queryId string, limit int, c
 		),
 	)
 	defer span.End()
-	rb := &responseBuilder{}
+	rb := &responseBuilder{
+		logger: q.logger,
+	}
 	// nextToken is used as offset to next calls for GetQueryResults.
 	var nextToken string
 	for {
@@ -501,6 +901,8 @@ type responseBuilder struct {
 	output []apievents.AuditEvent
 	// totalSize is used to track size of output
 	totalSize int
+
+	logger *slog.Logger
 }
 
 func (r *responseBuilder) endKeyset() (*keyset, error) {
@@ -559,7 +961,62 @@ func (rb *responseBuilder) appendUntilSizeLimit(resultResp *athena.GetQueryResul
 		}
 
 		if len(eventData)+rb.totalSize > events.MaxEventBytesInResponse {
-			return true, nil
+			// Encountered an event that would push the total page over the size
+			// limit.
+			if len(rb.output) > 0 {
+				// There are already one or more full events to return, just
+				// return them and the next event will be picked up on the next
+				// page.
+				return true, nil
+			}
+			// A single event is larger than the max page size - the best we can
+			// do is try to trim it.
+			event = event.TrimToMaxSize(events.MaxEventBytesInResponse)
+
+			// Check to make sure the trimmed event is small enough.
+			fields, err = events.ToEventFields(event)
+			if err != nil {
+				return false, trace.Wrap(err)
+			}
+			marshalledEvent, err := utils.FastMarshal(&fields)
+			if err != nil {
+				return false, trace.Wrap(err, "failed to marshal event, %s", eventData)
+			}
+			if len(marshalledEvent)+rb.totalSize <= events.MaxEventBytesInResponse {
+				events.MetricQueriedTrimmedEvents.Inc()
+				// Exact rb.totalSize doesn't really matter since the response is
+				// already size limited.
+				rb.totalSize += events.MaxEventBytesInResponse
+				rb.output = append(rb.output, event)
+				return true, nil
+			}
+
+			// Failed to trim the event to size. The only options are to return
+			// a response with 0 events, skip this event, or return an error.
+			//
+			// Silently skipping events is a terrible option, it's better for
+			// the client to get an error.
+			//
+			// Returning 0 events amounts to either skipping the event or
+			// getting the client stuck in a paging loop depending on what would
+			// be returned for the next page token.
+			//
+			// Returning a descriptive error should at least give the client a
+			// hint as to what has gone wrong so that an attempt can be made to
+			// fix it.
+			//
+			// If this condition is reached it should be considered a bug, any
+			// event that can possibly exceed the maximum size should implement
+			// TrimToMaxSize (until we can one day implement an API for storing
+			// and retrieving large events).
+			rb.logger.ErrorContext(context.Background(), "Failed to query event exceeding maximum response size.",
+				"event_type", event.GetType(),
+				"event_id", event.GetID(),
+				"event_size", len(eventData),
+			)
+			return true, trace.Errorf(
+				"%s event %s is %s and cannot be returned because it exceeds the maximum response size of %s",
+				event.GetType(), event.GetID(), humanize.IBytes(uint64(len(eventData))), humanize.IBytes(events.MaxEventBytesInResponse))
 		}
 		rb.totalSize += len(eventData)
 		rb.output = append(rb.output, event)

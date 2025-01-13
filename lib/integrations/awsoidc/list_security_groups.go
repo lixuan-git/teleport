@@ -1,18 +1,20 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package awsoidc
 
@@ -89,6 +91,19 @@ type SecurityGroupRule struct {
 
 	// CIDRs contains a list of IP ranges that this rule applies to and a description for the value.
 	CIDRs []CIDR `json:"cidrs"`
+
+	// Groups is a list of rules that allow another security group referenced
+	// by ID.
+	Groups []GroupIDRule `json:"groups"`
+}
+
+// GroupIDRule is a security group rule that refers to another security group by
+// ID and has a description.
+type GroupIDRule struct {
+	// GroupId is the ID of the security group that is allowed by the rule.
+	GroupId string `json:"groupId"`
+	// Description contains a small text describing the CIDR.
+	Description string `json:"description"`
 }
 
 // CIDR has a CIDR (IP Range) and a description for the value.
@@ -185,11 +200,25 @@ func convertAWSIPPermissions(permissions []ec2Types.IpPermission) []SecurityGrou
 			ipProtocol = aws.ToString(permission.IpProtocol)
 		}
 
-		cidrs := make([]CIDR, 0, len(permission.IpRanges))
+		var cidrs []CIDR
+		if len(permission.IpRanges) > 0 {
+			cidrs = make([]CIDR, 0, len(permission.IpRanges))
+		}
 		for _, r := range permission.IpRanges {
 			cidrs = append(cidrs, CIDR{
 				CIDR:        aws.ToString(r.CidrIp),
 				Description: aws.ToString(r.Description),
+			})
+		}
+
+		var groupIDs []GroupIDRule
+		if len(permission.UserIdGroupPairs) > 0 {
+			groupIDs = make([]GroupIDRule, 0, len(permission.UserIdGroupPairs))
+		}
+		for _, pair := range permission.UserIdGroupPairs {
+			groupIDs = append(groupIDs, GroupIDRule{
+				GroupId:     aws.ToString(pair.GroupId),
+				Description: aws.ToString(pair.Description),
 			})
 		}
 
@@ -201,6 +230,7 @@ func convertAWSIPPermissions(permissions []ec2Types.IpPermission) []SecurityGrou
 			FromPort:   fromPort,
 			ToPort:     toPort,
 			CIDRs:      cidrs,
+			Groups:     groupIDs,
 		})
 	}
 

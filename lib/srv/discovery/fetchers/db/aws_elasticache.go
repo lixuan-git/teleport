@@ -1,18 +1,21 @@
 /*
-Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package db
 
 import (
@@ -26,7 +29,6 @@ import (
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/cloud"
 	libcloudaws "github.com/gravitational/teleport/lib/cloud/aws"
-	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/srv/discovery/common"
 )
 
@@ -47,7 +49,9 @@ func (f *elastiCachePlugin) ComponentShortName() string {
 // TODO(greedy52) support ElastiCache global datastore.
 func (f *elastiCachePlugin) GetDatabases(ctx context.Context, cfg *awsFetcherConfig) (types.Databases, error) {
 	ecClient, err := cfg.AWSClients.GetAWSElastiCacheClient(ctx, cfg.Region,
-		cloud.WithAssumeRole(cfg.AssumeRole.RoleARN, cfg.AssumeRole.ExternalID))
+		cloud.WithAssumeRole(cfg.AssumeRole.RoleARN, cfg.AssumeRole.ExternalID),
+		cloud.WithCredentialsMaybeIntegration(cfg.Integration),
+	)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -58,15 +62,18 @@ func (f *elastiCachePlugin) GetDatabases(ctx context.Context, cfg *awsFetcherCon
 
 	var eligibleClusters []*elasticache.ReplicationGroup
 	for _, cluster := range clusters {
-		if !services.IsElastiCacheClusterSupported(cluster) {
-			cfg.Log.Debugf("ElastiCache cluster %q is not supported. Skipping.", aws.StringValue(cluster.ReplicationGroupId))
+		if !libcloudaws.IsElastiCacheClusterSupported(cluster) {
+			cfg.Logger.DebugContext(ctx, "Skipping unsupported ElastiCache cluster",
+				"cluster", aws.StringValue(cluster.ReplicationGroupId),
+			)
 			continue
 		}
 
-		if !services.IsElastiCacheClusterAvailable(cluster) {
-			cfg.Log.Debugf("The current status of ElastiCache cluster %q is %q. Skipping.",
-				aws.StringValue(cluster.ReplicationGroupId),
-				aws.StringValue(cluster.Status))
+		if !libcloudaws.IsElastiCacheClusterAvailable(cluster) {
+			cfg.Logger.DebugContext(ctx, "Skipping unavailable ElastiCache cluster",
+				"cluster", aws.StringValue(cluster.ReplicationGroupId),
+				"status", aws.StringValue(cluster.Status),
+			)
 			continue
 		}
 
@@ -82,17 +89,17 @@ func (f *elastiCachePlugin) GetDatabases(ctx context.Context, cfg *awsFetcherCon
 	allNodes, err := getElastiCacheNodes(ctx, ecClient)
 	if err != nil {
 		if trace.IsAccessDenied(err) {
-			cfg.Log.WithError(err).Debug("No permissions to describe nodes")
+			cfg.Logger.DebugContext(ctx, "No permissions to describe nodes", "error", err)
 		} else {
-			cfg.Log.WithError(err).Info("Failed to describe nodes.")
+			cfg.Logger.InfoContext(ctx, "Failed to describe nodes", "error", err)
 		}
 	}
 	allSubnetGroups, err := getElastiCacheSubnetGroups(ctx, ecClient)
 	if err != nil {
 		if trace.IsAccessDenied(err) {
-			cfg.Log.WithError(err).Debug("No permissions to describe subnet groups")
+			cfg.Logger.DebugContext(ctx, "No permissions to describe subnet groups", "error", err)
 		} else {
-			cfg.Log.WithError(err).Info("Failed to describe subnet groups.")
+			cfg.Logger.InfoContext(ctx, "Failed to describe subnet groups", "error", err)
 		}
 	}
 
@@ -104,17 +111,22 @@ func (f *elastiCachePlugin) GetDatabases(ctx context.Context, cfg *awsFetcherCon
 		tags, err := getElastiCacheResourceTags(ctx, ecClient, cluster.ARN)
 		if err != nil {
 			if trace.IsAccessDenied(err) {
-				cfg.Log.WithError(err).Debug("No permissions to list resource tags")
+				cfg.Logger.DebugContext(ctx, "No permissions to list resource tags", "error", err)
 			} else {
-				cfg.Log.WithError(err).Infof("Failed to list resource tags for ElastiCache cluster %q.", aws.StringValue(cluster.ReplicationGroupId))
+				cfg.Logger.InfoContext(ctx, "Failed to list resource tags for ElastiCache cluster",
+					"cluster", aws.StringValue(cluster.ReplicationGroupId),
+					"error", err,
+				)
 			}
 		}
 
-		extraLabels := services.ExtraElastiCacheLabels(cluster, tags, allNodes, allSubnetGroups)
+		extraLabels := common.ExtraElastiCacheLabels(cluster, tags, allNodes, allSubnetGroups)
 
-		if dbs, err := services.NewDatabasesFromElastiCacheReplicationGroup(cluster, extraLabels); err != nil {
-			cfg.Log.Infof("Could not convert ElastiCache cluster %q to database resources: %v.",
-				aws.StringValue(cluster.ReplicationGroupId), err)
+		if dbs, err := common.NewDatabasesFromElastiCacheReplicationGroup(cluster, extraLabels); err != nil {
+			cfg.Logger.InfoContext(ctx, "Could not convert ElastiCache cluster to database resources",
+				"cluster", aws.StringValue(cluster.ReplicationGroupId),
+				"error", err,
+			)
 		} else {
 			databases = append(databases, dbs...)
 		}

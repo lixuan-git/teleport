@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package proxy
 
@@ -35,6 +37,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/portforward"
 	clientremotecommand "k8s.io/client-go/tools/remotecommand"
 	"k8s.io/client-go/transport"
 
@@ -68,16 +71,14 @@ type wsStreamClient struct {
 	cacheBuff *bytes.Buffer
 	conn      *gwebsocket.Conn
 	mu        *sync.Mutex
-	localPort *int32
 	readyChan chan struct{}
 	listener  net.Listener
 }
 
 type websocketOption func(*wsStreamClient)
 
-func withLocalPortforwarding(port int32, readyChan chan struct{}) websocketOption {
+func withLocalPortforwarding(readyChan chan struct{}) websocketOption {
 	return func(c *wsStreamClient) {
-		c.localPort = &port
 		c.readyChan = readyChan
 	}
 }
@@ -130,6 +131,15 @@ func newWebSocketClient(config *rest.Config, method string, u *url.URL, opts ...
 //	CLOSE
 func (e *wsStreamClient) StreamWithContext(_ context.Context, options clientremotecommand.StreamOptions) error {
 	return trace.Wrap(e.Stream(options))
+}
+
+func (e *wsStreamClient) GetPorts() ([]portforward.ForwardedPort, error) {
+	return []portforward.ForwardedPort{
+		{
+			Local:  uint16(e.listener.Addr().(*net.TCPAddr).Port),
+			Remote: 8080,
+		},
+	}, nil
 }
 
 // Stream copies the contents from stdin into the connection and respective stdout and stderr
@@ -377,14 +387,15 @@ const (
 // Due to portforward websocket limitations, the listener do not accept
 // concurrent connections.
 func (e *wsStreamClient) portforward(remoteConn *gwebsocket.Conn) (err error) {
-	if e.localPort == nil || e.readyChan == nil {
+	if e.readyChan == nil {
 		return trace.BadParameter("cannot use portforward without proper initialization")
 	}
 
-	e.listener, err = net.Listen("tcp", fmt.Sprintf("localhost:%d", *e.localPort))
+	e.listener, err = net.Listen("tcp", "localhost:0")
 	if err != nil {
 		return trace.Wrap(err)
 	}
+
 	close(e.readyChan)
 	for {
 		conn, err := e.listener.Accept()

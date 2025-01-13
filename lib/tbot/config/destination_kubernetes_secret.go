@@ -1,18 +1,20 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package config
 
@@ -23,7 +25,8 @@ import (
 	"sync"
 
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel/attribute"
+	oteltrace "go.opentelemetry.io/otel/trace"
 	corev1 "k8s.io/api/core/v1"
 	kubeerrors "k8s.io/apimachinery/pkg/api/errors"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -39,6 +42,10 @@ type DestinationKubernetesSecret struct {
 	// Name is the name the Kubernetes Secret that should be created and written
 	// to.
 	Name string `yaml:"name"`
+	// Labels is a set of labels to apply to the output Kubernetes secret.
+	// When configured, these labels will overwrite any existing labels on the
+	// secret.
+	Labels map[string]string `yaml:"labels,omitempty"`
 
 	mu          sync.Mutex
 	namespace   string
@@ -66,6 +73,7 @@ func (dks *DestinationKubernetesSecret) secretTemplate() *corev1.Secret {
 		ObjectMeta: v1.ObjectMeta{
 			Name:      dks.Name,
 			Namespace: dks.namespace,
+			Labels:    dks.Labels,
 		},
 		Data: map[string][]byte{},
 	}
@@ -76,6 +84,12 @@ func (dks *DestinationKubernetesSecret) upsertSecret(ctx context.Context, secret
 		WithData(secret.Data).
 		WithResourceVersion(secret.ResourceVersion).
 		WithType(secret.Type)
+
+	// If user has configured labels, we overwrite the labels on the secret.
+	if len(dks.Labels) > 0 {
+		apply = apply.
+			WithLabels(dks.Labels)
+	}
 
 	applyOpts := v1.ApplyOptions{
 		FieldManager: "tbot",
@@ -162,6 +176,13 @@ func (dks *DestinationKubernetesSecret) Init(ctx context.Context, subdirs []stri
 }
 
 func (dks *DestinationKubernetesSecret) Write(ctx context.Context, name string, data []byte) error {
+	ctx, span := tracer.Start(
+		ctx,
+		"DestinationKubernetesSecret/Write",
+		oteltrace.WithAttributes(attribute.String("name", name)),
+	)
+	defer span.End()
+
 	dks.mu.Lock()
 	defer dks.mu.Unlock()
 	if dks.initialized == false {
@@ -173,10 +194,12 @@ func (dks *DestinationKubernetesSecret) Write(ctx context.Context, name string, 
 		if !kubeerrors.IsNotFound(err) {
 			return trace.Wrap(err)
 		}
-		log.WithFields(logrus.Fields{
-			"secret_name":      dks.Name,
-			"secret_namespace": dks.namespace,
-		}).Warn("Kubernetes secret missing on attempt to write data. One will be created.")
+		log.WarnContext(
+			ctx,
+			"Kubernetes secret missing on attempt to write data. One will be created.",
+			"secret_name", dks.Name,
+			"secret_namespace", dks.namespace,
+		)
 		// If the secret doesn't exist, we create it on write - this is ensures
 		// that we can recover if the secret is deleted between renewal loops.
 		secret = dks.secretTemplate()
@@ -188,7 +211,52 @@ func (dks *DestinationKubernetesSecret) Write(ctx context.Context, name string, 
 	return trace.Wrap(err)
 }
 
+// WriteMany allows you to write multiple artifacts to a destination at once.
+// This should be atomic, meaning all artifacts are written or none are. Any
+// artifacts that are not specified will be removed from the destination.
+func (dks *DestinationKubernetesSecret) WriteMany(ctx context.Context, toWrite map[string][]byte) error {
+	ctx, span := tracer.Start(
+		ctx,
+		"DestinationKubernetesSecret/WriteMany",
+	)
+	defer span.End()
+
+	dks.mu.Lock()
+	defer dks.mu.Unlock()
+	if dks.initialized == false {
+		return trace.BadParameter("destination has not been initialized")
+	}
+
+	secret, err := dks.getSecret(ctx)
+	if err != nil {
+		if !kubeerrors.IsNotFound(err) {
+			return trace.Wrap(err)
+		}
+		log.WarnContext(
+			ctx,
+			"Kubernetes secret missing on attempt to write data. One will be created.",
+			"secret_name", dks.Name,
+			"secret_namespace", dks.namespace,
+		)
+		// If the secret doesn't exist, we create it on write - this is ensures
+		// that we can recover if the secret is deleted between renewal loops.
+		secret = dks.secretTemplate()
+	}
+
+	secret.Data = toWrite
+
+	err = dks.upsertSecret(ctx, secret, false)
+	return trace.Wrap(err)
+}
+
 func (dks *DestinationKubernetesSecret) Read(ctx context.Context, name string) ([]byte, error) {
+	ctx, span := tracer.Start(
+		ctx,
+		"DestinationKubernetesSecret/Read",
+		oteltrace.WithAttributes(attribute.String("name", name)),
+	)
+	defer span.End()
+
 	dks.mu.Lock()
 	defer dks.mu.Unlock()
 	if dks.initialized == false {
@@ -218,4 +286,8 @@ func (dks *DestinationKubernetesSecret) String() string {
 func (dks *DestinationKubernetesSecret) MarshalYAML() (interface{}, error) {
 	type raw DestinationKubernetesSecret
 	return withTypeHeader((*raw)(dks), DestinationKubernetesSecretType)
+}
+
+func (dks *DestinationKubernetesSecret) IsPersistent() bool {
+	return true
 }

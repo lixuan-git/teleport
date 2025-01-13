@@ -1,16 +1,20 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package pgbk
 
@@ -135,10 +139,9 @@ func (w *wal2jsonMessage) Events() ([]backend.Event, error) {
 		return []backend.Event{{
 			Type: types.OpPut,
 			Item: backend.Item{
-				Key:      key,
+				Key:      backend.KeyFromString(string(key)),
 				Value:    value,
 				Expires:  expires.UTC(),
-				ID:       idFromRevision(revision),
 				Revision: revisionToString(revision),
 			},
 		}}, nil
@@ -151,7 +154,7 @@ func (w *wal2jsonMessage) Events() ([]backend.Event, error) {
 		return []backend.Event{{
 			Type: types.OpDelete,
 			Item: backend.Item{
-				Key: key,
+				Key: backend.KeyFromString(string(key)),
 			},
 		}}, nil
 
@@ -193,15 +196,14 @@ func (w *wal2jsonMessage) Events() ([]backend.Event, error) {
 			return []backend.Event{{
 				Type: types.OpDelete,
 				Item: backend.Item{
-					Key: oldKey,
+					Key: backend.KeyFromString(string(oldKey)),
 				},
 			}, {
 				Type: types.OpPut,
 				Item: backend.Item{
-					Key:      key,
+					Key:      backend.KeyFromString(string(key)),
 					Value:    value,
 					Expires:  expires.UTC(),
-					ID:       idFromRevision(revision),
 					Revision: revisionToString(revision),
 				},
 			}}, nil
@@ -210,10 +212,9 @@ func (w *wal2jsonMessage) Events() ([]backend.Event, error) {
 		return []backend.Event{{
 			Type: types.OpPut,
 			Item: backend.Item{
-				Key:      key,
+				Key:      backend.KeyFromString(string(key)),
 				Value:    value,
 				Expires:  expires.UTC(),
-				ID:       idFromRevision(revision),
 				Revision: revisionToString(revision),
 			},
 		}}, nil

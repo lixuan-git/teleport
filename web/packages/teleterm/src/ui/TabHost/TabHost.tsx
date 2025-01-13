@@ -1,40 +1,49 @@
-/*
-Copyright 2019 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React from 'react';
+import React, { useCallback } from 'react';
 import styled from 'styled-components';
+
 import { Flex } from 'design';
 
+import { Shell } from 'teleterm/mainProcess/shell';
 import { useAppContext } from 'teleterm/ui/appContextProvider';
-import * as types from 'teleterm/ui/services/workspacesService/documentsService/types';
-import { Tabs } from 'teleterm/ui/Tabs';
 import { DocumentsRenderer } from 'teleterm/ui/Documents/DocumentsRenderer';
-import { IAppContext } from 'teleterm/ui/types';
 import { useKeyboardShortcutFormatters } from 'teleterm/ui/services/keyboardShortcuts';
+import { useWorkspaceServiceState } from 'teleterm/ui/services/workspacesService';
+import * as types from 'teleterm/ui/services/workspacesService/documentsService/types';
+import { canDocChangeShell } from 'teleterm/ui/services/workspacesService/documentsService/types';
+import { Tabs } from 'teleterm/ui/Tabs';
+import { IAppContext } from 'teleterm/ui/types';
 
-import { useTabShortcuts } from './useTabShortcuts';
-import { useNewTabOpener } from './useNewTabOpener';
+import { useStoreSelector } from '../hooks/useStoreSelector';
 import { ClusterConnectPanel } from './ClusterConnectPanel/ClusterConnectPanel';
+import { useNewTabOpener } from './useNewTabOpener';
+import { useTabShortcuts } from './useTabShortcuts';
 
 export function TabHostContainer(props: {
   topBarContainerRef: React.MutableRefObject<HTMLDivElement>;
 }) {
   const ctx = useAppContext();
-  ctx.workspacesService.useState();
-  const isRootClusterSelected = !!ctx.workspacesService.getRootClusterUri();
+  const isRootClusterSelected = useStoreSelector(
+    'workspacesService',
+    useCallback(state => !!state.rootClusterUri, [])
+  );
 
   if (isRootClusterSelected) {
     return <TabHost ctx={ctx} topBarContainerRef={props.topBarContainerRef} />;
@@ -49,6 +58,7 @@ export function TabHost({
   ctx: IAppContext;
   topBarContainerRef: React.MutableRefObject<HTMLDivElement>;
 }) {
+  useWorkspaceServiceState();
   const documentsService =
     ctx.workspacesService.getActiveWorkspaceDocumentService();
   const activeDocument = documentsService?.getActive();
@@ -81,7 +91,7 @@ export function TabHost({
 
   function handleTabContextMenu(doc: types.Document) {
     ctx.mainProcessClient.openTabContextMenu({
-      documentKind: doc.kind,
+      document: doc,
       onClose: () => {
         documentsService.close(doc.uri);
       },
@@ -93,6 +103,11 @@ export function TabHost({
       },
       onDuplicatePty: () => {
         documentsService.duplicatePtyAndActivate(doc.uri);
+      },
+      onReopenPtyInShell(shell: Shell) {
+        if (canDocChangeShell(doc)) {
+          documentsService.reopenPtyInShell(doc, shell);
+        }
       },
     });
   }

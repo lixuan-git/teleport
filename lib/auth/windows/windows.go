@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package windows
 
@@ -30,6 +34,7 @@ import (
 
 	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/lib/cryptosuites"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/tlsca"
 )
@@ -66,12 +71,12 @@ func getCertRequest(req *GenerateCredentialsRequest) (*certRequest, error) {
 	// Important: rdpclient currently only supports 2048-bit RSA keys.
 	// If you switch the key type here, update handle_general_authentication in
 	// rdp/rdpclient/src/piv.rs accordingly.
-	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	rsaKey, err := cryptosuites.GenerateKeyWithAlgorithm(cryptosuites.RSA2048)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 	// Also important: rdpclient expects the private key to be in PKCS1 format.
-	keyDER := x509.MarshalPKCS1PrivateKey(rsaKey)
+	keyDER := x509.MarshalPKCS1PrivateKey(rsaKey.(*rsa.PrivateKey))
 
 	// Generate the Windows-compatible certificate, see
 	// https://docs.microsoft.com/en-us/troubleshoot/windows-server/windows-security/enabling-smart-card-logon-third-party-certification-authorities
@@ -124,15 +129,26 @@ func getCertRequest(req *GenerateCredentialsRequest) (*certRequest, error) {
 		return nil, trace.Wrap(err)
 	}
 	csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrBytes})
-	// Note: this CRL DN may or may not be the same DN published in updateCRL.
-	//
-	// There can be multiple AD domains connected to Teleport. Each
-	// windows_desktop_service is connected to a single AD domain and publishes
-	// CRLs in it. Each service can also handle RDP connections for a different
-	// domain, with the assumption that some other windows_desktop_service
-	// published a CRL there.
-	crlDN := crlDN(req.ClusterName, req.LDAPConfig, req.CAType)
-	return &certRequest{csrPEM: csrPEM, crlEndpoint: fmt.Sprintf("ldap:///%s?certificateRevocationList?base?objectClass=cRLDistributionPoint", crlDN), keyDER: keyDER}, nil
+	cr := &certRequest{
+		csrPEM: csrPEM,
+		keyDER: keyDER,
+	}
+
+	if !req.OmitCDP {
+		// Note: this CRL DN may or may not be the same DN published in updateCRL.
+		//
+		// There can be multiple AD domains connected to Teleport. Each
+		// windows_desktop_service is connected to a single AD domain and publishes
+		// CRLs in it. Each service can also handle RDP connections for a different
+		// domain, with the assumption that some other windows_desktop_service
+		// published a CRL there.
+		crlDN := crlDN(req.ClusterName, req.LDAPConfig, req.CAType)
+
+		// TODO(zmb3) consider making Teleport itself the CDP (via HTTP) instead of LDAP
+		cr.crlEndpoint = fmt.Sprintf("ldap:///%s?certificateRevocationList?base?objectClass=cRLDistributionPoint", crlDN)
+	}
+
+	return cr, nil
 }
 
 // AuthInterface is a subset of auth.ClientI
@@ -173,6 +189,11 @@ type GenerateCredentialsRequest struct {
 	CreateUser bool
 	// Groups are groups that user should be member of
 	Groups []string
+
+	// OmitCDP can be used to prevent Teleport from issuing certs with a
+	// CRL Distribution Point (CDP). CDPs are required in user certificates
+	// for RDP, but they can be omitted for certs that are used for LDAP binds.
+	OmitCDP bool
 }
 
 // GenerateWindowsDesktopCredentials generates a private key / certificate pair for the given
@@ -310,7 +331,7 @@ func SubjectAltNameExtension(user, domain string) (pkix.Extension, error) {
 	// Setting otherName SAN according to
 	// https://samfira.com/2020/05/16/golang-x-509-certificates-and-othername/
 	//
-	// othernName SAN is needed to pass the UPN of the user, per
+	// otherName SAN is needed to pass the UPN of the user, per
 	// https://docs.microsoft.com/en-us/troubleshoot/windows-server/windows-security/enabling-smart-card-logon-third-party-certification-authorities
 	ext := pkix.Extension{Id: SubjectAltNameExtensionOID}
 	var err error

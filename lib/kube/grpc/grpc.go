@@ -1,39 +1,44 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package kubev1
 
 import (
 	"context"
 	"errors"
+	"log/slog"
+	"slices"
 
 	"github.com/gravitational/trace"
 	"github.com/gravitational/trace/trail"
-	"github.com/sirupsen/logrus"
-	"golang.org/x/exp/slices"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/defaults"
 	proto "github.com/gravitational/teleport/api/gen/proto/go/teleport/kube/v1"
 	"github.com/gravitational/teleport/api/types"
 	apievents "github.com/gravitational/teleport/api/types/events"
-	"github.com/gravitational/teleport/lib/auth"
 	"github.com/gravitational/teleport/lib/authz"
 	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/services/local"
-	"github.com/gravitational/teleport/lib/tlsca"
+	"github.com/gravitational/teleport/lib/utils"
 )
 
 // errDone indicates that resource iteration is complete
@@ -45,6 +50,7 @@ type Server struct {
 	cfg          Config
 	proxyAddress string
 	kubeProxySNI string
+	kubeClient   kubernetes.Interface
 }
 
 // New creates a new instance of Kube gRPC handler.
@@ -52,25 +58,34 @@ func New(cfg Config) (*Server, error) {
 	if err := cfg.CheckAndSetDefaults(); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	sni, addr, err := getWebAddrAndKubeSNI(cfg.KubeProxyAddr)
-	if err != nil {
-		return nil, trace.Wrap(err)
+
+	var sni, addr string
+	var err error
+	if cfg.KubeProxyAddr != "" {
+		sni, addr, err = getWebAddrAndKubeSNI(cfg.KubeProxyAddr)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
 	}
 
-	return &Server{cfg: cfg, proxyAddress: addr, kubeProxySNI: sni}, nil
+	s := &Server{cfg: cfg, proxyAddress: addr, kubeProxySNI: sni}
+
+	if s.kubeClient, err = s.buildKubeClient(); err != nil {
+		return nil, trace.Wrap(err, "unable to create kubeClient")
+	}
+
+	return s, nil
 }
 
 // Config specifies configuration for Kube gRPC server.
 type Config struct {
-	// Signer is a auth server client to sign Kubernetes Certificates.
-	Signer CertificateSigner
-	// AccessPoint is caching access point to retrieve search and preview roles
-	// from the backend.
-	AccessPoint services.RoleGetter
+	// AccessPoint is caching access point to retrieve roles and the cluster
+	// auth preference.
+	AccessPoint AccessPoint
 	// Authz authenticates user.
 	Authz authz.Authorizer
 	// Log is the logger function.
-	Log logrus.FieldLogger
+	Log *slog.Logger
 	// Emitter is used to emit audit events.
 	Emitter apievents.Emitter
 	// Component name to include in log output.
@@ -79,19 +94,33 @@ type Config struct {
 	KubeProxyAddr string
 	// ClusterName is the name of the cluster that this server is running in.
 	ClusterName string
+	// GetConnTLSCertificate returns the TLS kubeClient certificate to use when
+	// connecting to the upstream Teleport proxy or Kubernetes service when
+	// forwarding requests using the forward identity (i.e. proxy impersonating
+	// a user) method. Paired with GetConnTLSRoots and ConnTLSCipherSuites to
+	// generate the correct [*tls.Config] on demand.
+	GetConnTLSCertificate utils.GetCertificateFunc
+	// GetConnTLSRoots returns the [*x509.CertPool] used to validate TLS
+	// connections to the upstream Teleport proxy or Kubernetes service.
+	GetConnTLSRoots utils.GetRootsFunc
+	// ConnTLSCipherSuites optionally contains a list of TLS ciphersuites to use
+	// when connecting to the upstream Teleport Proxy or Kubernetes service.
+	ConnTLSCipherSuites []uint16
 }
 
-// CertificateSigner is an interface for signing Kubernetes certificates.
-type CertificateSigner interface {
-	// ProcessKubeCSR processes CSR request against Kubernetes CA, returns
-	// signed certificate if successful.
-	ProcessKubeCSR(req auth.KubeCSR) (*auth.KubeCSRResponse, error)
+// AccessPoint is caching access point to retrieve roles and the cluster
+// auth preference.
+type AccessPoint interface {
+	services.RoleGetter
 }
 
 // CheckAndSetDefaults checks and sets default values.
 func (c *Config) CheckAndSetDefaults() error {
-	if c.Signer == nil {
-		return trace.BadParameter("missing parameter Signer")
+	if c.GetConnTLSCertificate == nil {
+		return trace.BadParameter("missing parameter GetConnTLSCertificate")
+	}
+	if c.GetConnTLSRoots == nil {
+		return trace.BadParameter("missing parameter GetConnTLSRoots")
 	}
 	if c.AccessPoint == nil {
 		return trace.BadParameter("missing parameter AccessPoint")
@@ -102,9 +131,7 @@ func (c *Config) CheckAndSetDefaults() error {
 	if c.Emitter == nil {
 		return trace.BadParameter("missing parameter Emitter")
 	}
-	if c.KubeProxyAddr == "" {
-		return trace.BadParameter("missing parameter KubeProxyAddr")
-	}
+
 	if c.ClusterName == "" {
 		return trace.BadParameter("missing parameter ClusterName")
 	}
@@ -112,15 +139,18 @@ func (c *Config) CheckAndSetDefaults() error {
 		c.Component = "kube.grpc"
 	}
 	if c.Log == nil {
-		c.Log = logrus.New()
+		c.Log = slog.Default()
 	}
-	c.Log = c.Log.WithFields(logrus.Fields{trace.Component: c.Component})
+	c.Log = c.Log.With(teleport.ComponentKey, c.Component)
 	return nil
 }
 
 // ListKubernetesResources returns the list of resources available for the user for
 // the specified Resource kind, Kubernetes cluster and namespace.
 func (s *Server) ListKubernetesResources(ctx context.Context, req *proto.ListKubernetesResourcesRequest) (*proto.ListKubernetesResourcesResponse, error) {
+	if s.proxyAddress == "" {
+		return nil, trail.ToGRPC(trace.ConnectionProblem(nil, "Kubernetes API is disabled"))
+	}
 	userContext, err := s.authorize(ctx)
 	if err != nil {
 		return nil, trail.ToGRPC(err)
@@ -129,7 +159,8 @@ func (s *Server) ListKubernetesResources(ctx context.Context, req *proto.ListKub
 	if req.UseSearchAsRoles || req.UsePreviewAsRoles {
 		var extraRoles []string
 		if req.UseSearchAsRoles {
-			extraRoles = append(extraRoles, userContext.Checker.GetAllowedSearchAsRoles()...)
+			allowedSearchAsRoles := userContext.Checker.GetAllowedSearchAsRolesForKubeResourceKind(req.ResourceType)
+			extraRoles = append(extraRoles, allowedSearchAsRoles...)
 		}
 		if req.UsePreviewAsRoles {
 			extraRoles = append(extraRoles, userContext.Checker.GetAllowedPreviewAsRoles()...)
@@ -153,12 +184,14 @@ func (s *Server) ListKubernetesResources(ctx context.Context, req *proto.ListKub
 	identity.KubernetesCluster = req.KubernetesCluster
 	identity.Groups = userContext.Checker.RoleNames()
 	identity.RouteToCluster = req.TeleportCluster
+	ctx = authz.ContextWithUser(ctx, authz.WrapIdentity(identity)) // wrap the identity in the context
+
 	switch {
 	case requiresFakePagination(req):
-		rsp, err := s.listResourcesUsingFakePagination(ctx, identity, req)
+		rsp, err := s.listResourcesUsingFakePagination(ctx, req)
 		return rsp, trail.ToGRPC(err)
 	case slices.Contains(types.KubernetesResourcesKinds, req.ResourceType):
-		rsp, err := s.listKubernetesResources(ctx, identity, true, req)
+		rsp, err := s.listKubernetesResources(ctx, true, req)
 		return rsp, trail.ToGRPC(err)
 	default:
 		return nil, trail.ToGRPC(trace.BadParameter("unsupported resource type %q", req.ResourceType))
@@ -169,7 +202,7 @@ func (s *Server) ListKubernetesResources(ctx context.Context, req *proto.ListKub
 func (s *Server) authorize(ctx context.Context) (*authz.Context, error) {
 	authCtx, err := s.cfg.Authz.Authorize(ctx)
 	if err != nil {
-		return nil, authz.ConvertAuthorizerError(ctx, s.cfg.Log, err)
+		return nil, trace.Wrap(err)
 	}
 	return authCtx, nil
 }
@@ -203,7 +236,6 @@ func (s *Server) emitAuditEvent(ctx context.Context, userContext *authz.Context,
 // those that match the search parameters.
 func (s *Server) listKubernetesResources(
 	ctx context.Context,
-	identity tlsca.Identity,
 	respectLimit bool,
 	req *proto.ListKubernetesResourcesRequest,
 ) (*proto.ListKubernetesResourcesResponse, error) {
@@ -216,15 +248,22 @@ func (s *Server) listKubernetesResources(
 
 	limit := int(req.Limit)
 	filter := services.MatchResourceFilter{
-		ResourceKind:        req.ResourceType,
-		Labels:              req.Labels,
-		SearchKeywords:      req.SearchKeywords,
-		PredicateExpression: req.PredicateExpression,
+		ResourceKind:   req.ResourceType,
+		Labels:         req.Labels,
+		SearchKeywords: req.SearchKeywords,
+	}
+
+	if req.PredicateExpression != "" {
+		expression, err := services.NewResourceExpression(req.PredicateExpression)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		filter.PredicateExpression = expression
 	}
 
 	rsp := &proto.ListKubernetesResourcesResponse{}
 	err := s.iterateKubernetesResources(
-		ctx, identity, req, respectLimit,
+		ctx, req, respectLimit,
 		func(r *types.KubernetesResourceV1, continueKey string) (int, error) {
 			switch match, err := services.MatchResourceByFilters(r, filter, nil /* ignore dup matches  */); {
 			case err != nil:
@@ -248,24 +287,19 @@ func (s *Server) listKubernetesResources(
 // For each resources discovered, the fn function is called to decide the action.
 // Kubernetes continue key is a base64 encoded json payload with the resource
 // version of the request. In order to resume the operation when using the paginated
-// mode, Teleport respects the Kubernetes Continue Key and will return it to the client
+// mode, Teleport respects the Kubernetes Continue Key and will return it to the kubeClient
 // as a NextKey.
 // In order to have the expected behavior Teleport must respect the ContinueKey and
 // cannot manipulate it. It means that Teleport needs to manipulate the number of
 // requested items from the Kubernetes Cluster in order to have the expected behavior.
 func (s *Server) iterateKubernetesResources(
 	ctx context.Context,
-	identity tlsca.Identity,
 	req *proto.ListKubernetesResourcesRequest,
 	respectLimit bool,
 	fn func(*types.KubernetesResourceV1, string) (int, error),
 ) error {
-	kubeClient, err := s.newKubernetesClient(s.cfg.ClusterName, identity)
-	if err != nil {
-		s.cfg.Log.WithError(err).Warnf("unable to create a Kubernetes client for user %q", identity.Username)
-		// Hide the root cause of the error from the client.
-		return trace.Errorf("unable to create a Kubernetes client for user %q", identity.Username)
-	}
+	kubeClient := s.kubeClient
+
 	continueKey := req.StartKey
 	itemsAppended := 0
 	for {
@@ -499,10 +533,10 @@ func itemListToKObjectList[T kObject](items []T) []kObject {
 }
 
 // listResourcesUsingFakePagination is a helper function that lists Kubernetes
-// resources using fake pagination. It is used when the client requires
+// resources using fake pagination. It is used when the kubeClient requires
 // the total count or sorting.
 func (s *Server) listResourcesUsingFakePagination(
-	ctx context.Context, identity tlsca.Identity,
+	ctx context.Context,
 	req *proto.ListKubernetesResourcesRequest,
 ) (*proto.ListKubernetesResourcesResponse, error) {
 	var (
@@ -511,7 +545,7 @@ func (s *Server) listResourcesUsingFakePagination(
 	)
 	switch {
 	case slices.Contains(types.KubernetesResourcesKinds, req.ResourceType):
-		rsp, err = s.listKubernetesResources(ctx, identity, false /* do not respect the limit value */, req)
+		rsp, err = s.listKubernetesResources(ctx, false /* do not respect the limit value */, req)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -525,19 +559,26 @@ func (s *Server) listResourcesUsingFakePagination(
 			return nil, trace.Wrap(err)
 		}
 	}
+
+	// map the request to the fake pagination request.
+	params := local.FakePaginateParams{
+		StartKey:       req.StartKey,
+		Limit:          req.Limit,
+		ResourceType:   req.ResourceType,
+		Labels:         req.Labels,
+		SearchKeywords: req.SearchKeywords,
+	}
+
+	if req.PredicateExpression != "" {
+		expression, err := services.NewResourceExpression(req.PredicateExpression)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		params.PredicateExpression = expression
+	}
+
 	// Apply request filters and get pagination info.
-	fakeRsp, err := local.FakePaginate(
-		sortedClusters.AsResources(),
-		// map the request to the fake pagination request.
-		local.FakePaginateParams{
-			StartKey:            req.StartKey,
-			Limit:               req.Limit,
-			ResourceType:        req.ResourceType,
-			Labels:              req.Labels,
-			PredicateExpression: req.PredicateExpression,
-			SearchKeywords:      req.SearchKeywords,
-		},
-	)
+	fakeRsp, err := local.FakePaginate(sortedClusters.AsResources(), params)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}

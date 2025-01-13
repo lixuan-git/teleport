@@ -1,49 +1,57 @@
 /*
-Copyright 2018-2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package proxy
 
 import (
 	"context"
 	"crypto/tls"
+	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"sync"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/eks"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
-	"golang.org/x/exp/maps"
 	"golang.org/x/net/http2"
 
 	"github.com/gravitational/teleport"
 	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
+	"github.com/gravitational/teleport/lib/authz"
 	"github.com/gravitational/teleport/lib/cloud"
-	"github.com/gravitational/teleport/lib/defaults"
+	"github.com/gravitational/teleport/lib/cloud/awsconfig"
 	"github.com/gravitational/teleport/lib/httplib"
+	"github.com/gravitational/teleport/lib/inventory"
 	"github.com/gravitational/teleport/lib/labels"
 	"github.com/gravitational/teleport/lib/limiter"
 	"github.com/gravitational/teleport/lib/multiplexer"
 	"github.com/gravitational/teleport/lib/reversetunnel"
 	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/services/readonly"
 	"github.com/gravitational/teleport/lib/srv"
 	"github.com/gravitational/teleport/lib/srv/ingress"
-	"github.com/gravitational/teleport/lib/utils"
 )
 
 // TLSServerConfig is a configuration for TLS server
@@ -55,7 +63,7 @@ type TLSServerConfig struct {
 	// LimiterConfig is limiter config
 	LimiterConfig limiter.Config
 	// AccessPoint is caching access point
-	AccessPoint auth.ReadKubernetesAccessPoint
+	AccessPoint authclient.ReadKubernetesAccessPoint
 	// OnHeartbeat is a callback for kubernetes_service heartbeats.
 	OnHeartbeat func(error)
 	// GetRotation returns the certificate rotation state.
@@ -63,13 +71,14 @@ type TLSServerConfig struct {
 	// ConnectedProxyGetter gets the proxies teleport is connected to.
 	ConnectedProxyGetter *reversetunnel.ConnectedProxyGetter
 	// Log is the logger.
-	Log logrus.FieldLogger
+	Log *slog.Logger
 	// Selectors is a list of resource monitor selectors.
 	ResourceMatchers []services.ResourceMatcher
 	// OnReconcile is called after each kube_cluster resource reconciliation.
 	OnReconcile func(types.KubeClusters)
 	// CloudClients is a set of cloud clients that Teleport supports.
 	CloudClients cloud.Clients
+	awsClients   *awsClientsGetter
 	// StaticLabels is a map of static labels associated with this service.
 	// Each cluster advertised by this kubernetes_service will include these static labels.
 	// If the service and a cluster define labels with the same key,
@@ -95,9 +104,26 @@ type TLSServerConfig struct {
 	// kubernetes cluster name. Proxy uses this map to route requests to the correct
 	// kubernetes_service. The servers are kept in memory to avoid making unnecessary
 	// unmarshal calls followed by filtering and to improve memory usage.
-	KubernetesServersWatcher *services.KubeServerWatcher
+	KubernetesServersWatcher *services.GenericWatcher[types.KubeServer, readonly.KubeServer]
 	// PROXYProtocolMode controls behavior related to unsigned PROXY protocol headers.
 	PROXYProtocolMode multiplexer.PROXYProtocolMode
+	// InventoryHandle is used to send kube server heartbeats via the inventory control stream.
+	InventoryHandle inventory.DownstreamHandle
+}
+
+type awsClientsGetter struct{}
+
+func (f *awsClientsGetter) GetConfig(ctx context.Context, region string, optFns ...awsconfig.OptionsFn) (aws.Config, error) {
+	return awsconfig.GetConfig(ctx, region, optFns...)
+}
+
+func (f *awsClientsGetter) GetAWSEKSClient(cfg aws.Config) EKSClient {
+	return eks.NewFromConfig(cfg)
+}
+
+func (f *awsClientsGetter) GetAWSSTSPresignClient(cfg aws.Config) STSPresignClient {
+	stsClient := sts.NewFromConfig(cfg)
+	return sts.NewPresignClient(stsClient)
 }
 
 // CheckAndSetDefaults checks and sets default values
@@ -108,18 +134,11 @@ func (c *TLSServerConfig) CheckAndSetDefaults() error {
 	if c.TLS == nil {
 		return trace.BadParameter("missing parameter TLS")
 	}
-	c.TLS.ClientAuth = tls.RequireAndVerifyClientCert
-	if c.TLS.ClientCAs == nil {
-		return trace.BadParameter("missing parameter TLS.ClientCAs")
-	}
-	if c.TLS.RootCAs == nil {
-		return trace.BadParameter("missing parameter TLS.RootCAs")
-	}
-	if len(c.TLS.Certificates) == 0 {
-		return trace.BadParameter("missing parameter TLS.Certificates")
-	}
 	if c.AccessPoint == nil {
 		return trace.BadParameter("missing parameter AccessPoint")
+	}
+	if c.InventoryHandle == nil {
+		return trace.BadParameter("missing parameter InventoryHandle")
 	}
 
 	if err := c.validateLabelKeys(); err != nil {
@@ -134,7 +153,7 @@ func (c *TLSServerConfig) CheckAndSetDefaults() error {
 	}
 
 	if c.Log == nil {
-		c.Log = logrus.New()
+		c.Log = slog.Default()
 	}
 	if c.CloudClients == nil {
 		cloudClients, err := cloud.NewClients()
@@ -142,6 +161,9 @@ func (c *TLSServerConfig) CheckAndSetDefaults() error {
 			return trace.Wrap(err)
 		}
 		c.CloudClients = cloudClients
+	}
+	if c.awsClients == nil {
+		c.awsClients = &awsClientsGetter{}
 	}
 	if c.ConnectedProxyGetter == nil {
 		c.ConnectedProxyGetter = reversetunnel.NewConnectedProxyGetter()
@@ -168,19 +190,19 @@ type TLSServer struct {
 	fwd          *Forwarder
 	mu           sync.Mutex
 	listener     net.Listener
-	heartbeats   map[string]*srv.Heartbeat
+	heartbeats   map[string]*srv.HeartbeatV2
 	closeContext context.Context
 	closeFunc    context.CancelFunc
 	// kubeClusterWatcher monitors changes to kube cluster resources.
-	kubeClusterWatcher *services.KubeClusterWatcher
+	kubeClusterWatcher *services.GenericWatcher[types.KubeCluster, readonly.KubeCluster]
 	// reconciler reconciles proxied kube clusters with kube_clusters resources.
-	reconciler *services.Reconciler
+	reconciler *services.Reconciler[types.KubeCluster]
 	// monitoredKubeClusters contains all kube clusters the proxied kube_clusters are
 	// reconciled against.
 	monitoredKubeClusters monitoredKubeClusters
 	// reconcileCh triggers reconciliation of proxied kube_clusters.
 	reconcileCh chan struct{}
-	log         *logrus.Entry
+	log         *slog.Logger
 }
 
 // NewTLSServer returns new unstarted TLS server
@@ -188,9 +210,7 @@ func NewTLSServer(cfg TLSServerConfig) (*TLSServer, error) {
 	if err := cfg.CheckAndSetDefaults(); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	log := cfg.Log.WithFields(logrus.Fields{
-		trace.Component: cfg.Component,
-	})
+	log := cfg.Log.With(teleport.ComponentKey, cfg.Component)
 	// limiter limits requests by frequency and amount of simultaneous
 	// connections per client
 	limiter, err := limiter.NewLimiter(cfg.LimiterConfig)
@@ -248,10 +268,10 @@ func NewTLSServer(cfg TLSServerConfig) (*TLSServer, error) {
 			TLSConfig:   cfg.TLS,
 			ConnState:   ingress.HTTPConnStateReporter(ingress.Kube, cfg.IngressReporter),
 			ConnContext: func(ctx context.Context, c net.Conn) context.Context {
-				return utils.ClientAddrContext(ctx, c.RemoteAddr(), c.LocalAddr())
+				return authz.ContextWithClientAddrs(ctx, c.RemoteAddr(), c.LocalAddr())
 			},
 		},
-		heartbeats: make(map[string]*srv.Heartbeat),
+		heartbeats: make(map[string]*srv.HeartbeatV2),
 		monitoredKubeClusters: monitoredKubeClusters{
 			static: fwd.kubeClusters(),
 		},
@@ -269,13 +289,24 @@ func NewTLSServer(cfg TLSServerConfig) (*TLSServer, error) {
 	return server, nil
 }
 
+// ServeOption is a functional option for the multiplexer.
+type ServeOption func(*multiplexer.Config)
+
+// WithMultiplexerIgnoreSelfConnections is used for tests, it makes multiplexer ignore the fact that it's self
+// connection (coming from same IP as the listening address) when deciding if it should drop connection with
+// missing required PROXY header. This is needed since all connections in tests are self connections.
+func WithMultiplexerIgnoreSelfConnections() ServeOption {
+	return func(cfg *multiplexer.Config) {
+		cfg.IgnoreSelfConnections = true
+	}
+}
+
 // Serve takes TCP listener, upgrades to TLS using config and starts serving
-func (t *TLSServer) Serve(listener net.Listener) error {
+func (t *TLSServer) Serve(listener net.Listener, options ...ServeOption) error {
 	caGetter := func(ctx context.Context, id types.CertAuthID, loadKeys bool) (types.CertAuthority, error) {
 		return t.CachingAuthClient.GetCertAuthority(ctx, id, loadKeys)
 	}
-	// Wrap listener with a multiplexer to get Proxy Protocol support.
-	mux, err := multiplexer.New(multiplexer.Config{
+	muxConfig := multiplexer.Config{
 		Context:             t.Context,
 		Listener:            listener,
 		Clock:               t.Clock,
@@ -287,8 +318,14 @@ func (t *TLSServer) Serve(listener net.Listener) error {
 		// It's required to accommodate setups with high latency and where the time
 		// between the TCP being accepted and the time for the first byte is longer
 		// than the default value -  1s.
-		ReadDeadline: 10 * time.Second,
-	})
+		DetectTimeout: 10 * time.Second,
+	}
+	for _, opt := range options {
+		opt(&muxConfig)
+	}
+
+	// Wrap listener with a multiplexer to get PROXY Protocol support.
+	mux, err := multiplexer.New(muxConfig)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -297,6 +334,14 @@ func (t *TLSServer) Serve(listener net.Listener) error {
 	defer mux.Close()
 
 	t.mu.Lock()
+	select {
+	// If the server is closed before the listener is started, return early
+	// to avoid deadlock.
+	case <-t.closeContext.Done():
+		t.mu.Unlock()
+		return nil
+	default:
+	}
 	t.listener = mux.TLS()
 	err = http2.ConfigureServer(t.Server, &http2.Server{})
 	t.mu.Unlock()
@@ -384,8 +429,11 @@ func (t *TLSServer) close(ctx context.Context) error {
 		t.KubernetesServersWatcher.Close()
 	}
 
+	var listClose error
 	t.mu.Lock()
-	listClose := t.listener.Close()
+	if t.listener != nil {
+		listClose = t.listener.Close()
+	}
 	t.mu.Unlock()
 	return trace.NewAggregate(append(errs, listClose)...)
 }
@@ -394,20 +442,12 @@ func (t *TLSServer) close(ctx context.Context) error {
 // and server's GetConfigForClient reloads the list of trusted
 // local and remote certificate authorities
 func (t *TLSServer) GetConfigForClient(info *tls.ClientHelloInfo) (*tls.Config, error) {
-	return auth.WithClusterCAs(t.TLS, t.AccessPoint, t.ClusterName, t.log)(info)
-}
-
-// getServerInfoFunc returns function that the heartbeater uses to report the
-// provided cluster to the auth server.
-func (t *TLSServer) getServerInfoFunc(name string) func() (types.Resource, error) {
-	return func() (types.Resource, error) {
-		return t.getServerInfo(name)
-	}
+	return authclient.WithClusterCAs(t.TLS, t.AccessPoint, t.ClusterName, t.log)(info)
 }
 
 // GetServerInfo returns a services.Server object for heartbeats (aka
 // presence).
-func (t *TLSServer) getServerInfo(name string) (types.Resource, error) {
+func (t *TLSServer) getServerInfo(name string) (*types.KubernetesServerV3, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	var addr string
@@ -481,18 +521,11 @@ func (t *TLSServer) getKubeClusterWithServiceLabels(name string) (*types.Kuberne
 }
 
 // startHeartbeat starts the registration heartbeat to the auth server.
-func (t *TLSServer) startHeartbeat(ctx context.Context, name string) error {
-	heartbeat, err := srv.NewHeartbeat(srv.HeartbeatConfig{
-		Mode:            srv.HeartbeatModeKube,
-		Context:         t.closeContext,
-		Component:       t.TLSServerConfig.Component,
+func (t *TLSServer) startHeartbeat(name string) error {
+	heartbeat, err := srv.NewKubernetesServerHeartbeat(srv.HeartbeatV2Config[*types.KubernetesServerV3]{
+		InventoryHandle: t.InventoryHandle,
 		Announcer:       t.TLSServerConfig.AuthClient,
-		GetServerInfo:   t.getServerInfoFunc(name),
-		KeepAlivePeriod: apidefaults.ServerKeepAliveTTL(),
-		AnnouncePeriod:  apidefaults.ServerAnnounceTTL/2 + utils.RandomDuration(apidefaults.ServerAnnounceTTL/10),
-		ServerTTL:       apidefaults.ServerAnnounceTTL,
-		CheckPeriod:     defaults.HeartbeatCheckPeriod,
-		Clock:           t.TLSServerConfig.Clock,
+		GetResource:     func(context.Context) (*types.KubernetesServerV3, error) { return t.getServerInfo(name) },
 		OnHeartbeat:     t.TLSServerConfig.OnHeartbeat,
 	})
 	if err != nil {
@@ -509,7 +542,7 @@ func (t *TLSServer) startHeartbeat(ctx context.Context, name string) error {
 func (t *TLSServer) getRotationState() types.Rotation {
 	rotation, err := t.TLSServerConfig.GetRotation(types.RoleKube)
 	if err != nil && !trace.IsNotFound(err) {
-		t.log.WithError(err).Warn("Failed to get rotation state.")
+		t.log.WarnContext(t.closeContext, "Failed to get rotation state", "error", err)
 	}
 	if rotation != nil {
 		return *rotation
@@ -525,14 +558,14 @@ func (t *TLSServer) startStaticClustersHeartbeat() error {
 	// proxy_service will pretend to also be kube_server.
 	if t.KubeServiceType == KubeService ||
 		t.KubeServiceType == LegacyProxyService {
-		t.log.Debugf("Starting kubernetes_service heartbeats for %q", t.Component)
+		t.log.DebugContext(t.closeContext, "Starting kubernetes_service heartbeats")
 		for _, cluster := range t.fwd.kubeClusters() {
-			if err := t.startHeartbeat(t.closeContext, cluster.GetName()); err != nil {
+			if err := t.startHeartbeat(cluster.GetName()); err != nil {
 				return trace.Wrap(err)
 			}
 		}
 	} else {
-		t.log.Debug("No local kube credentials on proxy, will not start kubernetes_service heartbeats")
+		t.log.DebugContext(t.closeContext, "No local kube credentials on proxy, will not start kubernetes_service heartbeats")
 	}
 
 	return nil
@@ -558,13 +591,11 @@ func (t *TLSServer) getServiceStaticLabels() map[string]string {
 	}
 	labels := maps.Clone(t.CloudLabels.Get())
 	// Let static labels override ec2 labels.
-	for k, v := range t.StaticLabels {
-		labels[k] = v
-	}
+	maps.Copy(labels, t.StaticLabels)
 	return labels
 }
 
-// setServiceLabels updates the the cluster labels with the kubernetes_service labels.
+// setServiceLabels updates the cluster labels with the kubernetes_service labels.
 // If the cluster and the service define overlapping labels the service labels take precedence.
 // This function manipulates the original cluster.
 func (t *TLSServer) setServiceLabels(cluster types.KubeCluster) {
@@ -611,7 +642,9 @@ func (t *TLSServer) getKubernetesServersForKubeClusterFunc() (getKubeServersByNa
 		}, nil
 	case ProxyService:
 		return func(ctx context.Context, name string) ([]types.KubeServer, error) {
-			servers, err := t.KubernetesServersWatcher.GetKubeServersByClusterName(ctx, name)
+			servers, err := t.KubernetesServersWatcher.CurrentResourcesWithFilter(ctx, func(ks readonly.KubeServer) bool {
+				return ks.GetCluster().GetName() == name
+			})
 			return servers, trace.Wrap(err)
 		}, nil
 	case LegacyProxyService:
@@ -621,7 +654,9 @@ func (t *TLSServer) getKubernetesServersForKubeClusterFunc() (getKubeServersByNa
 			// and forward the request to the next proxy.
 			kube, err := t.getKubeClusterWithServiceLabels(name)
 			if err != nil {
-				servers, err := t.KubernetesServersWatcher.GetKubeServersByClusterName(ctx, name)
+				servers, err := t.KubernetesServersWatcher.CurrentResourcesWithFilter(ctx, func(ks readonly.KubeServer) bool {
+					return ks.GetCluster().GetName() == name
+				})
 				return servers, trace.Wrap(err)
 			}
 			srv, err := types.NewKubernetesServerV3FromCluster(kube, "", t.HostID)

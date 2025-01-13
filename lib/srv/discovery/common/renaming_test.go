@@ -1,18 +1,20 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package common
 
@@ -23,17 +25,17 @@ import (
 	"cloud.google.com/go/container/apiv1/containerpb"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/mysql/armmysqlflexibleservers"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/redis/armredis/v2"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/redis/armredis/v3"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/redisenterprise/armredisenterprise"
+	ekstypes "github.com/aws/aws-sdk-go-v2/service/eks/types"
+	rdstypes "github.com/aws/aws-sdk-go-v2/service/rds/types"
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/eks"
-	"github.com/aws/aws-sdk-go/service/rds"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport/api/types"
 	azureutils "github.com/gravitational/teleport/api/utils/azure"
-	libcloudaws "github.com/gravitational/teleport/lib/cloud/aws"
+	"github.com/gravitational/teleport/lib/cloud/awstesthelpers"
 	"github.com/gravitational/teleport/lib/cloud/azure"
 	"github.com/gravitational/teleport/lib/cloud/gcp"
 	"github.com/gravitational/teleport/lib/services"
@@ -191,7 +193,7 @@ func TestApplyAWSDatabaseNameSuffix(t *testing.T) {
 					resource: database,
 					renameFn: func(r types.ResourceWithLabels) {
 						db := r.(types.Database)
-						ApplyAWSDatabaseNameSuffix(db, services.AWSMatcherRDS)
+						ApplyAWSDatabaseNameSuffix(db, types.AWSMatcherRDS)
 					},
 					originalName:      tt.dbName,
 					nameOverrideLabel: overrideLabel,
@@ -220,7 +222,7 @@ func TestApplyAzureDatabaseNameSuffix(t *testing.T) {
 			region:         "East US", // we normalize regions, so this should become "eastus".
 			resourceGroup:  "Some Group",
 			subscriptionID: "11111111-2222-3333-4444-555555555555",
-			matcherType:    services.AzureMatcherMySQL,
+			matcherType:    types.AzureMatcherMySQL,
 			wantRename:     "some-db-mysql-eastus-Some-Group-11111111-2222-3333-4444-555555555555",
 			makeDBFunc:     makeAzureMySQLFlexDatabase,
 		},
@@ -230,7 +232,7 @@ func TestApplyAzureDatabaseNameSuffix(t *testing.T) {
 			region:         "eastus", // use the normalized region.
 			resourceGroup:  "(parens are invalid)",
 			subscriptionID: "11111111-2222-3333-4444-555555555555",
-			matcherType:    services.AzureMatcherMySQL,
+			matcherType:    types.AzureMatcherMySQL,
 			wantRename:     "some-db-mysql-eastus-11111111-2222-3333-4444-555555555555",
 			makeDBFunc:     makeAzureMySQLFlexDatabase,
 		},
@@ -240,7 +242,7 @@ func TestApplyAzureDatabaseNameSuffix(t *testing.T) {
 			region:         "eastus",
 			resourceGroup:  "Some Group",
 			subscriptionID: "11111111-2222-3333-4444-555555555555",
-			matcherType:    services.AzureMatcherRedis,
+			matcherType:    types.AzureMatcherRedis,
 			wantRename:     "some-db-redis-eastus-Some-Group-11111111-2222-3333-4444-555555555555",
 			makeDBFunc:     makeAzureRedisDB,
 		},
@@ -250,7 +252,7 @@ func TestApplyAzureDatabaseNameSuffix(t *testing.T) {
 			region:         "eastus",
 			resourceGroup:  "Some Group",
 			subscriptionID: "11111111-2222-3333-4444-555555555555",
-			matcherType:    services.AzureMatcherRedis,
+			matcherType:    types.AzureMatcherRedis,
 			wantRename:     "some-db-redis-enterprise-eastus-Some-Group-11111111-2222-3333-4444-555555555555",
 			makeDBFunc:     makeAzureRedisEnterpriseDB,
 		},
@@ -363,7 +365,7 @@ func requireOverrideLabelSkipsRenaming(t *testing.T, r types.ResourceWithLabels,
 
 func makeAuroraPrimaryDB(t *testing.T, name, region, accountID, overrideLabel string) types.Database {
 	t.Helper()
-	cluster := &rds.DBCluster{
+	cluster := &rdstypes.DBCluster{
 		DBClusterArn:                     aws.String(fmt.Sprintf("arn:aws:rds:%s:%s:cluster:%v", region, accountID, name)),
 		DBClusterIdentifier:              aws.String("cluster-1"),
 		DbClusterResourceId:              aws.String("resource-1"),
@@ -371,33 +373,33 @@ func makeAuroraPrimaryDB(t *testing.T, name, region, accountID, overrideLabel st
 		Engine:                           aws.String("aurora-mysql"),
 		EngineVersion:                    aws.String("8.0.0"),
 		Endpoint:                         aws.String("localhost"),
-		Port:                             aws.Int64(3306),
-		TagList: libcloudaws.LabelsToTags[rds.Tag](map[string]string{
+		Port:                             aws.Int32(3306),
+		TagList: awstesthelpers.LabelsToRDSTags(map[string]string{
 			overrideLabel: name,
 		}),
 	}
-	database, err := services.NewDatabaseFromRDSCluster(cluster)
+	database, err := NewDatabaseFromRDSCluster(cluster, []rdstypes.DBInstance{})
 	require.NoError(t, err)
 	return database
 }
 
 func makeRDSInstanceDB(t *testing.T, name, region, accountID, overrideLabel string) types.Database {
 	t.Helper()
-	instance := &rds.DBInstance{
+	instance := &rdstypes.DBInstance{
 		DBInstanceArn:        aws.String(fmt.Sprintf("arn:aws:rds:%s:%s:db:%v", region, accountID, name)),
 		DBInstanceIdentifier: aws.String(name),
 		DbiResourceId:        aws.String(uuid.New().String()),
 		Engine:               aws.String(services.RDSEnginePostgres),
 		DBInstanceStatus:     aws.String("available"),
-		Endpoint: &rds.Endpoint{
+		Endpoint: &rdstypes.Endpoint{
 			Address: aws.String("localhost"),
-			Port:    aws.Int64(5432),
+			Port:    aws.Int32(5432),
 		},
-		TagList: libcloudaws.LabelsToTags[rds.Tag](map[string]string{
+		TagList: awstesthelpers.LabelsToRDSTags(map[string]string{
 			overrideLabel: name,
 		}),
 	}
-	database, err := services.NewDatabaseFromRDSInstance(instance)
+	database, err := NewDatabaseFromRDSInstance(instance)
 	require.NoError(t, err)
 	return database
 }
@@ -429,7 +431,7 @@ func makeAzureMySQLFlexDatabase(t *testing.T, name, region, group, subscription 
 		Name: &name,
 		Type: &resourceType,
 	}
-	database, err := services.NewDatabaseFromAzureMySQLFlexServer(server)
+	database, err := NewDatabaseFromAzureMySQLFlexServer(server)
 	require.NoError(t, err)
 	return database
 }
@@ -450,7 +452,7 @@ func makeAzureRedisDB(t *testing.T, name, region, group, subscription string) ty
 			RedisVersion:      to.Ptr("6.0"),
 		},
 	}
-	database, err := services.NewDatabaseFromAzureRedis(resourceInfo)
+	database, err := NewDatabaseFromAzureRedis(resourceInfo)
 	require.NoError(t, err)
 	return database
 }
@@ -480,7 +482,7 @@ func makeAzureRedisEnterpriseDB(t *testing.T, name, region, group, subscription 
 			ClientProtocol:    to.Ptr(armredisenterprise.ProtocolEncrypted),
 		},
 	}
-	database, err := services.NewDatabaseFromAzureRedisEnterprise(armCluster, armDatabase)
+	database, err := NewDatabaseFromAzureRedisEnterprise(armCluster, armDatabase)
 	require.NoError(t, err)
 	return database
 }
@@ -496,15 +498,14 @@ func labelsToAzureTags(labels map[string]string) map[string]*string {
 
 func makeEKSKubeCluster(t *testing.T, name, region, accountID, overrideLabel string) types.KubeCluster {
 	t.Helper()
-	eksCluster := &eks.Cluster{
-		Name:   aws.String(name),
-		Arn:    aws.String(fmt.Sprintf("arn:aws:eks:%s:%s:cluster/%s", region, accountID, name)),
-		Status: aws.String(eks.ClusterStatusActive),
-		Tags: map[string]*string{
-			overrideLabel: aws.String(name),
+	eksCluster := &ekstypes.Cluster{
+		Name: aws.String(name),
+		Arn:  aws.String(fmt.Sprintf("arn:aws:eks:%s:%s:cluster/%s", region, accountID, name)),
+		Tags: map[string]string{
+			overrideLabel: name,
 		},
 	}
-	kubeCluster, err := services.NewKubeClusterFromAWSEKS(eksCluster)
+	kubeCluster, err := NewKubeClusterFromAWSEKS(aws.StringValue(eksCluster.Name), aws.StringValue(eksCluster.Arn), eksCluster.Tags)
 	require.NoError(t, err)
 	require.True(t, kubeCluster.IsAWS())
 	return kubeCluster
@@ -523,7 +524,7 @@ func makeAKSKubeCluster(t *testing.T, name, location, group, subID string) types
 		},
 		Properties: azure.AKSClusterProperties{},
 	}
-	kubeCluster, err := services.NewKubeClusterFromAzureAKS(aksCluster)
+	kubeCluster, err := NewKubeClusterFromAzureAKS(aksCluster)
 	require.NoError(t, err)
 	require.True(t, kubeCluster.IsAzure())
 	return kubeCluster
@@ -541,7 +542,7 @@ func makeGKEKubeCluster(t *testing.T, name, location, projectID string) types.Ku
 		Description: "desc1",
 	}
 
-	kubeCluster, err := services.NewKubeClusterFromGCPGKE(gkeCluster)
+	kubeCluster, err := NewKubeClusterFromGCPGKE(gkeCluster)
 	require.NoError(t, err)
 	require.True(t, kubeCluster.IsGCP())
 	return kubeCluster

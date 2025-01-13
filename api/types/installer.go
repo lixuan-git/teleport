@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright 2022 Gravitational, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,7 +22,7 @@ import (
 	"github.com/gravitational/trace"
 )
 
-// Installer is an installer script rseource
+// Installer is an installer script resource
 type Installer interface {
 	Resource
 
@@ -95,16 +95,6 @@ func (c *InstallerV1) Expiry() time.Time {
 // GetMetadata returns object metadata.
 func (c *InstallerV1) GetMetadata() Metadata {
 	return c.Metadata
-}
-
-// GetResourceID returns resource ID.
-func (c *InstallerV1) GetResourceID() int64 {
-	return c.Metadata.ID
-}
-
-// SetResourceID sets resource ID.
-func (c *InstallerV1) SetResourceID(id int64) {
-	c.Metadata.ID = id
 }
 
 // GetRevision returns the revision

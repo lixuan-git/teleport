@@ -1,18 +1,20 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package postgres
 
@@ -22,6 +24,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"fmt"
+	"log/slog"
 	"net"
 	"regexp"
 	"strconv"
@@ -34,8 +37,8 @@ import (
 	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgproto3/v2"
 	"github.com/jackc/pgtype"
-	"github.com/sirupsen/logrus"
 
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/srv/db/common"
 	"github.com/gravitational/teleport/lib/utils"
@@ -54,6 +57,9 @@ func MakeTestClient(ctx context.Context, config common.TestClientConfig) (*pgcon
 	pgconnConfig.TLSConfig, err = common.MakeTestClientTLSConfig(config)
 	if err != nil {
 		return nil, trace.Wrap(err)
+	}
+	if config.UserAgent != "" {
+		pgconnConfig.RuntimeParams["application_name"] = config.UserAgent
 	}
 	pgConn, err := pgconn.ConnectConfig(ctx, pgconnConfig)
 	if err != nil {
@@ -74,17 +80,21 @@ type TestServer struct {
 	listener  net.Listener
 	port      string
 	tlsConfig *tls.Config
-	log       logrus.FieldLogger
+	log       *slog.Logger
 	// queryCount keeps track of the number of queries the server has received.
 	queryCount uint32
 	// parametersCh receives startup message connection parameters.
 	parametersCh chan map[string]string
 	// storedProcedures are the stored procedures created on the server.
-	storedProcedures map[string]string
+	storedProcedures map[string]*storedProcedure
 	// userEventsCh receives user activate/deactivate events.
 	userEventsCh chan UserEvent
+	// userPermissionEventsCh receives user permission change events.
+	userPermissionEventsCh chan UserPermissionEvent
 	// mu protects test server's shared state.
 	mu sync.Mutex
+	// allowedUsers list of users that can be used to connect to the server.
+	allowedUsers *sync.Map
 
 	// nextPid is a dummy variable used to assign each connection a unique fake "pid".
 	// it's incremented after each new startup connection. Starts counting from 1.
@@ -118,6 +128,20 @@ type UserEvent struct {
 	Active bool
 }
 
+// UserPermissionEvent represents a user permission change event.
+type UserPermissionEvent struct {
+	// Name is the name of the user.
+	Name string
+	// Permissions are the user permissions.
+	Permissions Permissions
+}
+
+// storedProcedure represents a stored procedure.
+type storedProcedure struct {
+	query     string
+	argsCount int
+}
+
 // NewTestServer returns a new instance of a test Postgres server.
 func NewTestServer(config common.TestServerConfig) (svr *TestServer, err error) {
 	err = config.CheckAndSetDefaults()
@@ -135,44 +159,50 @@ func NewTestServer(config common.TestServerConfig) (svr *TestServer, err error) 
 		return nil, trace.Wrap(err)
 	}
 
+	var allowedUsers sync.Map
+	for _, user := range config.Users {
+		allowedUsers.Store(user, struct{}{})
+	}
+
 	return &TestServer{
 		cfg:       config,
 		listener:  config.Listener,
 		port:      port,
 		tlsConfig: tlsConfig,
-		log: logrus.WithFields(logrus.Fields{
-			trace.Component: defaults.ProtocolPostgres,
-			"name":          config.Name,
-		}),
-		parametersCh:     make(chan map[string]string, 100),
-		pids:             make(map[uint32]*pidHandle),
-		storedProcedures: make(map[string]string),
-		userEventsCh:     make(chan UserEvent, 100),
-		mmCache:          make(map[string]*multiMessage),
+		log: slog.Default().With(
+			teleport.ComponentKey, defaults.ProtocolPostgres,
+			"name", config.Name,
+		),
+		parametersCh:           make(chan map[string]string, 100),
+		pids:                   make(map[uint32]*pidHandle),
+		storedProcedures:       make(map[string]*storedProcedure),
+		userEventsCh:           make(chan UserEvent, 100),
+		userPermissionEventsCh: make(chan UserPermissionEvent, 100),
+		allowedUsers:           &allowedUsers,
+		mmCache:                make(map[string]*multiMessage),
 	}, nil
 }
 
 // Serve starts serving client connections.
 func (s *TestServer) Serve() error {
-	s.log.Debugf("Starting test Postgres server on %v.", s.listener.Addr())
-	defer s.log.Debug("Test Postgres server stopped.")
+	s.log.DebugContext(context.Background(), "Starting test Postgres server.", "address", s.listener.Addr())
+	defer s.log.DebugContext(context.Background(), "Test Postgres server stopped.")
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
 			if utils.IsOKNetworkError(err) {
 				return nil
 			}
-			s.log.WithError(err).Error("Failed to accept connection.")
+			s.log.ErrorContext(context.Background(), "Failed to accept connection.", "error", err)
 			continue
 		}
-		s.log.Debug("Accepted connection.")
+		s.log.DebugContext(context.Background(), "Accepted connection.")
 		go func() {
-			defer s.log.Debug("Connection done.")
+			defer s.log.DebugContext(context.Background(), "Connection done.")
 			defer conn.Close()
 			err = s.handleConnection(conn)
 			if err != nil {
-				s.log.Errorf("Failed to handle connection: %v.",
-					trace.DebugReport(err))
+				s.log.ErrorContext(context.Background(), "Failed to handle connection.", "debug_report", trace.DebugReport(err))
 			}
 		}()
 	}
@@ -188,7 +218,7 @@ func (s *TestServer) handleConnection(conn net.Conn) error {
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	s.log.Debugf("Received %#v.", startupMessage)
+	s.log.DebugContext(context.Background(), "Received.", "message", fmt.Sprintf("%#v", startupMessage))
 	switch msg := startupMessage.(type) {
 	case *pgproto3.StartupMessage:
 		return s.handleStartup(client, msg)
@@ -210,7 +240,7 @@ func (s *TestServer) startTLS(conn net.Conn) (*pgproto3.Backend, error) {
 	if _, ok := startupMessage.(*pgproto3.SSLRequest); !ok {
 		return nil, trace.BadParameter("expected *pgproto3.SSLRequest, got: %#v", startupMessage)
 	}
-	s.log.Debugf("Received %#v.", startupMessage)
+	s.log.DebugContext(context.Background(), "Received.", "message", fmt.Sprintf("%#v", startupMessage))
 	// Reply with 'S' to indicate TLS support.
 	if _, err := conn.Write([]byte("S")); err != nil {
 		return nil, trace.Wrap(err)
@@ -223,9 +253,12 @@ func (s *TestServer) startTLS(conn net.Conn) (*pgproto3.Backend, error) {
 func (s *TestServer) handleStartup(client *pgproto3.Backend, startupMessage *pgproto3.StartupMessage) error {
 	// Push connect parameters into the channel so tests can consume them.
 	s.parametersCh <- startupMessage.Parameters
-	// If auth token is specified, used it for password authentication, this
-	// simulates cloud provider IAM auth.
-	if s.cfg.AuthToken != "" {
+
+	// Perform authentication.
+	switch {
+	case s.cfg.AuthToken != "":
+		// If auth token is specified, used it for password authentication, this
+		// simulates cloud provider IAM auth.
 		if err := s.handlePasswordAuth(client); err != nil {
 			if trace.IsAccessDenied(err) {
 				if err := client.Send(&pgproto3.ErrorResponse{Code: pgerrcode.InvalidPassword, Message: err.Error()}); err != nil {
@@ -234,7 +267,12 @@ func (s *TestServer) handleStartup(client *pgproto3.Backend, startupMessage *pgp
 			}
 			return trace.Wrap(err)
 		}
+	case !s.cfg.AllowAnyUser:
+		if _, ok := s.allowedUsers.Load(startupMessage.Parameters[userParameterName]); !ok {
+			return trace.AccessDenied("invalid username")
+		}
 	}
+
 	// Accept auth and send ready for query.
 	if err := client.Send(&pgproto3.AuthenticationOk{}); err != nil {
 		return trace.Wrap(err)
@@ -263,31 +301,57 @@ func (s *TestServer) handleStartup(client *pgproto3.Backend, startupMessage *pgp
 		switch msg := message.(type) {
 		case *pgproto3.Query:
 			if err := s.handleQuery(client, msg.String, pid); err != nil {
-				s.log.WithError(err).Error("Failed to handle query.")
+				s.log.ErrorContext(context.Background(), "Failed to handle query.", "error", err)
 			}
 		// Following messages are for handling Postgres extended query
 		// protocol flow used by prepared statements.
 		case *pgproto3.Parse:
+			schema, procName, argsCount, ok := processProcedureCall(msg.Query)
+			if ok {
+				if !s.hasProcedure(pid, schema, procName, argsCount) {
+					return trace.BadParameter("procedure %q on schema %q wasn't created before the call for PID %d", procName, schema, pid)
+				}
+
+				switch procName {
+				case activateProcName:
+					if err := s.handleActivateUser(client); err != nil {
+						s.log.ErrorContext(context.Background(), "Failed to handle user activation.", "error", err)
+					}
+				case deleteProcName:
+					if err := s.handleDeactivateUser(client, true); err != nil {
+						s.log.ErrorContext(context.Background(), "Failed to handle user deletion.", "error", err)
+					}
+				case deactivateProcName:
+					if err := s.handleDeactivateUser(client, false); err != nil {
+						s.log.ErrorContext(context.Background(), "Failed to handle user deactivation.", "error", err)
+					}
+				case updatePermissionsProcName:
+					if err := s.handleUpdatePermissions(client); err != nil {
+						s.log.ErrorContext(context.Background(), "Failed to handle user permissions update.", "error", err)
+					}
+				}
+
+				continue
+			}
+
 			switch msg.Query {
-			case activateQuery:
-				if err := s.handleActivateUser(client); err != nil {
-					s.log.WithError(err).Error("Failed to handle user activation.")
+			case schemaInfoQuery:
+				if err := s.handleSchemaInfo(client); err != nil {
+					s.log.ErrorContext(context.Background(), "Failed to handle schema info query.", "error", err)
 				}
-			case deactivateQuery:
-				if err := s.handleDeactivateUser(client); err != nil {
-					s.log.WithError(err).Error("Failed to handle user deactivation.")
-				}
+			default:
+				s.log.WarnContext(context.Background(), "Ignoring PARSE message", "query", msg.Query)
 			}
 		case *pgproto3.Bind:
 		case *pgproto3.Describe:
 		case *pgproto3.Sync:
 			if err := s.handleSync(client); err != nil {
-				s.log.WithError(err).Error("Failed to handle sync.")
+				s.log.ErrorContext(context.Background(), "Failed to handle sync.", "error", err)
 			}
 		case *pgproto3.Execute:
 			// Execute executes prepared statement.
 			if err := s.handleQuery(client, "", pid); err != nil {
-				s.log.WithError(err).Error("Failed to handle query.")
+				s.log.ErrorContext(context.Background(), "Failed to handle query.", "error", err)
 			}
 		case *pgproto3.Terminate:
 			return nil
@@ -333,13 +397,16 @@ func (s *TestServer) handleQuery(client *pgproto3.Backend, query string, pid uin
 	if query == TestLongRunningQuery {
 		return trace.Wrap(s.fakeLongRunningQuery(client, pid))
 	}
-	if strings.Contains(query, "create or replace procedure") {
-		if err := s.handleCreateStoredProcedure(query); err != nil {
+	if strings.Contains(strings.ToUpper(query), "CREATE OR REPLACE PROCEDURE") {
+		if err := s.handleCreateStoredProcedure(query, pid); err != nil {
 			return trace.Wrap(err)
 		}
 	}
 	if selectBenchmarkRe.MatchString(query) {
 		return trace.Wrap(s.handleBenchmarkQuery(query, client))
+	}
+	if query == TestErrorQuery {
+		return trace.Wrap(s.handleQueryWithError(client))
 	}
 
 	messages := []pgproto3.BackendMessage{
@@ -349,7 +416,7 @@ func (s *TestServer) handleQuery(client *pgproto3.Backend, query string, pid uin
 		&pgproto3.ReadyForQuery{},
 	}
 	for _, message := range messages {
-		s.log.Debugf("Sending %#v.", message)
+		s.log.DebugContext(context.Background(), "Sending.", "message", fmt.Sprintf("%#v", message))
 		err := client.Send(message)
 		if err != nil {
 			return trace.Wrap(err)
@@ -358,21 +425,78 @@ func (s *TestServer) handleQuery(client *pgproto3.Backend, query string, pid uin
 	return nil
 }
 
-func (s *TestServer) handleCreateStoredProcedure(query string) error {
+func (s *TestServer) handleQueryWithError(client *pgproto3.Backend) error {
+	for _, message := range []pgproto3.BackendMessage{
+		&pgproto3.ErrorResponse{Severity: "ERROR", Code: "42703", Message: "error"},
+		&pgproto3.ReadyForQuery{},
+	} {
+		s.log.DebugContext(context.Background(), "Sending.", "message", fmt.Sprintf("%#v", message))
+		err := client.Send(message)
+		if err != nil {
+			return trace.Wrap(err)
+		}
+	}
+
+	return nil
+}
+
+func (s *TestServer) handleCreateStoredProcedure(query string, pid uint32) error {
 	match := storedProcedureRe.FindStringSubmatch(query)
-	if len(match) != 2 {
+	if match == nil {
 		return trace.BadParameter("failed to extract stored procedure name from query")
 	}
-	switch match[1] {
-	case activateProcName, deactivateProcName:
-		s.log.Debugf("Created stored procedure %q.", match[1])
-	default:
+
+	if _, ok := procs[match[storedProcedureRe.SubexpIndex("ProcName")]]; !ok {
 		return trace.BadParameter("test server doesn't support stored procedure %q", match[1])
 	}
+
+	procName := storedProcedureName(pid, match[storedProcedureRe.SubexpIndex("Schema")], match[storedProcedureRe.SubexpIndex("ProcName")])
+	var argsCount int
+	args := strings.Split(match[storedProcedureRe.SubexpIndex("Args")], ",")
+	for _, arg := range args {
+		// Skip arguments that have a default value.
+		if !strings.Contains(strings.ToLower(arg), "default") {
+			argsCount++
+		}
+	}
+
+	s.log.DebugContext(context.Background(), "Created stored procedure.", "procedure", procName)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.storedProcedures[match[1]] = query
+	s.storedProcedures[procName] = &storedProcedure{query: query, argsCount: argsCount}
 	return nil
+}
+
+func (s *TestServer) hasProcedure(pid uint32, schema, procName string, argsCount int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	storedProcedure, ok := s.storedProcedures[storedProcedureName(pid, schema, procName)]
+	if !ok {
+		s.log.ErrorContext(context.Background(), "Procedure not found", "procedure", procName, "schema", schema)
+		return false
+	}
+
+	if argsCount != storedProcedure.argsCount {
+		s.log.ErrorContext(context.Background(), "Wrong number of arguments for procedure call", "procedure", procName, "expected_args", storedProcedure.argsCount, "args_provided", argsCount)
+		return false
+	}
+
+	return true
+}
+
+func storedProcedureName(pid uint32, schema, procName string) string {
+	var name string
+	switch strings.ToLower(schema) {
+	case "pg_temp":
+		name = fmt.Sprintf("%d.%s", pid, procName)
+	case "":
+		name = procName
+	default:
+		name = fmt.Sprintf("%s.%s", schema, procName)
+	}
+
+	return strings.ToLower(name)
 }
 
 // multiMessage wraps *pgproto3.DataRow and implements pgproto3.BackendMessage by writing multiple copies of this message in Encode.
@@ -388,7 +512,10 @@ func newMultiMessage(rowSize, repeats int) (*multiMessage, error) {
 		return nil, trace.Wrap(err)
 	}
 	message := &pgproto3.DataRow{Values: [][]byte{buf}}
-	encoded := message.Encode(nil)
+	encoded, err := message.Encode(nil)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
 	payload := bytes.Repeat(encoded, repeats)
 	return &multiMessage{
 		singleMessage: message,
@@ -400,8 +527,8 @@ func (m *multiMessage) Decode(_ []byte) error {
 	return trace.NotImplemented("Decode is not implemented for multiMessage")
 }
 
-func (m *multiMessage) Encode(dst []byte) []byte {
-	return append(dst, m.payload...)
+func (m *multiMessage) Encode(dst []byte) ([]byte, error) {
+	return append(dst, m.payload...), nil
 }
 
 func (m *multiMessage) Backend() {
@@ -446,7 +573,7 @@ func (s *TestServer) handleBenchmarkQuery(query string, client *pgproto3.Backend
 		return trace.Wrap(err)
 	}
 
-	s.log.Debugf("Responding to query %q, will send %v messages of length %v, total length %v", query, repeats, len(mm.singleMessage.Encode(nil)), len(mm.payload))
+	s.log.DebugContext(context.Background(), "Responding to query", "query", query, "repeat", repeats, "length", len(mm.payload))
 
 	// preamble
 	err = client.Send(&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{{Name: []byte("dummy")}}})
@@ -471,7 +598,7 @@ func (s *TestServer) handleBenchmarkQuery(query string, client *pgproto3.Backend
 		return trace.Wrap(err)
 	}
 
-	s.log.Debugf("Finished handling query %q", query)
+	s.log.DebugContext(context.Background(), "Finished handling query", "query", query)
 
 	return nil
 }
@@ -536,12 +663,13 @@ func (s *TestServer) handleActivateUser(client *pgproto3.Backend) error {
 		return trace.Wrap(err)
 	}
 	// Mark the user as active.
-	s.log.Debugf("Activated user %q with roles %v.", name, roles)
+	s.log.DebugContext(context.Background(), "Activated user.", "user", name, "roles", roles)
 	s.userEventsCh <- UserEvent{Name: name, Roles: roles, Active: true}
+	s.allowedUsers.Store(name, struct{}{})
 	return nil
 }
 
-func (s *TestServer) handleDeactivateUser(client *pgproto3.Backend) error {
+func (s *TestServer) handleDeactivateUser(client *pgproto3.Backend, sendDeleteResponse bool) error {
 	// Expect Describe message.
 	_, err := s.receiveDescribeMessage(client)
 	if err != nil {
@@ -587,6 +715,84 @@ func (s *TestServer) handleDeactivateUser(client *pgproto3.Backend) error {
 		return trace.Wrap(err)
 	}
 	// Respond to Bind message.
+	messages := []pgproto3.BackendMessage{
+		&pgproto3.BindComplete{},
+	}
+	if sendDeleteResponse {
+		messages = append(messages,
+			&pgproto3.RowDescription{Fields: TestDeleteUserResponse.FieldDescriptions},
+			&pgproto3.DataRow{Values: TestDeleteUserResponse.Rows[0]},
+		)
+	} else {
+		messages = append(messages, &pgproto3.NoData{})
+	}
+	messages = append(messages,
+		&pgproto3.CommandComplete{},
+		&pgproto3.ReadyForQuery{},
+	)
+
+	err = s.sendMessages(client, messages...)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	// Mark the user as active.
+	s.log.DebugContext(context.Background(), "Deactivated user.", "user", name)
+	s.userEventsCh <- UserEvent{Name: name, Active: false}
+	s.allowedUsers.Delete(name)
+	return nil
+}
+
+func (s *TestServer) handleUpdatePermissions(client *pgproto3.Backend) error {
+	// Expect Describe message.
+	_, err := s.receiveDescribeMessage(client)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	// Expect Sync message.
+	_, err = s.receiveSyncMessage(client)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	// Respond to Parse message.
+	err = s.sendMessages(client,
+		&pgproto3.ParseComplete{},
+		&pgproto3.ParameterDescription{ParameterOIDs: []uint32{pgtype.VarcharOID, pgtype.JSONBOID}},
+		&pgproto3.NoData{},
+		&pgproto3.ReadyForQuery{})
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	// Expect Bind message.
+	bind, err := s.receiveBindMessage(client)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	// Extract user name.
+	name, err := getVarchar(bind.ParameterFormatCodes[0], bind.Parameters[0])
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	// Extract role names.
+	perms, err := getJSONB[Permissions](bind.ParameterFormatCodes[1], bind.Parameters[1])
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	// Expect Describe message.
+	_, err = s.receiveDescribeMessage(client)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	// Expect Execute message.
+	_, err = s.receiveExecuteMessage(client)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	// Expect Sync message.
+	_, err = s.receiveSyncMessage(client)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	// Respond to Bind message.
 	err = s.sendMessages(client,
 		&pgproto3.BindComplete{},
 		&pgproto3.NoData{},
@@ -596,8 +802,82 @@ func (s *TestServer) handleDeactivateUser(client *pgproto3.Backend) error {
 		return trace.Wrap(err)
 	}
 	// Mark the user as active.
-	s.log.Debugf("Deactivated user %q.", name)
-	s.userEventsCh <- UserEvent{Name: name, Active: false}
+	s.log.DebugContext(context.Background(), "Updated permissions for user.", "user", name, "permissions", fmt.Sprintf("%#v", perms))
+	s.userPermissionEventsCh <- UserPermissionEvent{Name: name, Permissions: perms}
+	return nil
+}
+
+func (s *TestServer) handleSchemaInfo(client *pgproto3.Backend) error {
+	// Expect Describe message.
+	_, err := s.receiveDescribeMessage(client)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	// Expect Sync message.
+	_, err = s.receiveSyncMessage(client)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	// Respond to Parse message.
+	err = s.sendMessages(client,
+		&pgproto3.ParseComplete{},
+		&pgproto3.ParameterDescription{ParameterOIDs: []uint32{}},
+		&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{{Name: []byte("schemaname")}, {Name: []byte("tablename")}}},
+		&pgproto3.ReadyForQuery{})
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	// Expect Bind message.
+	_, err = s.receiveBindMessage(client)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	// Expect Describe message.
+	_, err = s.receiveDescribeMessage(client)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	// Expect Execute message.
+	_, err = s.receiveExecuteMessage(client)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	// Expect Sync message.
+	_, err = s.receiveSyncMessage(client)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	// Respond to Bind message.
+	err = s.sendMessages(client,
+		&pgproto3.BindComplete{},
+		&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{{Name: []byte("schemaname")}, {Name: []byte("tablename")}}},
+	)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	// Send over results
+	fixedSchema := map[string][]string{
+		"public": {"employees", "orders", "departments", "projects", "customers"},
+		"hr":     {"salaries"},
+	}
+	for schemaName, tables := range fixedSchema {
+		for _, tableName := range tables {
+			err = s.sendMessages(client, &pgproto3.DataRow{Values: [][]byte{[]byte(schemaName), []byte(tableName)}})
+			if err != nil {
+				return trace.Wrap(err)
+			}
+		}
+	}
+
+	// Notify the client we are finished.
+	err = s.sendMessages(client,
+		&pgproto3.CommandComplete{},
+		&pgproto3.ReadyForQuery{})
+	if err != nil {
+		return trace.Wrap(err)
+	}
 	return nil
 }
 
@@ -654,7 +934,7 @@ func (s *TestServer) receiveFrontendMessage(client *pgproto3.Backend) (pgproto3.
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	s.log.Debugf("Received %#v.", message)
+	s.log.DebugContext(context.Background(), "Received.", "message", fmt.Sprintf("%#v", message))
 	return message, nil
 }
 
@@ -688,9 +968,19 @@ func getVarcharArray(formatCode int16, src []byte) ([]string, error) {
 	return strs, nil
 }
 
+// getJSONB parses the incoming JSONB data into target type. To get raw data, pass pgtype.JSONB as T.
+func getJSONB[T any](formatCode int16, src []byte) (T, error) {
+	var dst T
+	err := pgtype.NewConnInfo().Scan(pgtype.JSONBOID, formatCode, src, &dst)
+	if err != nil {
+		return dst, trace.Wrap(err)
+	}
+	return dst, nil
+}
+
 func (s *TestServer) sendMessages(client *pgproto3.Backend, messages ...pgproto3.BackendMessage) error {
 	for _, message := range messages {
-		s.log.Debugf("Sending %#v.", message)
+		s.log.DebugContext(context.Background(), "Sending.", "message", fmt.Sprintf("%#v", message))
 		err := client.Send(message)
 		if err != nil {
 			return trace.Wrap(err)
@@ -714,7 +1004,7 @@ func (s *TestServer) fakeLongRunningQuery(client *pgproto3.Backend, pid uint32) 
 		&pgproto3.ReadyForQuery{},
 	}
 	for _, message := range messages {
-		s.log.Debugf("Sending %#v.", message)
+		s.log.DebugContext(context.Background(), "Sending.", "message", fmt.Sprintf("%#v", message))
 		err := client.Send(message)
 		if err != nil {
 			return trace.Wrap(err)
@@ -725,7 +1015,7 @@ func (s *TestServer) fakeLongRunningQuery(client *pgproto3.Backend, pid uint32) 
 
 func (s *TestServer) handleSync(client *pgproto3.Backend) error {
 	message := &pgproto3.ReadyForQuery{}
-	s.log.Debugf("Sending %#v.", message)
+	s.log.DebugContext(context.Background(), "Sending.", "message", fmt.Sprintf("%#v", message))
 	err := client.Send(message)
 	if err != nil {
 		return trace.Wrap(err)
@@ -751,6 +1041,11 @@ func (s *TestServer) ParametersCh() chan map[string]string {
 // UserEventsCh returns channel that receives user activate/deactivate events.
 func (s *TestServer) UserEventsCh() <-chan UserEvent {
 	return s.userEventsCh
+}
+
+// UserPermissionsCh returns channel that receives user permission events.
+func (s *TestServer) UserPermissionsCh() <-chan UserPermissionEvent {
+	return s.userPermissionEventsCh
 }
 
 // Close closes the server listener.
@@ -804,23 +1099,68 @@ func (s *TestServer) registerCancel(pid uint32, cancel context.CancelFunc) error
 	return nil
 }
 
-// TestQueryResponse is the response test Postgres server sends to every query.
+// TestQueryResponse is the response test Postgres server sends to every success
+// query.
 var TestQueryResponse = &pgconn.Result{
 	FieldDescriptions: []pgproto3.FieldDescription{{Name: []byte("test-field")}},
 	Rows:              [][][]byte{{[]byte("test-value")}},
 	CommandTag:        pgconn.CommandTag("select 1"),
 }
 
+// TestDeleteUserResponse is the response test Postgres server sends to every
+// query that calls the auto user deletion procedure.
+var TestDeleteUserResponse = &pgconn.Result{
+	FieldDescriptions: []pgproto3.FieldDescription{{Name: []byte("state")}},
+	Rows:              [][][]byte{{[]byte("TP003")}},
+}
+
 // TestLongRunningQuery is a stub SQL query clients can use to simulate a long
 // running query that can be only be stopped by a cancel request.
 const TestLongRunningQuery = "pg_sleep(forever)"
 
+// TestErrorQuery is a stub SQL query clients can use to simulate a query that
+// returns error.
+const TestErrorQuery = "select err"
+
 // testSecretKey is the secret key stub for all connections, used for cancel requests.
 const testSecretKey = 1234
 
+// userParameterName is the parameter name that contains the username used to
+// connect.
+const userParameterName = "user"
+
 // storedProcedureRe is the regex for capturing stored procedure name from its
 // creation query.
-var storedProcedureRe = regexp.MustCompile(`create or replace procedure (.+)\(`)
+var storedProcedureRe = regexp.MustCompile(`(?i)create or replace procedure (?:(?P<Schema>\w+)\.)?(?P<ProcName>.+)\((?P<Args>.+)?\)`)
 
 // selectBenchmarkRe is the regex for capturing the parameters from the select query used for read benchmark.
 var selectBenchmarkRe = regexp.MustCompile(`SELECT \* FROM bench\_(\d+) LIMIT (\d+)`)
+
+// callProcedureRe is the regex for caputuring the schema name, and procedure
+// name from the procedure call query.
+// Examples:
+// - call pg_temp.hello($1)
+// - call pg_temp.hello1()
+// - call pg_temp.hello2($1, $2, $3)
+// - call hello3($1::jsonb)
+var callProcedureRe = regexp.MustCompile(`(?i)^call (?:(?P<Schema>\w+)\.)?(?P<ProcName>\w+)\((?P<Args>.+)?\)`)
+
+// processProcedureCall parses a query and returns the information about the
+// the procedure call.
+// Examples:
+// - create or replace procedure teleport_procedure(username varchar, inout state varchar default 'TP003')
+// - create or replace procedure pg_temp.teleport_procedure(username varchar, inout state varchar default 'TP003')
+// - create or replace procedure pg_temp.teleport_procedure()
+// - create or replace procedure pg_temp.teleport_procedure(permissions_ JSONB)
+func processProcedureCall(query string) (schema string, procName string, argsCount int, ok bool) {
+	procMatches := callProcedureRe.FindStringSubmatch(query)
+	if procMatches == nil {
+		return
+	}
+
+	ok = true
+	schema = procMatches[callProcedureRe.SubexpIndex("Schema")]
+	procName = procMatches[callProcedureRe.SubexpIndex("ProcName")]
+	argsCount = len(strings.Split(procMatches[callProcedureRe.SubexpIndex("Args")], ","))
+	return
+}

@@ -1,18 +1,20 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
@@ -37,27 +39,29 @@ type PluginStaticCredentials interface {
 	// GetPluginStaticCredentialsByLabels will get a list of plugin static credentials resource by matching labels.
 	GetPluginStaticCredentialsByLabels(ctx context.Context, labels map[string]string) ([]types.PluginStaticCredentials, error)
 
+	// UpdatePluginStaticCredentials will update a plugin static credentials' resource.
+	UpdatePluginStaticCredentials(ctx context.Context, pluginStaticCredentials types.PluginStaticCredentials) (types.PluginStaticCredentials, error)
+
 	// DeletePluginStaticCredentials will delete a plugin static credentials resource.
 	DeletePluginStaticCredentials(ctx context.Context, name string) error
+
+	// GetAllPluginStaticCredentials will get all plugin static credentials.
+	GetAllPluginStaticCredentials(ctx context.Context) ([]types.PluginStaticCredentials, error)
 }
 
 // MarshalPluginStaticCredentials marshals PluginStaticCredentials resource to JSON.
 func MarshalPluginStaticCredentials(pluginStaticCredentials types.PluginStaticCredentials, opts ...MarshalOption) ([]byte, error) {
-	if err := pluginStaticCredentials.CheckAndSetDefaults(); err != nil {
-		return nil, trace.Wrap(err)
-	}
 	cfg, err := CollectOptions(opts)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 	switch pluginStaticCredentials := pluginStaticCredentials.(type) {
 	case *types.PluginStaticCredentialsV1:
-		if !cfg.PreserveResourceID {
-			copy := *pluginStaticCredentials
-			copy.SetResourceID(0)
-			pluginStaticCredentials = &copy
+		if err := pluginStaticCredentials.CheckAndSetDefaults(); err != nil {
+			return nil, trace.Wrap(err)
 		}
-		data, err := protojson.Marshal(protoadapt.MessageV2Of(pluginStaticCredentials))
+
+		data, err := protojson.Marshal(protoadapt.MessageV2Of(maybeResetProtoRevision(cfg.PreserveRevision, pluginStaticCredentials)))
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -89,8 +93,8 @@ func UnmarshalPluginStaticCredentials(data []byte, opts ...MarshalOption) (types
 		if err := pluginStaticCredentials.CheckAndSetDefaults(); err != nil {
 			return nil, trace.Wrap(err)
 		}
-		if cfg.ID != 0 {
-			pluginStaticCredentials.SetResourceID(cfg.ID)
+		if cfg.Revision != "" {
+			pluginStaticCredentials.SetRevision(cfg.Revision)
 		}
 		if !cfg.Expires.IsZero() {
 			pluginStaticCredentials.SetExpiry(cfg.Expires)

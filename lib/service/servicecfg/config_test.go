@@ -1,21 +1,27 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package servicecfg
 
 import (
 	"fmt"
+	"io"
+	"log/slog"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -27,9 +33,9 @@ import (
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/backend/lite"
 	"github.com/gravitational/teleport/lib/defaults"
-	"github.com/gravitational/teleport/lib/fixtures"
 	"github.com/gravitational/teleport/lib/srv/app/common"
 	"github.com/gravitational/teleport/lib/utils"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
 func TestDefaultConfig(t *testing.T) {
@@ -78,25 +84,26 @@ func TestDefaultConfig(t *testing.T) {
 
 	// auth section
 	auth := config.Auth
-	require.Equal(t, auth.ListenAddr, localAuthAddr)
-	require.Equal(t, auth.Limiter.MaxConnections, int64(defaults.LimiterMaxConnections))
-	require.Equal(t, auth.Limiter.MaxNumberOfUsers, defaults.LimiterMaxConcurrentUsers)
-	require.Equal(t, config.Auth.StorageConfig.Type, lite.GetName())
-	require.Equal(t, auth.StorageConfig.Params[defaults.BackendPath], filepath.Join(config.DataDir, defaults.BackendDir))
+	require.Equal(t, localAuthAddr, auth.ListenAddr)
+	require.Equal(t, int64(defaults.LimiterMaxConnections), auth.Limiter.MaxConnections)
+	require.Equal(t, lite.GetName(), config.Auth.StorageConfig.Type)
+	require.Empty(t, auth.StorageConfig.Params[defaults.BackendPath])
+	require.Equal(t, filepath.Join(defaults.DataDir, defaults.LicenseFile), config.Auth.LicenseFile)
 
 	// SSH section
 	ssh := config.SSH
-	require.Equal(t, ssh.Limiter.MaxConnections, int64(defaults.LimiterMaxConnections))
-	require.Equal(t, ssh.Limiter.MaxNumberOfUsers, defaults.LimiterMaxConcurrentUsers)
-	require.Equal(t, ssh.AllowTCPForwarding, true)
+	require.Equal(t, int64(defaults.LimiterMaxConnections), ssh.Limiter.MaxConnections)
+	require.True(t, ssh.AllowTCPForwarding)
 
 	// proxy section
 	proxy := config.Proxy
-	require.Equal(t, proxy.Limiter.MaxConnections, int64(defaults.LimiterMaxConnections))
-	require.Equal(t, proxy.Limiter.MaxNumberOfUsers, defaults.LimiterMaxConcurrentUsers)
+	require.Equal(t, int64(defaults.LimiterMaxConnections), proxy.Limiter.MaxConnections)
 
 	// Misc levers and dials
-	require.Equal(t, config.RotationConnectionInterval, defaults.HighResPollingPeriod)
+	require.Equal(t, defaults.HighResPollingPeriod, config.RotationConnectionInterval)
+
+	// Debug should always be enabled by default.
+	require.True(t, config.DebugService.Enabled)
 }
 
 // TestCheckApp validates application configuration.
@@ -176,189 +183,141 @@ func TestCheckApp(t *testing.T) {
 	}
 }
 
-func TestCheckDatabase(t *testing.T) {
+func TestCheckAppTCPPorts(t *testing.T) {
 	tests := []struct {
-		desc       string
-		inDatabase Database
-		outErr     bool
+		name     string
+		tcpPorts []PortRange
+		uri      string
+		check    require.ErrorAssertionFunc
 	}{
 		{
-			desc: "ok",
-			inDatabase: Database{
-				Name:     "example",
-				Protocol: defaults.ProtocolPostgres,
-				URI:      "localhost:5432",
+			name: "valid ranges and single ports",
+			tcpPorts: []PortRange{
+				PortRange{Port: 22, EndPort: 25},
+				PortRange{Port: 26},
+				PortRange{Port: 65535},
 			},
-			outErr: false,
+			check: hasNoErr,
 		},
 		{
-			desc: "empty database name",
-			inDatabase: Database{
-				Protocol: defaults.ProtocolPostgres,
-				URI:      "localhost:5432",
+			name: "valid overlapping ranges",
+			tcpPorts: []PortRange{
+				PortRange{Port: 100, EndPort: 200},
+				PortRange{Port: 150, EndPort: 175},
+				PortRange{Port: 111},
+				PortRange{Port: 150, EndPort: 210},
+				PortRange{Port: 1, EndPort: 65535},
 			},
-			outErr: true,
+			check: hasNoErr,
 		},
 		{
-			desc: "fails services.ValidateDatabase",
-			inDatabase: Database{
-				Name:     "??--++",
-				Protocol: defaults.ProtocolPostgres,
-				URI:      "localhost:5432",
+			// Ports are validated only for TCP apps to allow for some forwards compatibility.
+			// If HTTP apps support port ranges in the future, old versions of Teleport shouldn't hard
+			// fail to make downgrades easier.
+			name: "valid non-TCP app with invalid ports ignored",
+			uri:  "http://localhost:8000",
+			tcpPorts: []PortRange{
+				PortRange{Port: 0},
+				PortRange{Port: 10, EndPort: 2},
 			},
-			outErr: true,
+			check: hasNoErr,
+		},
+		// Test cases for invalid ports.
+		{
+			name: "port smaller than 1",
+			tcpPorts: []PortRange{
+				PortRange{Port: 0},
+			},
+			check: hasErrTypeBadParameter,
 		},
 		{
-			desc: "GCP valid configuration",
-			inDatabase: Database{
-				Name:     "example",
-				Protocol: defaults.ProtocolPostgres,
-				URI:      "localhost:5432",
-				GCP: DatabaseGCP{
-					ProjectID:  "project-1",
-					InstanceID: "instance-1",
-				},
-				TLS: DatabaseTLS{
-					CACert: fixtures.LocalhostCert,
-				},
+			name: "end port smaller than 2",
+			tcpPorts: []PortRange{
+				PortRange{Port: 5, EndPort: 1},
 			},
-			outErr: false,
+			check: hasErrTypeBadParameterAndContains("end port must be between 6 and 65535"),
 		},
 		{
-			desc: "GCP project ID specified without instance ID",
-			inDatabase: Database{
-				Name:     "example",
-				Protocol: defaults.ProtocolPostgres,
-				URI:      "localhost:5432",
-				GCP: DatabaseGCP{
-					ProjectID: "project-1",
-				},
-				TLS: DatabaseTLS{
-					CACert: fixtures.LocalhostCert,
-				},
+			name: "end port smaller than port",
+			tcpPorts: []PortRange{
+				PortRange{Port: 10, EndPort: 5},
 			},
-			outErr: true,
+			check: hasErrTypeBadParameterAndContains("end port must be between 11 and 65535"),
 		},
 		{
-			desc: "GCP instance ID specified without project ID",
-			inDatabase: Database{
-				Name:     "example",
-				Protocol: defaults.ProtocolPostgres,
-				URI:      "localhost:5432",
-				GCP: DatabaseGCP{
-					InstanceID: "instance-1",
-				},
-				TLS: DatabaseTLS{
-					CACert: fixtures.LocalhostCert,
-				},
+			name: "uri specifies port",
+			uri:  "tcp://localhost:1234",
+			tcpPorts: []PortRange{
+				PortRange{Port: 1000, EndPort: 1500},
 			},
-			outErr: true,
+			check: hasErrTypeBadParameterAndContains("must not include a port number"),
 		},
 		{
-			desc: "SQL Server correct configuration",
-			inDatabase: Database{
-				Name:     "sqlserver",
-				Protocol: defaults.ProtocolSQLServer,
-				URI:      "localhost:1433",
-				AD: DatabaseAD{
-					KeytabFile: "/etc/keytab",
-					Domain:     "test-domain",
-					SPN:        "test-spn",
-				},
+			name: "invalid uri",
+			uri:  "%",
+			tcpPorts: []PortRange{
+				PortRange{Port: 1000, EndPort: 1500},
 			},
-			outErr: false,
-		},
-		{
-			desc: "SQL Server missing keytab",
-			inDatabase: Database{
-				Name:     "sqlserver",
-				Protocol: defaults.ProtocolSQLServer,
-				URI:      "localhost:1433",
-				AD: DatabaseAD{
-					Domain: "test-domain",
-					SPN:    "test-spn",
-				},
-			},
-			outErr: true,
-		},
-		{
-			desc: "SQL Server missing AD domain",
-			inDatabase: Database{
-				Name:     "sqlserver",
-				Protocol: defaults.ProtocolSQLServer,
-				URI:      "localhost:1433",
-				AD: DatabaseAD{
-					KeytabFile: "/etc/keytab",
-					SPN:        "test-spn",
-				},
-			},
-			outErr: true,
-		},
-		{
-			desc: "SQL Server missing SPN",
-			inDatabase: Database{
-				Name:     "sqlserver",
-				Protocol: defaults.ProtocolSQLServer,
-				URI:      "localhost:1433",
-				AD: DatabaseAD{
-					KeytabFile: "/etc/keytab",
-					Domain:     "test-domain",
-				},
-			},
-			outErr: true,
-		},
-		{
-			desc: "SQL Server missing LDAP Cert",
-			inDatabase: Database{
-				Name:     "sqlserver",
-				Protocol: defaults.ProtocolSQLServer,
-				URI:      "localhost:1433",
-				AD: DatabaseAD{
-					Domain:      "test-domain",
-					SPN:         "test-spn",
-					KDCHostName: "test-domain",
-				},
-			},
-			outErr: true,
-		},
-		{
-			desc: "SQL Server missing KDC Hostname",
-			inDatabase: Database{
-				Name:     "sqlserver",
-				Protocol: defaults.ProtocolSQLServer,
-				URI:      "localhost:1433",
-				AD: DatabaseAD{
-					Domain:   "test-domain",
-					SPN:      "test-spn",
-					LDAPCert: "random-content",
-				},
-			},
-			outErr: true,
-		},
-		{
-			desc: "MySQL with server version",
-			inDatabase: Database{
-				Name:     "mysql-foo",
-				Protocol: defaults.ProtocolMySQL,
-				URI:      "localhost:3306",
-				MySQL: MySQLOptions{
-					ServerVersion: "8.0.31",
-				},
-			},
-			outErr: false,
+			check: hasErrAndContains("invalid URL escape"),
 		},
 	}
-	for _, test := range tests {
-		test := test
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			app := App{
+				Name:     "foo",
+				URI:      "tcp://localhost",
+				TCPPorts: tc.tcpPorts,
+			}
+			if tc.uri != "" {
+				app.URI = tc.uri
+			}
+
+			err := app.CheckAndSetDefaults()
+			tc.check(t, err)
+		})
+	}
+}
+
+// TestDatabaseStaticLabels ensures the static labels are set.
+func TestDatabaseStaticLabels(t *testing.T) {
+	db := Database{
+		Name:     "example",
+		Protocol: defaults.ProtocolPostgres,
+		URI:      "localhost:5432",
+	}
+	require.NoError(t, db.CheckAndSetDefaults())
+	require.Equal(t, types.OriginConfigFile, db.StaticLabels[types.OriginLabel])
+}
+
+func TestDatabaseAWSAccountID(t *testing.T) {
+	for _, test := range []struct {
+		desc              string
+		assumeRoleARN     string
+		expectedAccountID string
+	}{
+		{
+			desc:              "valid role arn",
+			assumeRoleARN:     "arn:aws:iam::123456789012:role/test-role",
+			expectedAccountID: "123456789012",
+		},
+		{
+			desc:              "invalid role arn",
+			assumeRoleARN:     "foobar",
+			expectedAccountID: "",
+		},
+	} {
 		t.Run(test.desc, func(t *testing.T) {
 			t.Parallel()
-
-			err := test.inDatabase.CheckAndSetDefaults()
-			if test.outErr {
-				require.Error(t, err)
-			} else {
-				require.NoError(t, err)
+			db := Database{
+				Name:     "example",
+				Protocol: defaults.ProtocolPostgres,
+				AWS: DatabaseAWS{
+					AssumeRoleARN: test.assumeRoleARN,
+				},
 			}
+			require.NoError(t, db.CheckAndSetDefaults())
+			require.Equal(t, test.expectedAccountID, db.AWS.AccountID)
 		})
 	}
 }
@@ -625,8 +584,6 @@ func TestVerifyEnabledService(t *testing.T) {
 					Spec: &types.JamfSpecV1{
 						Enabled:     true,
 						ApiEndpoint: "https://example.jamfcloud.com",
-						Username:    "llama",
-						Password:    "supersecret!!1!ONE",
 					},
 				},
 			},
@@ -688,5 +645,60 @@ func TestWebPublicAddr(t *testing.T) {
 
 			require.Equal(t, test.expected, out)
 		})
+	}
+}
+
+func TestSetLogLevel(t *testing.T) {
+	for _, test := range []struct {
+		logLevel slog.Level
+	}{
+		{
+			logLevel: logutils.TraceLevel,
+		},
+		{
+			logLevel: slog.LevelDebug,
+		},
+		{
+			logLevel: slog.LevelInfo,
+		},
+		{
+			logLevel: slog.LevelWarn,
+		},
+		{
+			logLevel: slog.LevelError,
+		},
+	} {
+		t.Run(test.logLevel.String(), func(t *testing.T) {
+			// Create a configuration with local loggers to avoid modifying the
+			// global instances.
+			c := &Config{
+				Logger: slog.New(logutils.NewSlogTextHandler(io.Discard, logutils.SlogTextHandlerConfig{})),
+			}
+			ApplyDefaults(c)
+
+			c.SetLogLevel(test.logLevel)
+			require.Equal(t, test.logLevel, c.LoggerLevel.Level())
+		})
+	}
+}
+
+func hasNoErr(t require.TestingT, err error, msgAndArgs ...interface{}) {
+	require.NoError(t, err, msgAndArgs...)
+}
+
+func hasErrTypeBadParameter(t require.TestingT, err error, msgAndArgs ...interface{}) {
+	require.True(t, trace.IsBadParameter(err), "expected bad parameter error, got %+v", err)
+}
+
+func hasErrTypeBadParameterAndContains(msg string) require.ErrorAssertionFunc {
+	return func(t require.TestingT, err error, msgAndArgs ...interface{}) {
+		require.True(t, trace.IsBadParameter(err), "err should be trace.BadParameter")
+		require.ErrorContains(t, err, msg, msgAndArgs...)
+	}
+}
+
+func hasErrAndContains(msg string) require.ErrorAssertionFunc {
+	return func(t require.TestingT, err error, msgAndArgs ...interface{}) {
+		require.ErrorContains(t, err, msg, msgAndArgs...)
 	}
 }

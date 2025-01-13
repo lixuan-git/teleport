@@ -1,31 +1,42 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import { pluralize } from 'shared/utils/text';
-
-import type { ResourceTypeSearchFilter } from 'teleterm/ui/Search/searchResult';
+import {
+  resourceOneOfIsApp,
+  resourceOneOfIsDatabase,
+  resourceOneOfIsKube,
+  resourceOneOfIsServer,
+} from 'teleterm/helpers';
+import Logger from 'teleterm/logger';
+import type { TshdClient } from 'teleterm/services/tshd';
+import { getAppAddrWithProtocol } from 'teleterm/services/tshd/app';
+import {
+  cloneAbortSignal,
+  TshdRpcError,
+} from 'teleterm/services/tshd/cloneableClient';
 import type * as types from 'teleterm/services/tshd/types';
+import type { ResourceTypeFilter } from 'teleterm/ui/Search/searchResult';
 import type * as uri from 'teleterm/ui/uri';
 
 export class ResourcesService {
-  constructor(private tshClient: types.TshClient) {}
+  private logger = new Logger('ResourcesService');
 
-  fetchServers(params: types.GetResourcesParams) {
-    return this.tshClient.getServers(params);
-  }
+  constructor(private tshClient: TshdClient) {}
 
   // TODO(ravicious): Refactor it to use logic similar to that in the Web UI.
   // https://github.com/gravitational/teleport/blob/2a2b08dbfdaf71706a5af3812d3a7ec843d099b4/lib/web/apiserver.go#L2471
@@ -34,12 +45,16 @@ export class ResourcesService {
     hostname: string
   ): Promise<types.Server | undefined> {
     const query = `name == "${hostname}"`;
-    const { agentsList: servers } = await this.fetchServers({
-      clusterUri,
-      query,
-      limit: 2,
-      sort: null,
-    });
+    const {
+      response: { agents: servers },
+    } = await this.tshClient.getServers(
+      makeGetResourcesParamsRequest({
+        clusterUri,
+        query,
+        limit: 2,
+        sort: null,
+      })
+    );
 
     if (servers.length > 1) {
       throw new AmbiguousHostnameError(hostname);
@@ -48,16 +63,9 @@ export class ResourcesService {
     return servers[0];
   }
 
-  fetchDatabases(params: types.GetResourcesParams) {
-    return this.tshClient.getDatabases(params);
-  }
-
-  fetchKubes(params: types.GetResourcesParams) {
-    return this.tshClient.getKubes(params);
-  }
-
   async getDbUsers(dbUri: uri.DatabaseUri): Promise<string[]> {
-    return await this.tshClient.listDatabaseUsers(dbUri);
+    const { response } = await this.tshClient.listDatabaseUsers({ dbUri });
+    return response.users;
   }
 
   /**
@@ -73,57 +81,95 @@ export class ResourcesService {
   async searchResources({
     clusterUri,
     search,
-    filter,
+    filters,
     limit,
+    includeRequestable,
   }: {
     clusterUri: uri.ClusterUri;
     search: string;
-    // TODO(ravicious): Accept just `server | database | kube` as searchFilter here, wrap it in a
-    // variant of a discriminated union in searchResult.ts.
-    filter: ResourceTypeSearchFilter | undefined;
+    filters: ResourceTypeFilter[];
     limit: number;
-  }): Promise<PromiseSettledResult<SearchResult[]>[]> {
-    const params = { search, clusterUri, sort: null, limit };
+    includeRequestable: boolean;
+  }): Promise<SearchResult[]> {
+    try {
+      const { resources } = await this.listUnifiedResources({
+        clusterUri,
+        kinds: filters,
+        limit,
+        search,
+        query: '',
+        searchAsRoles: false,
+        pinnedOnly: false,
+        startKey: '',
+        sortBy: { field: 'name', isDesc: true },
+        includeRequestable,
+      });
+      return resources.map(r => {
+        if (r.kind === 'app') {
+          return {
+            ...r,
+            resource: {
+              ...r.resource,
+              addrWithProtocol: getAppAddrWithProtocol(r.resource),
+            },
+          };
+        }
+        return r;
+      });
+    } catch (err) {
+      throw new ResourceSearchError(clusterUri, err);
+    }
+  }
 
-    const getServers = () =>
-      this.fetchServers(params).then(
-        res =>
-          res.agentsList.map(resource => ({
-            kind: 'server' as const,
-            resource,
-          })),
-        err =>
-          Promise.reject(new ResourceSearchError(clusterUri, 'server', err))
-      );
-    const getDatabases = () =>
-      this.fetchDatabases(params).then(
-        res =>
-          res.agentsList.map(resource => ({
-            kind: 'database' as const,
-            resource,
-          })),
-        err =>
-          Promise.reject(new ResourceSearchError(clusterUri, 'database', err))
-      );
-    const getKubes = () =>
-      this.fetchKubes(params).then(
-        res =>
-          res.agentsList.map(resource => ({
-            kind: 'kube' as const,
-            resource,
-          })),
-        err => Promise.reject(new ResourceSearchError(clusterUri, 'kube', err))
-      );
+  async listUnifiedResources(
+    params: types.ListUnifiedResourcesRequest,
+    abortSignal?: AbortSignal
+  ): Promise<{ nextKey: string; resources: UnifiedResourceResponse[] }> {
+    const { response } = await this.tshClient.listUnifiedResources(params, {
+      abort: abortSignal && cloneAbortSignal(abortSignal),
+    });
+    return {
+      nextKey: response.nextKey,
+      resources: response.resources
+        .map(p => {
+          if (resourceOneOfIsServer(p.resource)) {
+            return {
+              kind: 'server' as const,
+              resource: p.resource.server,
+              requiresRequest: p.requiresRequest,
+            };
+          }
 
-    const promises = filter
-      ? [
-          filter.resourceType === 'servers' && getServers(),
-          filter.resourceType === 'databases' && getDatabases(),
-          filter.resourceType === 'kubes' && getKubes(),
-        ].filter(Boolean)
-      : [getServers(), getDatabases(), getKubes()];
+          if (resourceOneOfIsDatabase(p.resource)) {
+            return {
+              kind: 'database' as const,
+              resource: p.resource.database,
+              requiresRequest: p.requiresRequest,
+            };
+          }
 
-    return Promise.allSettled(promises);
+          if (resourceOneOfIsApp(p.resource)) {
+            return {
+              kind: 'app' as const,
+              resource: p.resource.app,
+              requiresRequest: p.requiresRequest,
+            };
+          }
+
+          if (resourceOneOfIsKube(p.resource)) {
+            return {
+              kind: 'kube' as const,
+              resource: p.resource.kube,
+              requiresRequest: p.requiresRequest,
+            };
+          }
+
+          this.logger.info(
+            `Ignoring unsupported resource ${JSON.stringify(p)}.`
+          );
+        })
+        .filter(Boolean),
+    };
   }
 }
 
@@ -137,28 +183,24 @@ export class AmbiguousHostnameError extends Error {
 export class ResourceSearchError extends Error {
   constructor(
     public clusterUri: uri.ClusterUri,
-    public resourceKind: SearchResult['kind'],
-    cause: Error
+    cause: Error | TshdRpcError
   ) {
-    super(
-      `Error while fetching resources of type ${resourceKind} from cluster ${clusterUri}`,
-      { cause }
-    );
+    super(`Error while fetching resources from cluster ${clusterUri}`, {
+      cause,
+    });
     this.name = 'ResourceSearchError';
     this.clusterUri = clusterUri;
-    this.resourceKind = resourceKind;
   }
 
   messageWithClusterName(
     getClusterName: (resourceUri: uri.ClusterOrResourceUri) => string,
     opts = { capitalize: true }
   ) {
-    const resource = pluralize(2, this.resourceKind);
     const cluster = getClusterName(this.clusterUri);
 
     return `${
       opts.capitalize ? 'Could' : 'could'
-    } not fetch ${resource} from ${cluster}`;
+    } not fetch resources from ${cluster}`;
   }
 
   messageAndCauseWithClusterName(
@@ -170,23 +212,63 @@ export class ResourceSearchError extends Error {
   }
 }
 
-export type SearchResultServer = { kind: 'server'; resource: types.Server };
+export type SearchResultServer = {
+  kind: 'server';
+  resource: types.Server;
+  requiresRequest: boolean;
+};
 export type SearchResultDatabase = {
   kind: 'database';
   resource: types.Database;
+  requiresRequest: boolean;
 };
-export type SearchResultKube = { kind: 'kube'; resource: types.Kube };
+export type SearchResultKube = {
+  kind: 'kube';
+  resource: types.Kube;
+  requiresRequest: boolean;
+};
+export type SearchResultApp = {
+  kind: 'app';
+  resource: types.App & { addrWithProtocol: string };
+  requiresRequest: boolean;
+};
 
 export type SearchResult =
   | SearchResultServer
   | SearchResultDatabase
-  | SearchResultKube;
+  | SearchResultKube
+  | SearchResultApp;
 
 export type SearchResultResource<Kind extends SearchResult['kind']> =
   Kind extends 'server'
     ? SearchResultServer['resource']
-    : Kind extends 'database'
-    ? SearchResultDatabase['resource']
-    : Kind extends 'kube'
-    ? SearchResultKube['resource']
-    : never;
+    : Kind extends 'app'
+      ? SearchResultApp['resource']
+      : Kind extends 'database'
+        ? SearchResultDatabase['resource']
+        : Kind extends 'kube'
+          ? SearchResultKube['resource']
+          : never;
+
+function makeGetResourcesParamsRequest(params: types.GetResourcesParams) {
+  return {
+    ...params,
+    search: params.search || '',
+    query: params.query || '',
+    searchAsRoles: params.searchAsRoles || '',
+    startKey: params.startKey || '',
+    sortBy: params.sort
+      ? `${params.sort.fieldName}:${params.sort.dir.toLowerCase()}`
+      : '',
+  };
+}
+
+export type UnifiedResourceResponse =
+  | { kind: 'server'; resource: types.Server; requiresRequest: boolean }
+  | {
+      kind: 'database';
+      resource: types.Database;
+      requiresRequest: boolean;
+    }
+  | { kind: 'kube'; resource: types.Kube; requiresRequest: boolean }
+  | { kind: 'app'; resource: types.App; requiresRequest: boolean };

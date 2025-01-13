@@ -1,41 +1,46 @@
 /**
- * Copyright 2020 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 import React from 'react';
-import { Box, Card, Flex, Text } from 'design';
-import * as Icons from 'design/Icon';
-
+import { Link } from 'react-router-dom';
 import styled from 'styled-components';
 
-import { FeatureBox } from 'teleport/components/Layout';
-import useTeleport from 'teleport/useTeleport';
-import cfg from 'teleport/config';
-import { ButtonLockedFeature } from 'teleport/components/ButtonLockedFeature';
-import { CtaEvent } from 'teleport/services/userEvent';
+import { Box, Flex, H2, H3, Text } from 'design';
+import * as Icons from 'design/Icon';
+import { MultiRowBox, Row } from 'design/MultiRowBox';
 
-export default function Container({
-  children,
-}: {
-  children?: React.ReactNode;
-}) {
+import { ButtonLockedFeature } from 'teleport/components/ButtonLockedFeature';
+import {
+  FeatureBox,
+  FeatureHeader,
+  FeatureHeaderTitle,
+} from 'teleport/components/Layout';
+import cfg from 'teleport/config';
+import { useNoMinWidth } from 'teleport/Main';
+import { CtaEvent } from 'teleport/services/userEvent';
+import useTeleport from 'teleport/useTeleport';
+
+export function SupportContainer({ children }: { children?: React.ReactNode }) {
   const ctx = useTeleport();
   const cluster = ctx.storeUser.state.cluster;
 
   // showCTA returns the premium support value for enterprise customers and true for OSS users
-  const showCTA = cfg.isEnterprise ? ctx.lockedFeatures.premiumSupport : true;
+  const showCTA = cfg.isEnterprise ? !cfg.premiumSupport : true;
 
   return (
     <Support
@@ -54,99 +59,226 @@ export const Support = ({
   authVersion,
   publicURL,
   isEnterprise,
+  licenseExpiryDateText,
   tunnelPublicAddress,
   isCloud,
   children,
   showPremiumSupportCTA,
 }: Props) => {
+  useNoMinWidth();
   const docs = getDocUrls(authVersion, isEnterprise);
 
   return (
-    <FeatureBox pt="4">
-      <Card px={5} pt={1} pb={6}>
-        <Flex justifyContent="space-between" flexWrap="wrap">
-          <Box>
-            <Header title="Support" icon={<Icons.Headset />} />
-            {isEnterprise && !showPremiumSupportCTA && (
-              <SupportLink
-                title="Create a Support Ticket"
-                url="https://support.goteleport.com"
+    <FeatureBox maxWidth="2000px">
+      <FeatureHeader>
+        <FeatureHeaderTitle>Help & Support</FeatureHeaderTitle>
+      </FeatureHeader>
+      <StyledMultiRowBox mb={3}>
+        <StyledRow>
+          <Flex alignItems="center" justifyContent="start">
+            <IconBox>
+              <Icons.Cluster />
+            </IconBox>
+            <H2>Cluster Information</H2>
+          </Flex>
+        </StyledRow>
+        <StyledRow
+          css={`
+            padding-left: ${props => props.theme.space[6]}px;
+          `}
+        >
+          <DataItem title="Cluster Name" data={clusterId} />
+          <DataItem title="Teleport Version" data={authVersion} />
+          <DataItem title="Public Address" data={publicURL} />
+          {tunnelPublicAddress && (
+            <DataItem title="Public SSH Tunnel" data={tunnelPublicAddress} />
+          )}
+          {isEnterprise && !cfg.isCloud && licenseExpiryDateText && (
+            <DataItem title="License Expiry" data={licenseExpiryDateText} />
+          )}
+          {isCloud && (
+            <Flex mt="5">
+              <Icons.Info mr="2" />
+              <Text>
+                Looking for{' '}
+                <Text
+                  fontWeight={'bold'}
+                  css={`
+                    display: inline;
+                  `}
+                >
+                  Scheduled Upgrades?
+                </Text>{' '}
+                It is now in{' '}
+                <Link to={cfg.getManageClusterRoute(clusterId)}>
+                  Cluster Management
+                </Link>{' '}
+                page.
+              </Text>
+            </Flex>
+          )}
+        </StyledRow>
+      </StyledMultiRowBox>
+      <MobileSeparator />
+      <StyledMultiRowBox mb={3}>
+        <StyledRow>
+          <SupportContentFlex
+            alignItems="center"
+            justifyContent="space-between"
+          >
+            <Flex alignItems="center">
+              <IconBox>
+                <Icons.Question />
+              </IconBox>
+              <H2>Support and Resource Pages</H2>
+            </Flex>
+            <SupportButtonBox>
+              {showPremiumSupportCTA && (
+                <ButtonLockedFeature event={CtaEvent.CTA_PREMIUM_SUPPORT}>
+                  Unlock Premium Support w/Enterprise
+                </ButtonLockedFeature>
+              )}
+            </SupportButtonBox>
+          </SupportContentFlex>
+        </StyledRow>
+        <StyledRow
+          css={`
+            padding-left: ${props => props.theme.space[6]}px;
+          `}
+        >
+          <SupportLinksFlex>
+            <Box>
+              <H3 ml={2} mb={1}>
+                Support
+              </H3>
+              {isEnterprise && !showPremiumSupportCTA && (
+                <ExternalSupportLink
+                  title="Create a Support Ticket"
+                  url="https://support.goteleport.com"
+                />
+              )}
+              <ExternalSupportLink
+                title="Ask the Community Questions"
+                url="https://github.com/gravitational/teleport/discussions"
               />
-            )}
-            <SupportLink
-              title="Ask the Community Questions"
-              url="https://github.com/gravitational/teleport/discussions"
-            />
-            <SupportLink
-              title="Request a New Feature"
-              url="https://github.com/gravitational/teleport/issues/new/choose"
-            />
-            <SupportLink
-              title="Send Product Feedback"
-              url="mailto:support@goteleport.com"
-            />
-            {showPremiumSupportCTA && (
-              <ButtonLockedFeature event={CtaEvent.CTA_PREMIUM_SUPPORT}>
-                Unlock Premium Support w/Enterprise
-              </ButtonLockedFeature>
-            )}
-          </Box>
-          <Box>
-            <Header title="Resources" icon={<Icons.BookOpenText />} />
-            <SupportLink title="Quickstart Guide" url={docs.quickstart} />
-            <SupportLink title="tsh User Guide" url={docs.userManual} />
-            <SupportLink title="Admin Guide" url={docs.adminGuide} />
-            <SupportLink
-              title="Download Page"
-              url={getDownloadLink(isCloud, isEnterprise)}
-            />
-            <SupportLink title="FAQ" url={docs.faq} />
-          </Box>
-          <Box>
-            <Header title="Troubleshooting" icon={<Icons.Graph />} />
-            <SupportLink
-              title="Monitoring & Debugging"
-              url={docs.troubleshooting}
-            />
-          </Box>
-          <Box>
-            <Header title="Updates" icon={<Icons.NotificationsActive />} />
-            <SupportLink title="Product Changelog" url={docs.changeLog} />
-            <SupportLink
-              title="Teleport Blog"
-              url="https://goteleport.com/blog/"
-            />
-          </Box>
-        </Flex>
-      </Card>
-      <DataContainer title="Cluster Information">
-        <DataItem title="Cluster Name" data={clusterId} />
-        <DataItem title="Teleport Version" data={authVersion} />
-        <DataItem title="Public Address" data={publicURL} />
-        {tunnelPublicAddress && (
-          <DataItem title="Public SSH Tunnel" data={tunnelPublicAddress} />
-        )}
-      </DataContainer>
-
+              <ExternalSupportLink
+                title="Request a New Feature"
+                url="https://github.com/gravitational/teleport/issues/new/choose"
+              />
+              <ExternalSupportLink
+                title="Send Product Feedback"
+                url="mailto:support@goteleport.com"
+              />
+            </Box>
+            <Box>
+              <H3 ml={2} mb={1}>
+                Resources
+              </H3>
+              <ExternalSupportLink
+                title="Get Started Guide"
+                url={docs.getStarted}
+              />
+              <ExternalSupportLink title="tsh User Guide" url={docs.tshGuide} />
+              <ExternalSupportLink title="Admin Guides" url={docs.adminGuide} />
+              <ExternalSupportLink
+                title="Troubleshooting Guide"
+                url={docs.troubleshooting}
+              />
+              <DownloadLink isCloud={isCloud} isEnterprise={isEnterprise} />
+              <ExternalSupportLink title="FAQ" url={docs.faq} />
+            </Box>
+            <Box>
+              <H3 ml={2} mb={1}>
+                Updates
+              </H3>
+              <ExternalSupportLink
+                title="Product Changelog"
+                url={docs.changeLog}
+              />
+              <ExternalSupportLink
+                title="Teleport Blog"
+                url="https://goteleport.com/blog/"
+              />
+            </Box>
+          </SupportLinksFlex>
+        </StyledRow>
+      </StyledMultiRowBox>
       {children}
     </FeatureBox>
   );
 };
 
-export const DataContainer: React.FC<{ title: string }> = ({
-  title,
-  children,
-}) => (
-  <StyledDataContainer mt={4} borderRadius={3} px={5} py={4}>
-    <Text as="h5" mb={4} fontWeight="bold" caps>
-      {title}
-    </Text>
-    {children}
-  </StyledDataContainer>
-);
+export const StyledMultiRowBox = styled(MultiRowBox)`
+  @media screen and (max-width: ${props => props.theme.breakpoints.mobile}px) {
+    border: none;
+  }
+`;
 
-const StyledDataContainer = styled(Box)`
-  border: 1px solid ${props => props.theme.colors.spotBackground[1]};
+export const StyledRow = styled(Row)`
+  @media screen and (max-width: ${props => props.theme.breakpoints.mobile}px) {
+    border: none !important;
+    padding-left: 0;
+    padding-bottom: 0;
+  }
+`;
+
+export const MobileSeparator = styled.div`
+  width: 100vw;
+  margin-left: -${props => props.theme.space[6]}px;
+  @media screen and (max-width: ${props => props.theme.breakpoints.mobile}px) {
+    border-bottom: ${props =>
+      `${props.theme.borders[1]} ${props.theme.colors.interactive.tonal.neutral[2]}`};
+  }
+`;
+
+export const IconBox = styled(Box)`
+  line-height: 0;
+  padding: ${props => props.theme.space[2]}px;
+  border-radius: ${props => props.theme.radii[3]}px;
+  margin-right: ${props => props.theme.space[3]}px;
+  background: ${props => props.theme.colors.interactive.tonal.neutral[0]};
+
+  @media screen and (max-width: ${props => props.theme.breakpoints.mobile}px) {
+    background: transparent;
+    margin-right: ${props => props.theme.space[1]}px;
+  }
+`;
+
+const SupportContentFlex = styled(Flex)`
+  @media screen and (max-width: ${props => props.theme.breakpoints.mobile}px) {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+`;
+
+const SupportButtonBox = styled(Box)`
+  width: 320px;
+  @media screen and (max-width: ${props => props.theme.breakpoints.mobile}px) {
+    margin-left: ${props => props.theme.space[6]}px;
+    margin-top: ${props => props.theme.space[2]}px;
+  }
+`;
+
+const SupportLinksFlex = styled(Flex)`
+  justify-content: space-between;
+  flex-wrap: wrap;
+  max-width: 70%;
+  @media screen and (max-width: ${props => props.theme.breakpoints.tablet}px) {
+    max-width: 100%;
+  }
+  @media screen and (max-width: ${props => props.theme.breakpoints.mobile}px) {
+    flex-direction: column;
+    gap: ${props => props.theme.space[3]}px;
+    margin-bottom: ${props => props.theme.space[3]}px;
+  }
+`;
+
+const DataItemFlex = styled(Flex)`
+  margin-bottom: ${props => props.theme.space[3]}px;
+  @media screen and (max-width: ${props => props.theme.breakpoints.mobile}px) {
+    flex-direction: column;
+    padding-left: ${props => props.theme.space[2]}px;
+  }
 `;
 
 /**
@@ -169,30 +301,52 @@ const getDocUrls = (version = '', isEnterprise: boolean) => {
     `${url}?product=teleport&version=${verPrefix}_${version}${anchorHash}`;
 
   return {
-    quickstart: withUTM('https://goteleport.com/docs/getting-started'),
-    userManual: withUTM('https://goteleport.com/docs/server-access/guides/tsh'),
-    adminGuide: withUTM('https://goteleport.com/docs/setup/admin'),
-    changeLog: withUTM('https://goteleport.com/docs/changelog'),
+    getStarted: withUTM(`https://goteleport.com/docs/get-started/`),
+    tshGuide: withUTM(`https://goteleport.com/docs/connect-your-client/tsh/`),
+    adminGuide: withUTM(`https://goteleport.com/docs/management/admin/`),
+    faq: withUTM(`https://goteleport.com/docs/faq`),
     troubleshooting: withUTM(
-      'https://goteleport.com/docs/setup/admin/troubleshooting'
+      `https://goteleport.com/docs/management/admin/troubleshooting/`
     ),
-    faq: withUTM('https://goteleport.com/docs/faq'),
+
+    // there isn't a version-specific changelog page
+    changeLog: withUTM('https://goteleport.com/docs/changelog'),
   };
 };
 
-const getDownloadLink = (isCloud: boolean, isEnterprise: boolean) => {
+const DownloadLink = ({
+  isCloud,
+  isEnterprise,
+}: {
+  isCloud: boolean;
+  isEnterprise: boolean;
+}) => {
   if (isCloud) {
-    return 'https://goteleport.com/docs/cloud/downloads/';
+    return (
+      <StyledSupportLink as={Link} to={cfg.routes.downloadCenter}>
+        Download Page
+      </StyledSupportLink>
+    );
   }
 
   if (isEnterprise) {
-    return 'https://goteleport.com/docs/choose-an-edition/teleport-enterprise/introduction/?scope=enterprise#dedicated-account-dashboard';
+    return (
+      <ExternalSupportLink
+        title="Download Page"
+        url="https://goteleport.com/docs/choose-an-edition/teleport-enterprise/introduction/?scope=enterprise#dedicated-account-dashboard"
+      />
+    );
   }
 
-  return 'https://goteleport.com/download/';
+  return (
+    <ExternalSupportLink
+      title="Download Page"
+      url="https://goteleport.com/download/"
+    />
+  );
 };
 
-const SupportLink = ({ title = '', url = '' }) => (
+const ExternalSupportLink = ({ title = '', url = '' }) => (
   <StyledSupportLink href={url} target="_blank">
     {title}
   </StyledSupportLink>
@@ -215,32 +369,20 @@ const StyledSupportLink = styled.a.attrs({
   }
 `;
 
-const StyledHeader = styled(Flex)`
-  border-bottom: 1px solid ${props => props.theme.colors.spotBackground[2]};
-`;
-
 export const DataItem = ({ title = '', data = null }) => (
-  <Flex mb={3}>
-    <Text typography="body2" bold style={{ width: '130px' }}>
+  <DataItemFlex>
+    <Text typography="body2" bold style={{ width: '136px' }}>
       {title}:
     </Text>
     <Text typography="body2">{data}</Text>
-  </Flex>
-);
-
-const Header = ({ title = '', icon = null }) => (
-  <StyledHeader alignItems="center" mb={3} width={210} mt={4} pb={2}>
-    {icon}
-    <Text as="h5" ml={2} caps>
-      {title}
-    </Text>
-  </StyledHeader>
+  </DataItemFlex>
 );
 
 export type Props = {
   clusterId: string;
   authVersion: string;
   publicURL: string;
+  licenseExpiryDateText?: string;
   isEnterprise: boolean;
   isCloud: boolean;
   tunnelPublicAddress?: string;

@@ -1,39 +1,38 @@
 /**
- * Copyright 2021-2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import { matchPath } from 'react-router';
+
+import { TrustedDeviceRequirement } from 'gen-proto-ts/teleport/legacy/types/trusted_device_requirement_pb';
 import { useAttempt } from 'shared/hooks';
 import { AuthProvider } from 'shared/services';
-import { isPrivateKeyRequiredError } from 'shared/utils/errorType';
 
-import history from 'teleport/services/history';
 import cfg from 'teleport/config';
 import auth, { UserCredentials } from 'teleport/services/auth';
+import history from 'teleport/services/history';
+import { storageService } from 'teleport/services/storageService';
+import session from 'teleport/services/websession';
 
 export default function useLogin() {
   const [attempt, attemptActions] = useAttempt({ isProcessing: false });
-  // privateKeyPolicyEnabled can be enabled through cluster wide config,
-  // or through a role setting.
-  // Cluster wide config takes precedence and the user will not
-  // see a login form which prevents login attempts.
-  // Role setting requires the user to try a successful
-  // attempt at logging in to determine if private key policy was enabled.
-  const [privateKeyPolicyEnabled, setPrivateKeyPolicyEnabled] = useState(
-    cfg.getPrivateKeyPolicy() != 'none'
-  );
+  const [checkingValidSession, setCheckingValidSession] = useState(true);
+  const licenseAcknowledged = storageService.getLicenseAcknowledged();
 
   const authProviders = cfg.getAuthProviders();
   const auth2faType = cfg.getAuth2faType();
@@ -52,16 +51,55 @@ export default function useLogin() {
     setShowMotd(false);
   }
 
+  // onSuccess can receive a device webtoken. If so, it will
+  // enable a prompt to allow users to authorize the current
+  function onSuccess({
+    deviceWebToken,
+    trustedDeviceRequirement,
+  }: LoginResponse) {
+    // deviceWebToken will only exist on a login response
+    // from enterprise but just in case there is a version mismatch
+    // between the webclient and proxy
+    if (trustedDeviceRequirement === TrustedDeviceRequirement.REQUIRED) {
+      session.setDeviceTrustRequired();
+    }
+    if (deviceWebToken && cfg.isEnterprise) {
+      return authorizeWithDeviceTrust(deviceWebToken);
+    }
+    return loginSuccess();
+  }
+
+  useEffect(() => {
+    if (session.isValid()) {
+      try {
+        const redirectUrlWithBase = new URL(getEntryRoute());
+        const matched = matchPath(redirectUrlWithBase.pathname, {
+          path: cfg.routes.samlIdpSso,
+          strict: true,
+          exact: true,
+        });
+        if (matched) {
+          history.push(redirectUrlWithBase, true);
+          return;
+        } else {
+          history.replace(cfg.routes.root);
+          return;
+        }
+      } catch (e) {
+        console.error(e);
+        history.replace(cfg.routes.root);
+        return;
+      }
+    }
+    setCheckingValidSession(false);
+  }, []);
+
   function onLogin(email, password, token) {
     attemptActions.start();
     auth
       .login(email, password, token)
       .then(onSuccess)
       .catch(err => {
-        if (isPrivateKeyRequiredError(err)) {
-          setPrivateKeyPolicyEnabled(true);
-          return;
-        }
         attemptActions.error(err);
       });
   }
@@ -72,10 +110,6 @@ export default function useLogin() {
       .loginWithWebauthn(creds)
       .then(onSuccess)
       .catch(err => {
-        if (isPrivateKeyRequiredError(err)) {
-          setPrivateKeyPolicyEnabled(true);
-          return;
-        }
         attemptActions.error(err);
       });
   }
@@ -90,6 +124,7 @@ export default function useLogin() {
   return {
     attempt,
     onLogin,
+    checkingValidSession,
     onLoginWithSso,
     authProviders,
     auth2faType,
@@ -99,19 +134,45 @@ export default function useLogin() {
     clearAttempt: attemptActions.clear,
     isPasswordlessEnabled: cfg.isPasswordlessEnabled(),
     primaryAuthType: cfg.getPrimaryAuthType(),
-    privateKeyPolicyEnabled,
+    licenseAcknowledged,
+    setLicenseAcknowledged: storageService.setLicenseAcknowledged,
     motd,
     showMotd,
     acknowledgeMotd,
   };
 }
 
-function onSuccess() {
+type DeviceWebToken = {
+  id: string;
+  token: string;
+};
+
+type LoginResponse = {
+  deviceWebToken?: DeviceWebToken;
+  trustedDeviceRequirement?: TrustedDeviceRequirement;
+};
+
+function authorizeWithDeviceTrust(token: DeviceWebToken) {
+  let redirect = history.getRedirectParam();
+  const authorize = cfg.getDeviceTrustAuthorizeRoute(
+    token.id,
+    token.token,
+    redirect
+  );
+  history.push(authorize, true);
+}
+
+function loginSuccess() {
   const redirect = getEntryRoute();
   const withPageRefresh = true;
   history.push(redirect, withPageRefresh);
 }
 
+/**
+ * getEntryRoute returns a base ensured redirect URL value that is safe
+ * for redirect.
+ * @returns base ensured URL string.
+ */
 function getEntryRoute() {
   let entryUrl = history.getRedirectParam();
   if (entryUrl) {

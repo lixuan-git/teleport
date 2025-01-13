@@ -1,18 +1,20 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
- http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package clickhouse
 
@@ -20,8 +22,8 @@ import (
 	"context"
 	"crypto/tls"
 	"database/sql"
-	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -31,10 +33,11 @@ import (
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/proto"
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/srv/db/common"
+	"github.com/gravitational/teleport/lib/utils"
 )
 
 // TestServerOption allows setting test server options.
@@ -61,7 +64,7 @@ type TestServer struct {
 	listener  net.Listener
 	port      string
 	tlsConfig *tls.Config
-	log       logrus.FieldLogger
+	logger    *slog.Logger
 	protocol  string
 }
 
@@ -90,10 +93,10 @@ func NewTestServer(config common.TestServerConfig, opts ...TestServerOption) (*T
 		listener:  config.Listener,
 		port:      port,
 		tlsConfig: tlsConfig,
-		log: logrus.WithFields(logrus.Fields{
-			trace.Component: defaults.ProtocolClickHouse,
-			"name":          config.Name,
-		}),
+		logger: utils.NewSlogLoggerForTests().With(
+			teleport.ComponentKey, defaults.ProtocolClickHouse,
+			"name", config.Name,
+		),
 	}
 
 	for _, opt := range opts {
@@ -180,27 +183,27 @@ func (s *TestServer) serveHTTP() error {
 	mux.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
 		buff, err := io.ReadAll(request.Body)
 		if err != nil {
-			s.log.Errorf("Got unexpected error %q", err)
+			s.logger.ErrorContext(request.Context(), "Got unexpected error", "error", err)
 		}
 		defer request.Body.Close()
 
 		query := string(buff)
 		enc, ok := encHandler[query]
 		if !ok {
-			s.log.Errorf("Got unexpected query %q", query)
+			s.logger.ErrorContext(request.Context(), "Got unexpected query", "query", query)
 			writer.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 		respBuff, err := enc()
 		if err != nil {
-			s.log.Errorf("Got unexpected error: %v", err)
+			s.logger.ErrorContext(request.Context(), "Got unexpected error", "error", err)
 			writer.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 
 		_, err = writer.Write(respBuff)
 		if err != nil {
-			s.log.Errorf("Got unexpected error: %v", err)
+			s.logger.ErrorContext(request.Context(), "Got unexpected error", "error", err)
 			writer.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -248,7 +251,7 @@ func MakeNativeTestClient(ctx context.Context, config common.TestClientConfig) (
 func MakeDBTestClient(ctx context.Context, config common.TestClientConfig) (*sql.DB, error) {
 	conn := clickhouse.OpenDB(&clickhouse.Options{
 		Protocol: toClickhouseProtocol(config.RouteToDatabase.Protocol),
-		Addr:     []string{fmt.Sprintf(config.Address)},
+		Addr:     []string{config.Address},
 	})
 	if err := conn.Ping(); err != nil {
 		conn.Close()

@@ -1,38 +1,55 @@
-/*
-Copyright 2019 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+import { useCallback, useEffect, useRef, useState } from 'react';
+import styled, { useTheme } from 'styled-components';
 
-    http://www.apache.org/licenses/LICENSE-2.0
+import { getPlatformType } from 'design/platform';
+import { TerminalSearch } from 'shared/components/TerminalSearch';
 
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-import React, { useEffect, useRef } from 'react';
-
-import { getPlatform } from 'design/theme/utils';
-import { useTheme } from 'styled-components';
-
+import StyledXterm from 'teleport/Console/StyledXterm';
+import { TermEvent } from 'teleport/lib/term/enums';
 import Terminal from 'teleport/lib/term/terminal';
 import Tty from 'teleport/lib/term/tty';
-import { TermEvent } from 'teleport/lib/term/enums';
-import StyledXterm from 'teleport/Console/StyledXterm';
 
 export default function Xterm({ tty }: { tty: Tty }) {
-  const refContainer = useRef<HTMLElement>();
+  const refContainer = useRef<HTMLDivElement>();
   const theme = useTheme();
   const terminalPlayer = useRef<TerminalPlayer>();
+  const [showSearch, setShowSearch] = useState(false);
+
+  const onSearchClose = useCallback(() => {
+    setShowSearch(false);
+  }, []);
+
+  const onSearchOpen = useCallback(() => {
+    setShowSearch(true);
+  }, []);
+
+  const isSearchKeyboardEvent = useCallback((e: KeyboardEvent) => {
+    return (e.metaKey || e.ctrlKey) && e.key === 'f';
+  }, []);
 
   useEffect(() => {
     const term = new TerminalPlayer(tty, {
       el: refContainer.current,
       fontFamily: theme.fonts.mono,
-      fontSize: getPlatform().isMac ? 12 : 14,
+      fontSize: getPlatformType().isMac ? 12 : 14,
       theme: theme.colors.terminal,
     });
 
@@ -67,7 +84,22 @@ export default function Xterm({ tty }: { tty: Tty }) {
     terminalPlayer.current?.updateTheme(theme.colors.terminal);
   }, [theme]);
 
-  return <StyledXterm ref={refContainer} />;
+  return (
+    <>
+      <StyledXterm ref={refContainer} />
+      {terminalPlayer.current && (
+        <TerminalAddonsContainer>
+          <TerminalSearch
+            show={showSearch}
+            isSearchKeyboardEvent={isSearchKeyboardEvent}
+            onClose={onSearchClose}
+            onOpen={onSearchOpen}
+            terminalSearcher={terminalPlayer.current}
+          />
+        </TerminalAddonsContainer>
+      )}
+    </>
+  );
 }
 
 class TerminalPlayer extends Terminal {
@@ -87,3 +119,15 @@ class TerminalPlayer extends Terminal {
   // prevent user resize requests
   _requestResize() {}
 }
+
+const TerminalAddonsContainer = styled.div`
+  position: absolute;
+  right: ${p => p.theme.space[2]}px;
+  top: ${p => p.theme.space[2]}px;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: ${p => p.theme.space[2]}px;
+  min-width: 500px;
+`;

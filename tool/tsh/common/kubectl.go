@@ -1,24 +1,25 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package common
 
 import (
 	"bufio"
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -27,13 +28,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/gravitational/trace"
 	"github.com/spf13/cobra"
-	"golang.org/x/exp/slices"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
@@ -50,7 +50,6 @@ import (
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/client"
 	"github.com/gravitational/teleport/lib/kube/kubeconfig"
-	"github.com/gravitational/teleport/lib/observability/tracing"
 )
 
 var (
@@ -151,26 +150,7 @@ func wrapConfigFn(cf *CLIConf) func(c *rest.Config) *rest.Config {
 // because we need to retry kubectl calls and `kubectl` calls os.Exit in multiple
 // paths.
 func runKubectlCode(cf *CLIConf, args []string) {
-	closeTracer := func() {}
-	cf.TracingProvider = tracing.NoopProvider()
-	cf.tracer = cf.TracingProvider.Tracer(teleport.ComponentTSH)
-	if cf.SampleTraces {
-		provider, err := newTraceProvider(cf, "", nil)
-		if err != nil {
-			log.WithError(err).Debug("Failed to set up span forwarding")
-		} else {
-			// ensure that the provider is shutdown on exit to flush any spans
-			// that haven't been forwarded yet.
-			closeTracer = func() {
-				shutdownCtx, cancel := context.WithTimeout(cf.Context, 1*time.Second)
-				defer cancel()
-				err := provider.Shutdown(shutdownCtx)
-				if err != nil && !errors.Is(err, context.DeadlineExceeded) {
-					log.WithError(err).Debugf("Failed to shutdown trace provider")
-				}
-			}
-		}
-	}
+	closeTracer := initializeTracing(cf)
 	// If the user opted to not sample traces, cf.TracingProvider is pre-initialized
 	// with a noop provider.
 	ctx, span := cf.TracingProvider.Tracer("kubectl").Start(cf.Context, "kubectl")
@@ -260,7 +240,7 @@ func runKubectlAndCollectRun(cf *CLIConf, fullArgs, args []string) error {
 		writer.CloseWithError(io.EOF)
 
 		if scanErr := group.Wait(); scanErr != nil {
-			log.WithError(scanErr).Warn("unable to scan stderr payload")
+			logger.WarnContext(cf.Context, "unable to scan stderr payload", "error", scanErr)
 		}
 
 		if err == nil {
@@ -443,8 +423,12 @@ func makeAndStartKubeLocalProxy(cf *CLIConf, config *clientcmdapi.Config, cluste
 		return nil, "", trace.Wrap(err)
 	}
 
-	localProxy, err := makeKubeLocalProxy(cf, tc, clusters, config, cf.LocalProxyPort)
+	localProxy, err := makeKubeLocalProxy(cf, tc, clusters, config, cf.LocalProxyPort, "")
 	if err != nil {
+		return nil, "", trace.Wrap(err)
+	}
+
+	if err := localProxy.WriteKubeConfig(); err != nil {
 		return nil, "", trace.Wrap(err)
 	}
 
@@ -519,8 +503,9 @@ func isKubectlConfigCommand(kubectlCommand *cobra.Command, args []string) bool {
 
 func kubeClusterAddrFromProfile(profile *profile.Profile) string {
 	partialClientConfig := client.Config{
-		WebProxyAddr:  profile.WebProxyAddr,
-		KubeProxyAddr: profile.KubeProxyAddr,
+		WebProxyAddr:      profile.WebProxyAddr,
+		KubeProxyAddr:     profile.KubeProxyAddr,
+		TLSRoutingEnabled: profile.TLSRoutingEnabled,
 	}
 	return partialClientConfig.KubeClusterAddr()
 }

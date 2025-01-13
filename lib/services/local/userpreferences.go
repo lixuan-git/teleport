@@ -1,19 +1,19 @@
 /*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Copyright 2023 Gravitational, Inc.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 package local
@@ -36,15 +36,21 @@ type UserPreferencesService struct {
 
 func DefaultUserPreferences() *userpreferencesv1.UserPreferences {
 	return &userpreferencesv1.UserPreferences{
-		Assist: &userpreferencesv1.AssistUserPreferences{
-			PreferredLogins: []string{},
-			ViewMode:        userpreferencesv1.AssistViewMode_ASSIST_VIEW_MODE_DOCKED,
+		Theme: userpreferencesv1.Theme_THEME_UNSPECIFIED,
+		UnifiedResourcePreferences: &userpreferencesv1.UnifiedResourcePreferences{
+			DefaultTab:            userpreferencesv1.DefaultTab_DEFAULT_TAB_ALL,
+			ViewMode:              userpreferencesv1.ViewMode_VIEW_MODE_CARD,
+			LabelsViewMode:        userpreferencesv1.LabelsViewMode_LABELS_VIEW_MODE_COLLAPSED,
+			AvailableResourceMode: userpreferencesv1.AvailableResourceMode_AVAILABLE_RESOURCE_MODE_NONE,
 		},
-		Theme: userpreferencesv1.Theme_THEME_LIGHT,
 		Onboard: &userpreferencesv1.OnboardUserPreferences{
 			PreferredResources: []userpreferencesv1.Resource{},
 			MarketingParams:    &userpreferencesv1.MarketingParams{},
 		},
+		ClusterPreferences: &userpreferencesv1.ClusterUserPreferences{
+			PinnedResources: &userpreferencesv1.PinnedResourcesUserPreferences{},
+		},
+		SideNavDrawerMode: userpreferencesv1.SideNavDrawerMode_SIDE_NAV_DRAWER_MODE_COLLAPSED,
 	}
 }
 
@@ -78,19 +84,7 @@ func (u *UserPreferencesService) UpsertUserPreferences(ctx context.Context, user
 		return trace.Wrap(err)
 	}
 
-	preferences, err := u.getUserPreferences(ctx, username)
-	if err != nil {
-		if !trace.IsNotFound(err) {
-			return trace.Wrap(err)
-		}
-		preferences = DefaultUserPreferences()
-	}
-
-	if err := overwriteValues(preferences, prefs); err != nil {
-		return trace.Wrap(err)
-	}
-
-	item, err := createBackendItem(username, preferences)
+	item, err := createBackendItem(username, prefs)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -124,8 +118,8 @@ func (u *UserPreferencesService) getUserPreferences(ctx context.Context, usernam
 }
 
 // backendKey returns the backend key for the user preferences for the given username.
-func backendKey(username string) []byte {
-	return backend.Key(userPreferencesPrefix, username)
+func backendKey(username string) backend.Key {
+	return backend.NewKey(userPreferencesPrefix, username)
 }
 
 // validatePreferences validates the given preferences.
@@ -139,7 +133,7 @@ func validatePreferences(preferences *userpreferencesv1.UserPreferences) error {
 
 // createBackendItem creates a backend.Item for the given username and user preferences.
 func createBackendItem(username string, preferences *userpreferencesv1.UserPreferences) (backend.Item, error) {
-	settingsKey := backend.Key(userPreferencesPrefix, username)
+	settingsKey := backend.NewKey(userPreferencesPrefix, username)
 
 	payload, err := json.Marshal(preferences)
 	if err != nil {

@@ -1,24 +1,26 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package track
 
 import (
 	"fmt"
-	pr "math/rand"
+	"math/rand/v2"
 	"sync"
 	"testing"
 	"time"
@@ -50,7 +52,7 @@ func (s *simpleTestProxies) RemoveRandProxies(n int) {
 	rms := make([]bool, len(s.proxies))
 	rmc := 0
 	for rmc < n {
-		i := pr.Int() % len(s.proxies)
+		i := rand.N(len(s.proxies))
 		if !rms[i] {
 			rms[i] = true
 			rmc++
@@ -72,7 +74,7 @@ func (s *simpleTestProxies) GetRandProxy() (p testProxy, ok bool) {
 		ok = false
 		return
 	}
-	i := pr.Int() % len(s.proxies)
+	i := rand.N(len(s.proxies))
 	return s.proxies[i], true
 }
 
@@ -118,23 +120,18 @@ type testProxy struct {
 func newTestProxy(life time.Duration) testProxy {
 	principals := make([]string, 0, 3)
 	for i := 0; i < 3; i++ {
-		p := fmt.Sprintf("proxy-%d", pr.Int())
+		p := fmt.Sprintf("proxy-%d", rand.Int())
 		principals = append(principals, p)
 	}
 	return testProxy{principals, life}
 }
 
 func prDuration(min time.Duration, max time.Duration) time.Duration {
-	mn, mx := int64(min), int64(max)
-	rslt := pr.Int63n(mx-mn) + mn
-	return time.Duration(rslt)
+	return min + rand.N(max-min)
 }
 
 func jitter(t time.Duration) time.Duration {
-	maxJitter := t / 5
-	baseJitter := time.Duration(pr.Uint64())
-	j := baseJitter % maxJitter
-	return t + j
+	return t + rand.N(t/5)
 }
 
 func TestBasic(t *testing.T) {

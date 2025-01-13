@@ -1,18 +1,20 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package awsoidc
 
@@ -43,9 +45,10 @@ func TestOpenTunnelRequest(t *testing.T) {
 
 	baseReqFn := func() OpenTunnelEC2Request {
 		return OpenTunnelEC2Request{
-			Region:     "us-east-1",
-			VPCID:      "vpc-id",
-			EC2Address: "127.0.0.1:22",
+			Region:        "us-east-1",
+			VPCID:         "vpc-id",
+			EC2Address:    "127.0.0.1:22",
+			EC2InstanceID: "i-12345",
 		}
 	}
 
@@ -81,6 +84,15 @@ func TestOpenTunnelRequest(t *testing.T) {
 			errCheck: isBadParamErrFn,
 		},
 		{
+			name: "missing instance id",
+			req: func() OpenTunnelEC2Request {
+				r := baseReqFn()
+				r.EC2InstanceID = ""
+				return r
+			},
+			errCheck: isBadParamErrFn,
+		},
+		{
 			name: "missing EC2Address",
 			req: func() OpenTunnelEC2Request {
 				r := baseReqFn()
@@ -106,6 +118,7 @@ func TestOpenTunnelRequest(t *testing.T) {
 				Region:             "us-east-1",
 				VPCID:              "vpc-id",
 				EC2Address:         "127.0.0.1:22",
+				EC2InstanceID:      "i-12345",
 				ec2OpenSSHPort:     "22",
 				ec2PrivateHostname: "127.0.0.1",
 			},
@@ -202,6 +215,7 @@ func TestOpenTunnelEC2(t *testing.T) {
 		Region:            "us-east-1",
 		VPCID:             "vpc-123",
 		EC2Address:        ec2Listener.Addr().String(),
+		EC2InstanceID:     "i-12345",
 		websocketCustomCA: eiceWebsocketServer.Certificate(),
 	})
 	require.NoError(t, err)

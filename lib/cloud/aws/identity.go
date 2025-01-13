@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package aws
 
@@ -21,6 +23,8 @@ import (
 	"fmt"
 	"strings"
 
+	awsv2 "github.com/aws/aws-sdk-go-v2/aws"
+	stsv2 "github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/arn"
 	"github.com/aws/aws-sdk-go/service/sts"
@@ -104,6 +108,10 @@ func (i identityBase) String() string {
 	return i.arn.String()
 }
 
+type callerIdentityGetter interface {
+	GetCallerIdentity(ctx context.Context, params *stsv2.GetCallerIdentityInput, optFns ...func(*stsv2.Options)) (*stsv2.GetCallerIdentityOutput, error)
+}
+
 // GetIdentityWithClient determines AWS identity of this Teleport process
 // using the provided STS API client.
 func GetIdentityWithClient(ctx context.Context, stsClient stsiface.STSAPI) (Identity, error) {
@@ -113,6 +121,20 @@ func GetIdentityWithClient(ctx context.Context, stsClient stsiface.STSAPI) (Iden
 	}
 
 	return IdentityFromArn(aws.StringValue(out.Arn))
+}
+
+// GetIdentityWithClient determines AWS identity of this Teleport process
+// using the provided STS API client.
+func GetIdentityWithClientV2(ctx context.Context, clt callerIdentityGetter) (Identity, error) {
+	out, err := clt.GetCallerIdentity(ctx, nil)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	var callerARN string
+	if out != nil {
+		callerARN = awsv2.ToString(out.Arn)
+	}
+	return IdentityFromArn(callerARN)
 }
 
 // IdentityFromArn returns an `Identity` interface based on the provided ARN.

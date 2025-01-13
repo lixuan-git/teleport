@@ -1,83 +1,126 @@
 /**
- * Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React, { useEffect, useState } from 'react';
-import { useHistory, useLocation } from 'react-router';
-
-import * as Icons from 'design/Icon';
-import styled from 'styled-components';
-import { Box, Flex, Link, Text } from 'design';
-
-import { getPlatform, Platform } from 'design/theme/utils';
-
-import useTeleport from 'teleport/useTeleport';
-import { ToolTipNoPermBadge } from 'teleport/components/ToolTipNoPermBadge';
-import { Acl } from 'teleport/services/user';
 import {
-  Header,
+  useEffect,
+  useMemo,
+  useState,
+  type ComponentPropsWithoutRef,
+} from 'react';
+import { useHistory, useLocation } from 'react-router';
+import styled from 'styled-components';
+
+import { Alert, Box, Flex, Link, P3, Text } from 'design';
+import * as Icons from 'design/Icon';
+import { NewTab } from 'design/Icon';
+import { getPlatform, Platform } from 'design/platform';
+import { Resource } from 'gen-proto-ts/teleport/userpreferences/v1/onboard_pb';
+import { UserPreferences } from 'gen-proto-ts/teleport/userpreferences/v1/userpreferences_pb';
+
+import AddApp from 'teleport/Apps/AddApp';
+import { FeatureHeader, FeatureHeaderTitle } from 'teleport/components/Layout';
+import { ToolTipNoPermBadge } from 'teleport/components/ToolTipNoPermBadge';
+import cfg from 'teleport/config';
+import {
+  BASE_RESOURCES,
+  getResourcePretitle,
+} from 'teleport/Discover/SelectResource/resources';
+import {
   HeaderSubtitle,
   PermissionsErrorMessage,
   ResourceKind,
 } from 'teleport/Discover/Shared';
-import {
-  getResourcePretitle,
-  RESOURCES,
-} from 'teleport/Discover/SelectResource/resources';
-import AddApp from 'teleport/Apps/AddApp';
-import { useUser } from 'teleport/User/UserContext';
-
-import {
-  ClusterResource,
-  UserPreferences,
-} from 'teleport/services/userPreferences/types';
-
 import { resourceKindToPreferredResource } from 'teleport/Discover/Shared/ResourceKind';
+import { storageService } from 'teleport/services/storageService';
+import { Acl, AuthType, OnboardDiscover } from 'teleport/services/user';
+import { useUser } from 'teleport/User/UserContext';
+import useTeleport from 'teleport/useTeleport';
 
 import { getMarketingTermMatches } from './getMarketingTermMatches';
 import { DiscoverIcon } from './icons';
-
-import { PrioritizedResources, SearchResource } from './types';
-
-import type { ResourceSpec } from './types';
+import { SAML_APPLICATIONS } from './resourcesE';
+import {
+  PrioritizedResources,
+  SearchResource,
+  type ResourceSpec,
+} from './types';
 
 interface SelectResourceProps {
   onSelect: (resource: ResourceSpec) => void;
 }
 
+type UrlLocationState = {
+  entity: SearchResource; // entity takes precedence over search keywords
+  searchKeywords: string;
+};
+
+function getDefaultResources(
+  includeEnterpriseResources: boolean
+): ResourceSpec[] {
+  const RESOURCES = includeEnterpriseResources
+    ? [...BASE_RESOURCES, ...SAML_APPLICATIONS]
+    : BASE_RESOURCES;
+  return RESOURCES;
+}
+
 export function SelectResource({ onSelect }: SelectResourceProps) {
   const ctx = useTeleport();
-  const location = useLocation<{ entity: SearchResource }>();
+  const location = useLocation<UrlLocationState>();
   const history = useHistory();
   const { preferences } = useUser();
 
   const [search, setSearch] = useState('');
-  const [resources, setResources] = useState<ResourceSpec[]>([]);
-  const [defaultResources, setDefaultResources] = useState<ResourceSpec[]>([]);
+  const { acl, authType } = ctx.storeUser.state;
+  const platform = getPlatform();
+  const defaultResources: ResourceSpec[] = useMemo(
+    () =>
+      sortResources(
+        // Apply access check to each resource.
+        addHasAccessField(
+          acl,
+          filterResources(
+            platform,
+            authType,
+            getDefaultResources(cfg.isEnterprise)
+          )
+        ),
+        preferences,
+        storageService.getOnboardDiscover()
+      ),
+    [acl, authType, platform, preferences]
+  );
+  const [resources, setResources] = useState(defaultResources);
+
+  // a user must be able to create tokens AND have access to create at least one
+  // type of resource in order to be considered eligible to "add resources"
+  const canAddResources =
+    acl.tokens.create && defaultResources.some(r => r.hasAccess);
+
   const [showApp, setShowApp] = useState(false);
 
   function onSearch(s: string, customList?: ResourceSpec[]) {
     const list = customList || defaultResources;
-    const split = s.split(' ').map(s => s.toLowerCase());
-    const foundResources = list.filter(r => {
-      const match = split.every(s => r.keywords.includes(s));
-      if (match) {
-        return r;
-      }
-    });
-    setResources(foundResources);
+    const search = s.split(' ').map(s => s.toLowerCase());
+    const found = list.filter(r =>
+      search.every(s => r.keywords.some(k => k.toLowerCase().includes(s)))
+    );
+
+    setResources(found);
     setSearch(s);
   }
 
@@ -87,16 +130,6 @@ export function SelectResource({ onSelect }: SelectResourceProps) {
   }
 
   useEffect(() => {
-    // Apply access check to each resource.
-    const userContext = ctx.storeUser.state;
-    const { acl } = userContext;
-
-    const sortedResources = sortResources(
-      makeResourcesWithHasAccessField(acl),
-      preferences
-    );
-    setDefaultResources(sortedResources);
-
     // A user can come to this screen by clicking on
     // a `add <specific-resource-type>` button.
     // We sort the list by the specified resource type,
@@ -112,27 +145,41 @@ export function SelectResource({ onSelect }: SelectResourceProps) {
     ) {
       const sortedResourcesByKind = sortResourcesByKind(
         resourceKindSpecifiedByUrlLoc,
-        sortedResources
+        defaultResources
       );
       onSearch(resourceKindSpecifiedByUrlLoc, sortedResourcesByKind);
       return;
     }
 
-    setResources(sortedResources);
+    const searchKeywordSpecifiedByUrlLoc = location.state?.searchKeywords;
+    if (searchKeywordSpecifiedByUrlLoc) {
+      onSearch(searchKeywordSpecifiedByUrlLoc, defaultResources);
+      return;
+    }
+
+    setResources(defaultResources);
     // Processing of the lists should only happen once on init.
     // User perms remain static and URL loc state does not change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
-    <Box mt={4}>
-      <Header>Select Resource To Add</Header>
+    <Box>
+      {!canAddResources && (
+        <Alert kind="info" mt={5}>
+          You cannot add new resources. Reach out to your Teleport administrator
+          for additional permissions.
+        </Alert>
+      )}
+      <FeatureHeader>
+        <FeatureHeaderTitle>Select Resource To Add</FeatureHeaderTitle>
+      </FeatureHeader>
       <HeaderSubtitle>
-        Teleport can integrate into most, if not all of your infrastructure.
+        Teleport can integrate into most, if not all, of your infrastructure.
         Search for what resource you want to add.
       </HeaderSubtitle>
       <Box height="90px" width="600px">
-        <InputWrapper mb={2}>
+        <InputWrapper>
           <StyledInput
             placeholder="Search for a resource"
             autoFocus
@@ -145,20 +192,28 @@ export function SelectResource({ onSelect }: SelectResourceProps) {
       </Box>
       {resources && resources.length > 0 && (
         <>
-          <Grid>
+          <Grid role="grid">
             {resources.map((r, index) => {
               const title = r.name;
               const pretitle = getResourcePretitle(r);
+              const select = () => {
+                if (!r.hasAccess) {
+                  return;
+                }
 
-              let resourceCardProps;
-              if (r.kind === ResourceKind.Application) {
+                setShowApp(true);
+                onSelect(r);
+              };
+
+              let resourceCardProps: ComponentPropsWithoutRef<
+                'button' | typeof Link
+              >;
+
+              if (r.kind === ResourceKind.Application && r.isDialog) {
                 resourceCardProps = {
-                  onClick: () => {
-                    if (r.hasAccess) {
-                      setShowApp(true);
-                      onSelect(r);
-                    }
-                  },
+                  onClick: select,
+                  onKeyUp: (e: KeyboardEvent) => e.key === 'Enter' && select(),
+                  role: 'button',
                 };
               } else if (r.unguidedLink) {
                 resourceCardProps = {
@@ -166,10 +221,17 @@ export function SelectResource({ onSelect }: SelectResourceProps) {
                   href: r.hasAccess ? r.unguidedLink : null,
                   target: '_blank',
                   style: { textDecoration: 'none' },
+                  role: 'link',
                 };
               } else {
                 resourceCardProps = {
                   onClick: () => r.hasAccess && onSelect(r),
+                  onKeyUp: (e: KeyboardEvent) => {
+                    if (e.key === 'Enter' && r.hasAccess) {
+                      onSelect(r);
+                    }
+                  },
+                  role: 'button',
                 };
               }
 
@@ -186,6 +248,7 @@ export function SelectResource({ onSelect }: SelectResourceProps) {
                   data-testid={r.kind}
                   key={`${index}${pretitle}${title}`}
                   hasAccess={r.hasAccess}
+                  aria-label={`${pretitle} ${title}`}
                   {...resourceCardProps}
                 >
                   {!r.unguidedLink && r.hasAccess && (
@@ -196,13 +259,13 @@ export function SelectResource({ onSelect }: SelectResourceProps) {
                       children={<PermissionsErrorMessage resource={r} />}
                     />
                   )}
-                  <Flex px={2} alignItems="center">
+                  <Flex px={2} alignItems="center" height="48px">
                     <Flex mr={3} justifyContent="center" width="24px">
                       <DiscoverIcon name={r.icon} />
                     </Flex>
                     <Box>
                       {pretitle && (
-                        <Text fontSize="12px" color="text.slightlyMuted">
+                        <Text typography="body3" color="text.slightlyMuted">
                           {pretitle}
                         </Text>
                       )}
@@ -215,11 +278,15 @@ export function SelectResource({ onSelect }: SelectResourceProps) {
                       )}
                     </Box>
                   </Flex>
+
+                  {r.unguidedLink && r.hasAccess ? (
+                    <NewTabInCorner color="text.muted" size={18} />
+                  ) : null}
                 </ResourceCard>
               );
             })}
           </Grid>
-          <Text mt={6} fontSize="12px">
+          <P3 mt={6}>
             Looking for something else?{' '}
             <Link
               href="https://github.com/gravitational/teleport/issues/new?assignees=&labels=feature-request&template=feature_request.md"
@@ -228,7 +295,7 @@ export function SelectResource({ onSelect }: SelectResourceProps) {
             >
               Request a feature
             </Link>
-          </Text>
+          </P3>
         </>
       )}
       {showApp && <AddApp onClose={() => setShowApp(false)} />}
@@ -247,7 +314,7 @@ const ClearSearch = ({ onClick }: { onClick(): void }) => {
         font-size: 12px;
         opacity: 0.7;
 
-        :hover {
+        &:hover {
           cursor: pointer;
           opacity: 1;
         }
@@ -290,6 +357,10 @@ function checkHasAccess(acl: Acl, resourceKind: ResourceKind) {
       return acl.nodes.list;
     case ResourceKind.SamlApplication:
       return acl.samlIdpServiceProvider.create;
+    case ResourceKind.ConnectMyComputer:
+      // This is probably already true since without this permission the user wouldn't be able to
+      // add any other resource, but let's just leave it for completeness sake.
+      return acl.tokens.create;
     default:
       return false;
   }
@@ -335,67 +406,135 @@ function sortResourcesByKind(
   return sorted;
 }
 
+const aBeforeB = -1;
+const aAfterB = 1;
+const aEqualsB = 0;
+
+/**
+ * Evaluates the predicate and prioritizes the element matching the predicate over the element that
+ * doesn't.
+ *
+ * @example
+ * comparePredicate({color: 'green'}, {color: 'red'}, (el) => el.color === 'green') // => -1 (a before b)
+ * comparePredicate({color: 'red'}, {color: 'green'}, (el) => el.color === 'green') // => 1  (a after  b)
+ * comparePredicate({color: 'blue'}, {color: 'pink'}, (el) => el.color === 'green') // => 0  (both are equal)
+ */
+function comparePredicate<ElementType>(
+  a: ElementType,
+  b: ElementType,
+  predicate: (resource: ElementType) => boolean
+): -1 | 0 | 1 {
+  const aMatches = predicate(a);
+  const bMatches = predicate(b);
+
+  if (aMatches && !bMatches) {
+    return aBeforeB;
+  }
+
+  if (bMatches && !aMatches) {
+    return aAfterB;
+  }
+
+  return aEqualsB;
+}
+
 export function sortResources(
   resources: ResourceSpec[],
-  preferences: UserPreferences
+  preferences: UserPreferences,
+  onboardDiscover: OnboardDiscover | undefined
 ) {
   const { preferredResources, hasPreferredResources } =
     getPrioritizedResources(preferences);
+  const platform = getPlatform();
 
   const sortedResources = [...resources];
   const accessible = sortedResources.filter(r => r.hasAccess);
   const restricted = sortedResources.filter(r => !r.hasAccess);
 
-  // Sort accessible resources by 1. os 2. preferred 3. guided and 4. alphabetically
-  accessible.sort((a, b) => {
-    let aPreferred,
-      bPreferred = false;
-    if (hasPreferredResources) {
-      aPreferred = preferredResources.includes(
-        resourceKindToPreferredResource(a.kind)
-      );
-      bPreferred = preferredResources.includes(
-        resourceKindToPreferredResource(b.kind)
-      );
-    }
+  const hasNoResources = onboardDiscover && !onboardDiscover.hasResource;
+  const prefersServers =
+    hasPreferredResources &&
+    preferredResources.includes(
+      resourceKindToPreferredResource(ResourceKind.Server)
+    );
+  const prefersServersOrNoPreferences =
+    prefersServers || !hasPreferredResources;
+  const shouldShowConnectMyComputerFirst =
+    hasNoResources &&
+    prefersServersOrNoPreferences &&
+    isConnectMyComputerAvailable(accessible);
 
-    let platform: string;
-    const platformType = getPlatform();
-    if (platformType.isMac) {
-      platform = Platform.PLATFORM_MACINTOSH;
-    }
-    if (platformType.isLinux) {
-      platform = Platform.PLATFORM_LINUX;
-    }
-    if (platformType.isWin) {
-      platform = Platform.PLATFORM_WINDOWS;
+  // Sort accessible resources by:
+  // 1. os
+  // 2. preferred
+  // 3. guided
+  // 4. alphabetically
+  //
+  // When available on the given platform, Connect My Computer is put either as the first resource
+  // if the user has no resources, otherwise it's at the end of the guided group.
+  accessible.sort((a, b) => {
+    const compareAB = (predicate: (r: ResourceSpec) => boolean) =>
+      comparePredicate(a, b, predicate);
+    const areBothGuided = !a.unguidedLink && !b.unguidedLink;
+
+    // Special cases for Connect My Computer.
+    // Show Connect My Computer tile as the first resource.
+    if (shouldShowConnectMyComputerFirst) {
+      const prioritizeConnectMyComputer = compareAB(
+        r => r.kind === ResourceKind.ConnectMyComputer
+      );
+      if (prioritizeConnectMyComputer) {
+        return prioritizeConnectMyComputer;
+      }
+
+      // Within the guided group, deprioritize server tiles of the current user platform if Connect
+      // My Computer is available.
+      //
+      // If the user has no resources available in the cluster, we want to nudge them towards
+      // Connect My Computer rather than, say, standalone macOS setup.
+      //
+      // Only do this if the user doesn't explicitly prefer servers. If they prefer servers, we
+      // want the servers for their platform to be displayed in their usual place so that the user
+      // doesn't miss that Teleport supports them.
+      if (!prefersServers && areBothGuided) {
+        const deprioritizeServerForUserPlatform = compareAB(
+          r => !(r.kind == ResourceKind.Server && r.platform === platform)
+        );
+        if (deprioritizeServerForUserPlatform) {
+          return deprioritizeServerForUserPlatform;
+        }
+      }
+    } else if (areBothGuided) {
+      // Show Connect My Computer tile as the last guided resource if the user already added some
+      // resources or they prefer other kinds of resources than servers.
+      const deprioritizeConnectMyComputer = compareAB(
+        r => r.kind !== ResourceKind.ConnectMyComputer
+      );
+      if (deprioritizeConnectMyComputer) {
+        return deprioritizeConnectMyComputer;
+      }
     }
 
     // Display platform resources first
-    if (a.platform === platform && b.platform !== platform) {
-      return -1;
-    }
-    if (a.platform !== platform && b.platform === platform) {
-      return 1;
+    const prioritizeUserPlatform = compareAB(r => r.platform === platform);
+    if (prioritizeUserPlatform) {
+      return prioritizeUserPlatform;
     }
 
     // Display preferred resources second
-    if (aPreferred && !bPreferred) {
-      return -1;
-    }
-    if (!aPreferred && bPreferred) {
-      return 1;
+    if (hasPreferredResources) {
+      const prioritizePreferredResource = compareAB(r =>
+        preferredResources.includes(resourceKindToPreferredResource(r.kind))
+      );
+      if (prioritizePreferredResource) {
+        return prioritizePreferredResource;
+      }
     }
 
     // Display guided resources third
-    if (!a.unguidedLink && !b.unguidedLink) {
-      return a.name.localeCompare(b.name);
-    }
-    if (!b.unguidedLink) {
-      return 1;
-    }
-    if (!a.unguidedLink) {
-      return -1;
+    const prioritizeGuided = compareAB(r => !r.unguidedLink);
+    if (prioritizeGuided) {
+      return prioritizeGuided;
     }
 
     // Alpha
@@ -411,6 +550,14 @@ export function sortResources(
   // top of the list, so it is more visible to
   // the user.
   return [...accessible, ...restricted];
+}
+
+function isConnectMyComputerAvailable(
+  accessibleResources: ResourceSpec[]
+): boolean {
+  return !!accessibleResources.find(
+    resource => resource.kind === ResourceKind.ConnectMyComputer
+  );
 }
 
 /**
@@ -444,7 +591,7 @@ function getPrioritizedResources(
   const preferredResources = preferences.onboard.preferredResources || [];
 
   // hasPreferredResources will be false if all resources are selected
-  const maxResources = Object.keys(ClusterResource).length / 2 - 1;
+  const maxResources = Object.keys(Resource).length / 2 - 1;
   const selectedAll = preferredResources.length === maxResources;
 
   return {
@@ -453,8 +600,29 @@ function getPrioritizedResources(
   };
 }
 
-function makeResourcesWithHasAccessField(acl: Acl): ResourceSpec[] {
-  return RESOURCES.map(r => {
+export function filterResources(
+  platform: Platform,
+  authType: AuthType,
+  resources: ResourceSpec[]
+) {
+  return resources.filter(resource => {
+    const resourceSupportsPlatform =
+      !resource.supportedPlatforms?.length ||
+      resource.supportedPlatforms.includes(platform);
+
+    const resourceSupportsAuthType =
+      !resource.supportedAuthTypes?.length ||
+      resource.supportedAuthTypes.includes(authType);
+
+    return resourceSupportsPlatform && resourceSupportsAuthType;
+  });
+}
+
+function addHasAccessField(
+  acl: Acl,
+  resources: ResourceSpec[]
+): ResourceSpec[] {
+  return resources.map(r => {
     const hasAccess = checkHasAccess(acl, r.kind);
     switch (r.kind) {
       case ResourceKind.Database:
@@ -472,23 +640,42 @@ const Grid = styled.div`
   row-gap: 15px;
 `;
 
-const ResourceCard = styled.div`
-  display: flex;
+const NewTabInCorner = styled(NewTab)`
+  position: absolute;
+  top: ${props => props.theme.space[3]}px;
+  right: ${props => props.theme.space[3]}px;
+  transition: color 0.3s;
+`;
+
+const ResourceCard = styled.button<{ hasAccess?: boolean }>`
   position: relative;
-  align-items: center;
+  text-align: left;
   background: ${props => props.theme.colors.spotBackground[0]};
   transition: all 0.3s;
 
+  border: none;
   border-radius: 8px;
-  padding: 12px 12px 12px 12px;
+  padding: 12px;
   color: ${props => props.theme.colors.text.main};
+  line-height: inherit;
+  font-size: inherit;
+  font-family: inherit;
   cursor: pointer;
-  height: 48px;
 
   opacity: ${props => (props.hasAccess ? '1' : '0.45')};
 
-  :hover {
+  &:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 3px ${props => props.theme.colors.brand};
+  }
+
+  &:hover,
+  &:focus-visible {
     background: ${props => props.theme.colors.spotBackground[1]};
+
+    ${NewTabInCorner} {
+      color: ${props => props.theme.colors.text.slightlyMuted};
+    }
   }
 `;
 
@@ -502,15 +689,17 @@ const BadgeGuided = styled.div`
   top: 0px;
   right: 0px;
   font-size: 10px;
+  line-height: 24px;
 `;
 
 const InputWrapper = styled.div`
   border-radius: 200px;
   height: 40px;
   border: 1px solid ${props => props.theme.colors.spotBackground[2]};
+  transition: all 0.1s;
 
   &:hover,
-  &:focus,
+  &:focus-within,
   &:active {
     background: ${props => props.theme.colors.spotBackground[0]};
   }

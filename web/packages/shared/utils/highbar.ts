@@ -1,17 +1,19 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 type SupportedMergeTypes = string | number | Record<string, unknown>;
@@ -58,40 +60,75 @@ export function mergeDeep(target: MergeTarget, ...sources: Array<MergeTarget>) {
   return mergeDeep(target, ...sources);
 }
 
-type CompareArray = Array<Record<string, unknown>>;
-
+/** Recursively compares two arrays. */
 export function arrayObjectIsEqual(
-  arr1: CompareArray,
-  arr2: CompareArray
+  arr1: unknown[],
+  arr2: unknown[],
+  options?: {
+    /**
+     * If `true`, treats fields set to `undefined` as equal to fields that
+     * don't exist at all. Doesn't apply to the array itself, but recursively
+     * to its elements.
+     */
+    ignoreUndefined?: boolean;
+  }
 ): boolean {
-  const compareArrays = (arr1, arr2) =>
+  return (
     arr1.length === arr2.length &&
-    arr1.every((obj, idx) => compareObjects(obj, arr2[idx]));
+    arr1.every((obj, idx) => equalsDeep(obj, arr2[idx], options))
+  );
+}
 
-  const compareObjects = (obj1, obj2) => {
-    if (!isObject(obj1)) {
-      return obj1 === obj2;
-    }
+/** Recursively compares two values. */
+export function equalsDeep(
+  val1: unknown,
+  val2: unknown,
+  options?: {
+    /**
+     * If `true`, treats fields set to `undefined` as equal to fields that
+     * don't exist at all.
+     */
+    ignoreUndefined?: boolean;
+  }
+) {
+  if (!isObject(val1) || !isObject(val2)) {
+    return val1 === val2;
+  }
 
-    if (Object.keys(obj1).length) {
-      if (Object.keys(obj1).length !== Object.keys(obj2).length) {
-        return false;
-      }
-      return Object.keys(obj1).every(key => {
-        return compareObjects(obj1[key], obj2[key]);
-      });
-    } else {
-      return true;
+  if (Array.isArray(val1) && Array.isArray(val2)) {
+    return arrayObjectIsEqual(val1, val2, options);
+  }
+
+  const obj1 = options?.ignoreUndefined ? onlyDefined(val1) : val1;
+  const obj2 = options?.ignoreUndefined ? onlyDefined(val2) : val2;
+
+  if (Object.keys(obj1).length !== Object.keys(obj2).length) {
+    return false;
+  }
+  return Object.keys(obj1).every(key => {
+    // This check prevents a false positive where lengths of objects are the
+    // same, because there are equal numbers of undefined fields on both
+    // compared objects, but it just so happens that only differences are
+    // between undefined and missing fields.
+    if (!Object.hasOwn(obj2, key)) {
+      return false;
     }
-  };
-  return compareArrays(arr1, arr2);
+    return equalsDeep(obj1[key], obj2[key], options);
+  });
+}
+
+/** Returns an object with undefined fields filtered out. */
+function onlyDefined(obj: object): object {
+  return Object.fromEntries(
+    Object.entries(obj).filter(([, value]) => value !== undefined)
+  );
 }
 
 export function isInteger(checkVal: any): boolean {
   return Number.isInteger(checkVal) || checkVal == parseInt(checkVal);
 }
 
-export function isObject(checkVal: unknown): boolean {
+export function isObject(checkVal: unknown): checkVal is object {
   const type = typeof checkVal;
   return checkVal != null && (type == 'object' || type == 'function');
 }
@@ -108,7 +145,8 @@ export function runOnce<T extends (...args) => any>(func: T) {
   let result;
   return function () {
     if (--n > 0) {
-      result = func.apply(this, arguments);
+      // This implementation does not pass strictBindCallApply check.
+      result = func.apply(this, arguments as any);
     }
     if (n <= 1) {
       func = undefined;
@@ -290,6 +328,7 @@ export function debounce<T extends (...args: any) => any>(
     }
     return result;
   }
+
   debounced.cancel = cancel;
   debounced.flush = flush;
   return debounced;
@@ -325,7 +364,8 @@ export function memoize<T extends (...args: any) => any>(
     if (cache.has(key)) {
       return cache.get(key);
     }
-    const result = func.apply(this, args);
+    // `as any` because the implementation does not pass strictBindCallApply check.
+    const result = func.apply(this, args as any);
     memoized.cache = cache.set(key, result) || cache;
     return result;
   };

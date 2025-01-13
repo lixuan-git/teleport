@@ -1,18 +1,20 @@
 /*
-Copyright 2017 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package proxy
 
@@ -23,18 +25,16 @@ import (
 	"time"
 
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
 
 	"github.com/gravitational/teleport"
 	apiclient "github.com/gravitational/teleport/api/client"
 	tracessh "github.com/gravitational/teleport/api/observability/tracing/ssh"
 	apiutils "github.com/gravitational/teleport/api/utils"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
-var log = logrus.WithFields(logrus.Fields{
-	trace.Component: teleport.ComponentConnectProxy,
-})
+var log = logutils.NewPackageLogger(teleport.ComponentKey, teleport.ComponentConnectProxy)
 
 // A Dialer is a means for a client to establish a SSH connection.
 type Dialer interface {
@@ -192,13 +192,15 @@ func DialerFromEnvironment(addr string, opts ...DialerOptionFunc) Dialer {
 	// If no proxy settings are in environment return regular ssh dialer,
 	// otherwise return a proxy dialer.
 	if proxyURL == nil {
-		log.Debugf("No proxy set in environment, returning direct dialer.")
+		log.DebugContext(context.Background(), "No proxy set in environment, returning direct dialer")
 		return directDial{
 			alpnDialer:        options.alpnDialer,
 			proxyHeaderGetter: options.proxyHeaderGetter,
 		}
 	}
-	log.Debugf("Found proxy %q in environment, returning proxy dialer.", proxyURL)
+	log.DebugContext(context.Background(), "Found proxy in environment, returning proxy dialer",
+		"proxy_url", logutils.StringerAttr(proxyURL),
+	)
 	return proxyDial{
 		proxyURL:          proxyURL,
 		insecure:          options.insecureSkipTLSVerify,

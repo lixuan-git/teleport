@@ -1,40 +1,41 @@
-/*
-Copyright 2019 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+import { useState } from 'react';
 
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React from 'react';
 import { Box, Indicator } from 'design';
 import { Danger } from 'design/Alert';
+import { ClusterDropdown } from 'shared/components/ClusterDropdown/ClusterDropdown';
 
+import { ButtonLockedFeature } from 'teleport/components/ButtonLockedFeature';
 import {
   FeatureBox,
   FeatureHeader,
   FeatureHeaderTitle,
 } from 'teleport/components/Layout';
-import useTeleport from 'teleport/useTeleport';
-
-import useStickerClusterId from 'teleport/useStickyClusterId';
-
-import { ButtonLockedFeature } from 'teleport/components/ButtonLockedFeature';
-
 import { CtaEvent } from 'teleport/services/userEvent';
+import useStickerClusterId from 'teleport/useStickyClusterId';
+import useTeleport from 'teleport/useTeleport';
 
 import SessionList from './SessionList';
 import useSessions from './useSessions';
 
-export default function Container() {
+export function SessionsContainer() {
   const ctx = useTeleport();
   const { clusterId } = useStickerClusterId();
   const state = useSessions(ctx, clusterId);
@@ -42,8 +43,16 @@ export default function Container() {
 }
 
 export function Sessions(props: ReturnType<typeof useSessions>) {
-  const { attempt, sessions, showActiveSessionsCTA, showModeratedSessionsCTA } =
-    props;
+  const {
+    ctx,
+    attempt,
+    sessions,
+    showActiveSessionsCTA,
+    showModeratedSessionsCTA,
+    clusterId,
+  } = props;
+  const [errorMessage, setErrorMessage] = useState('');
+
   return (
     <FeatureBox>
       <FeatureHeader
@@ -62,7 +71,7 @@ export function Sessions(props: ReturnType<typeof useSessions>) {
       >
         <FeatureHeaderTitle>Active Sessions</FeatureHeaderTitle>
         {showActiveSessionsCTA && (
-          <Box width="340px">
+          <Box>
             <ButtonLockedFeature
               height="36px"
               event={CtaEvent.CTA_ACTIVE_SESSIONS}
@@ -72,6 +81,15 @@ export function Sessions(props: ReturnType<typeof useSessions>) {
           </Box>
         )}
       </FeatureHeader>
+      {!errorMessage && (
+        <ClusterDropdown
+          clusterLoader={ctx.clusterService}
+          clusterId={clusterId}
+          onError={setErrorMessage}
+          mb={2}
+        />
+      )}
+      {errorMessage && <Danger>{errorMessage}</Danger>}
       {attempt.isFailed && <Danger>{attempt.message} </Danger>}
       {attempt.isProcessing && (
         <Box textAlign="center" m={10}>

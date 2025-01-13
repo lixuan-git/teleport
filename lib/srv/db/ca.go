@@ -1,18 +1,20 @@
 /*
-Copyright 2020-2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package db
 
@@ -47,7 +49,7 @@ func (s *Server) startCARenewer(ctx context.Context) {
 		case <-schedule.Chan():
 			for _, database := range s.getProxiedDatabases() {
 				if err := s.initCACert(ctx, database); err != nil {
-					s.log.WithError(err).Errorf("Failed to renew database %q CA.", database.GetName())
+					s.log.ErrorContext(ctx, "Failed to renew database CA.", "db", database.GetName(), "error", err)
 				}
 			}
 		case <-ctx.Done():
@@ -99,13 +101,17 @@ func (s *Server) shouldInitCACertLocked(database types.Database) bool {
 	// Can only download it for cloud-hosted instances.
 	switch database.GetType() {
 	case types.DatabaseTypeRDS,
+		types.DatabaseTypeDocumentDB,
 		types.DatabaseTypeRedshift,
 		types.DatabaseTypeRedshiftServerless,
 		types.DatabaseTypeElastiCache,
 		types.DatabaseTypeMemoryDB,
 		types.DatabaseTypeAWSKeyspaces,
 		types.DatabaseTypeDynamoDB,
+		types.DatabaseTypeMongoAtlas,
 		types.DatabaseTypeCloudSQL,
+		// GCP Spanner is intentionally omitted, because the GCP Spanner endpoint
+		// is issued by a public CA.
 		types.DatabaseTypeAzure:
 		return true
 	default:
@@ -149,7 +155,7 @@ func (s *Server) getCACert(ctx context.Context, database types.Database, filePat
 	}
 	// The update flow is going to create/update the cached CA, so we can read
 	// the contents from it.
-	s.log.Debugf("Loaded CA certificate %v.", filePath)
+	s.log.DebugContext(ctx, "Loaded CA certificate.", "path", filePath)
 	return os.ReadFile(filePath)
 }
 
@@ -159,7 +165,8 @@ func (s *Server) getCACertPaths(database types.Database) ([]string, error) {
 	switch database.GetType() {
 	// All RDS instances share the same root CA (per AWS region) which can be
 	// downloaded from a well-known URL.
-	case types.DatabaseTypeRDS:
+	// DocumentDB uses same certs as RDS.
+	case types.DatabaseTypeRDS, types.DatabaseTypeDocumentDB:
 		return []string{filepath.Join(s.cfg.DataDir, filepath.Base(rdsCAURLForDatabase(database)))}, nil
 
 	// All Redshift instances share the same root CA which can be downloaded
@@ -195,13 +202,18 @@ func (s *Server) getCACertPaths(database types.Database) ([]string, error) {
 
 	case types.DatabaseTypeAWSKeyspaces:
 		return []string{filepath.Join(s.cfg.DataDir, filepath.Base(amazonKeyspacesCAURL))}, nil
+
+	case types.DatabaseTypeMongoAtlas:
+		return []string{
+			filepath.Join(s.cfg.DataDir, filepath.Base(isrgRootX1URL)),
+		}, nil
 	}
 
 	return nil, trace.BadParameter("%v doesn't support automatic CA download", database)
 }
 
 // saveCACert saves the downloaded certificate to the filesystem.
-func (s *Server) saveCACert(filePath string, content []byte, version []byte) error {
+func (s *Server) saveCACert(ctx context.Context, filePath string, content []byte, version []byte) error {
 	// Save CA contents.
 	err := os.WriteFile(filePath, content, teleport.FileMaskOwnerOnly)
 	if err != nil {
@@ -214,7 +226,7 @@ func (s *Server) saveCACert(filePath string, content []byte, version []byte) err
 		return trace.Wrap(err)
 	}
 
-	s.log.Debugf("Saved CA certificate %v.", filePath)
+	s.log.DebugContext(ctx, "Saved CA certificate.", "path", filePath)
 	return nil
 }
 
@@ -240,7 +252,7 @@ func (s *Server) updateCACert(ctx context.Context, database types.Database, file
 	}
 
 	if equal {
-		s.log.Debugf("Database %q CA is up-to-date.", database.GetName())
+		s.log.DebugContext(ctx, "Database CA is up-to-date.", "db", database.GetName(), "type", database.GetType())
 		return nil
 	}
 
@@ -252,12 +264,12 @@ func (s *Server) updateCACert(ctx context.Context, database types.Database, file
 		}
 	}
 
-	err = s.saveCACert(filePath, contents, version)
+	err = s.saveCACert(ctx, filePath, contents, version)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
-	s.log.Infof("Database %q CA updated.", database.GetName())
+	s.log.InfoContext(ctx, "Database CA updated.", "db", database.GetName(), "type", database.GetType())
 	return nil
 }
 
@@ -297,7 +309,7 @@ func NewRealDownloader() CADownloader {
 // Download downloads CA certificate for the provided cloud database instance.
 func (d *realDownloader) Download(ctx context.Context, database types.Database, hint string) ([]byte, []byte, error) {
 	switch database.GetType() {
-	case types.DatabaseTypeRDS:
+	case types.DatabaseTypeRDS, types.DatabaseTypeDocumentDB:
 		return d.downloadFromURL(rdsCAURLForDatabase(database))
 	case types.DatabaseTypeRedshift,
 		types.DatabaseTypeRedshiftServerless:
@@ -317,6 +329,8 @@ func (d *realDownloader) Download(ctx context.Context, database types.Database, 
 		return nil, nil, trace.BadParameter("unknown Azure CA %q", hint)
 	case types.DatabaseTypeAWSKeyspaces:
 		return d.downloadFromURL(amazonKeyspacesCAURL)
+	case types.DatabaseTypeMongoAtlas:
+		return d.downloadFromURL(isrgRootX1URL)
 	}
 	return nil, nil, trace.BadParameter("%v doesn't support automatic CA download", database)
 }
@@ -324,7 +338,7 @@ func (d *realDownloader) Download(ctx context.Context, database types.Database, 
 // GetVersion returns the CA version for the provided database.
 func (d *realDownloader) GetVersion(ctx context.Context, database types.Database, hint string) ([]byte, error) {
 	switch database.GetType() {
-	case types.DatabaseTypeRDS:
+	case types.DatabaseTypeRDS, types.DatabaseTypeDocumentDB:
 		return d.getVersionFromURL(database, rdsCAURLForDatabase(database))
 	case types.DatabaseTypeRedshift,
 		types.DatabaseTypeRedshiftServerless:
@@ -341,6 +355,8 @@ func (d *realDownloader) GetVersion(ctx context.Context, database types.Database
 		return nil, trace.BadParameter("unknown Azure CA %q", hint)
 	case types.DatabaseTypeAWSKeyspaces:
 		return d.getVersionFromURL(database, amazonKeyspacesCAURL)
+	case types.DatabaseTypeMongoAtlas:
+		return d.getVersionFromURL(database, isrgRootX1URL)
 	}
 
 	return nil, trace.NotImplemented("%v doesn't support fetching CA version", database)
@@ -502,6 +518,13 @@ const (
 	// presented by AWS Keyspace. See:
 	// https://docs.aws.amazon.com/keyspaces/latest/devguide/using_go_driver.html
 	amazonKeyspacesCAURL = "https://certs.secureserver.net/repository/sf-class2-root.crt"
+
+	// isrgRootX1URL is the URL to download ISRG Root X1 CA for Let's Encrypt. See:
+	// https://letsencrypt.org/certificates/
+	//
+	// MongoDB Atlas uses certificates signed by Let's Encrypt:
+	// https://www.mongodb.com/docs/atlas/reference/faq/security/#which-certificate-authority-signs-mongodb-atlas-tls-certificates-
+	isrgRootX1URL = "https://letsencrypt.org/certs/isrgrootx1.pem"
 
 	// cloudSQLDownloadError is the error message that gets returned when
 	// we failed to download root certificate for Cloud SQL instance.

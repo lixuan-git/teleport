@@ -1,29 +1,27 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+import cfg, { UrlListRolesParams, UrlResourcesParams } from 'teleport/config';
 import api from 'teleport/services/api';
-import cfg, { UrlResourcesParams } from 'teleport/config';
-import history from 'teleport/services/history';
 
-import { UnifiedResource, ResourcesResponse } from '../agents';
-import { KeysEnum } from '../localStorage';
-
+import { ResourcesResponse, UnifiedResource } from '../agents';
+import { makeResource, makeResourceList, RoleResource } from './';
 import { makeUnifiedResource } from './makeUnifiedResource';
-
-import { makeResource, makeResourceList } from './';
 
 class ResourceService {
   fetchTrustedClusters() {
@@ -42,27 +40,11 @@ class ResourceService {
       .then(json => {
         const items = json?.items || [];
 
-        // TODO (avatus) DELETE IN 15.0
-        // if this request succeeds, we don't need a legacy view
-        localStorage.removeItem(KeysEnum.UNIFIED_RESOURCES_NOT_SUPPORTED);
         return {
           agents: items.map(makeUnifiedResource),
           startKey: json?.startKey,
           totalCount: json?.totalCount,
         };
-      })
-      .catch(res => {
-        // TODO (avatus) : a temporary check to catch unimplemented errors for unified resources
-        // This is a quick hacky way to catch the error until we migrate completely to unified resources
-        // DELETE IN 15.0
-        if (res.response?.status === 404 || res.response?.status === 501) {
-          localStorage.setItem(
-            KeysEnum.UNIFIED_RESOURCES_NOT_SUPPORTED,
-            'true'
-          );
-          history.replace(cfg.getNodesRoute(clusterId));
-        }
-        throw res;
       });
   }
 
@@ -72,9 +54,16 @@ class ResourceService {
       .then(res => makeResourceList<'github'>(res));
   }
 
-  fetchRoles() {
+  async fetchRoles(params?: UrlListRolesParams): Promise<{
+    items: RoleResource[];
+    startKey: string;
+  }> {
+    return await api.get(cfg.getListRolesUrl(params));
+  }
+
+  fetchPresetRoles() {
     return api
-      .get(cfg.getRolesUrl())
+      .get(cfg.getPresetRolesUrl())
       .then(res => makeResourceList<'role'>(res));
   }
 
@@ -86,7 +75,7 @@ class ResourceService {
 
   createRole(content: string) {
     return api
-      .post(cfg.getRolesUrl(), { content })
+      .post(cfg.getRoleUrl(), { content })
       .then(res => makeResource<'role'>(res));
   }
 
@@ -104,7 +93,7 @@ class ResourceService {
 
   updateRole(name: string, content: string) {
     return api
-      .put(cfg.getRolesUrl(name), { content })
+      .put(cfg.getRoleUrl(name), { content })
       .then(res => makeResource<'role'>(res));
   }
 
@@ -119,7 +108,7 @@ class ResourceService {
   }
 
   deleteRole(name: string) {
-    return api.delete(cfg.getRolesUrl(name));
+    return api.delete(cfg.getRoleUrl(name));
   }
 
   deleteGithubConnector(name: string) {

@@ -1,25 +1,31 @@
-/*
-Copyright 2019 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import * as uri from 'teleterm/ui/uri';
+import { SharedUnifiedResource } from 'shared/components/UnifiedResources';
 
 import type * as tsh from 'teleterm/services/tshd/types';
+import * as uri from 'teleterm/ui/uri';
 
 export type Kind = Document['kind'];
 
+/**
+ * DocumentOrigin denotes which part of Connect UI was used to create a document for the resource.
+ */
 export type DocumentOrigin =
   | 'resource_table'
   | 'search_bar'
@@ -97,11 +103,17 @@ export interface DocumentTshKube extends DocumentBase {
 
 export interface DocumentGateway extends DocumentBase {
   kind: 'doc.gateway';
+  // status is used merely to show a progress bar when the gateway is being set up.
+  status: '' | 'connecting' | 'connected' | 'error';
   gatewayUri?: uri.GatewayUri;
-  targetUri: uri.DatabaseUri;
+  targetUri: uri.DatabaseUri | uri.AppUri;
   targetUser: string;
   targetName: string;
-  targetSubresourceName?: string;
+  /**
+   * targetSubresourceName contains database name for db gateways and target port for TCP app
+   * gateways.
+   */
+  targetSubresourceName: string | undefined;
   port?: string;
   origin: DocumentOrigin;
 }
@@ -134,18 +146,54 @@ export interface DocumentGatewayCliClient extends DocumentBase {
   status: '' | 'connecting' | 'connected' | 'error';
 }
 
+/**
+ * DocumentGatewayKube replaced DocumentTshKube in Connect v14. Before removing DocumentTshKube
+ * completely, we should add a migration that transforms all DocumentTshKube docs into
+ * DocumentGatewayKube docs when loading the workspace state from disk.
+ */
 export interface DocumentGatewayKube extends DocumentBase {
   kind: 'doc.gateway_kube';
   rootClusterId: string;
   leafClusterId: string | undefined;
   targetUri: uri.KubeUri;
   origin: DocumentOrigin;
+  /** Identifier of the shell to be opened. */
+  shellId?: string;
+  // status is used merely to show a progress bar when the gateway is being set up.
+  status: '' | 'connecting' | 'connected' | 'error';
 }
 
 export interface DocumentCluster extends DocumentBase {
   kind: 'doc.cluster';
   clusterUri: uri.ClusterUri;
+  queryParams: DocumentClusterQueryParams;
 }
+
+// When extending this type, remember to update the
+// `WorkspacesService.reopenPreviousDocuments` method
+// that spreads all of its properties.
+export interface DocumentClusterQueryParams {
+  search: string;
+  advancedSearchEnabled: boolean;
+  /**
+   * This is a list of 'resource kind' filters that can be selected from
+   * both the search bar and the types selector in the unified resources view.
+   *
+   * If it is empty, all resource kinds are listed.
+   */
+  resourceKinds: DocumentClusterResourceKind[];
+  sort: {
+    fieldName: string;
+    dir: 'ASC' | 'DESC';
+  };
+}
+
+// Any changes done to this type must be backwards compatible as
+// `DocumentClusterQueryParams` uses values of this type and documents are stored to disk.
+export type DocumentClusterResourceKind = Extract<
+  SharedUnifiedResource['resource']['kind'],
+  'node' | 'app' | 'kube_cluster' | 'db'
+>;
 
 export interface DocumentAccessRequests extends DocumentBase {
   kind: 'doc.access_requests';
@@ -157,6 +205,8 @@ export interface DocumentAccessRequests extends DocumentBase {
 export interface DocumentPtySession extends DocumentBase {
   kind: 'doc.terminal_shell';
   cwd?: string;
+  /** Identifier of the shell to be opened. */
+  shellId?: string;
   rootClusterId?: string;
   leafClusterId?: string;
 }
@@ -167,6 +217,31 @@ export interface DocumentConnectMyComputer extends DocumentBase {
   // However, there are a few components in the system, such as `getResourceUri`, which need to determine the relation
   // between a document and a cluster just by looking at the document fields.
   rootClusterUri: uri.RootClusterUri;
+  /**
+   * The status of 'connecting' is used to indicate that Connect My Computer permissions cannot be
+   * established yet and the document is waiting for the app to receive full cluster details.
+   */
+  status: '' | 'connecting' | 'connected' | 'error';
+}
+
+/**
+ * Document to authorize a web session with device trust.
+ * Unlike other documents, it is not persisted on disk.
+ */
+export interface DocumentAuthorizeWebSession extends DocumentBase {
+  kind: 'doc.authorize_web_session';
+  // `DocumentAuthorizeWebSession` always operates on the root cluster, so in theory `rootClusterUri` is not needed.
+  // However, there are a few components in the system, such as `getResourceUri`, which need to determine the relation
+  // between a document and a cluster just by looking at the document fields.
+  rootClusterUri: uri.RootClusterUri;
+  webSessionRequest: WebSessionRequest;
+}
+
+export interface WebSessionRequest {
+  id: string;
+  token: string;
+  username: string;
+  redirectUri: string;
 }
 
 export type DocumentTerminal =
@@ -182,7 +257,8 @@ export type Document =
   | DocumentGateway
   | DocumentCluster
   | DocumentTerminal
-  | DocumentConnectMyComputer;
+  | DocumentConnectMyComputer
+  | DocumentAuthorizeWebSession;
 
 export function isDocumentTshNodeWithLoginHost(
   doc: Document
@@ -200,19 +276,25 @@ export function isDocumentTshNodeWithServerId(
   return doc.kind === 'doc.terminal_tsh_node' && 'serverId' in doc;
 }
 
+/**
+ * `DocumentPtySession` and `DocumentGatewayKube` spawn a shell.
+ * The shell is taken from the `doc.shellId` property.
+ */
+export function canDocChangeShell(
+  doc: Document
+): doc is DocumentPtySession | DocumentGatewayKube {
+  return doc.kind === 'doc.terminal_shell' || doc.kind === 'doc.gateway_kube';
+}
+
 export type CreateGatewayDocumentOpts = {
   gatewayUri?: uri.GatewayUri;
-  targetUri: uri.DatabaseUri;
+  targetUri: uri.DatabaseUri | uri.AppUri;
   targetName: string;
   targetUser: string;
   targetSubresourceName?: string;
   title?: string;
   port?: string;
   origin: DocumentOrigin;
-};
-
-export type CreateClusterDocumentOpts = {
-  clusterUri: uri.ClusterUri;
 };
 
 export type CreateTshKubeDocumentOptions = {

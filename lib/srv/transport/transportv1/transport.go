@@ -1,32 +1,40 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package transportv1
 
 import (
 	"context"
+	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"sync"
 
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh/agent"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
 
+	"github.com/gravitational/teleport"
 	transportv1pb "github.com/gravitational/teleport/api/gen/proto/go/teleport/transport/v1"
 	streamutils "github.com/gravitational/teleport/api/utils/grpc/stream"
 	"github.com/gravitational/teleport/lib/agentless"
@@ -35,6 +43,7 @@ import (
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/teleagent"
 	"github.com/gravitational/teleport/lib/utils"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
 // Dialer is the interface that groups basic dialing methods.
@@ -55,7 +64,7 @@ type ServerConfig struct {
 	// to run in FIPS mode.
 	FIPS bool
 	// Logger provides a mechanism to log output.
-	Logger logrus.FieldLogger
+	Logger *slog.Logger
 	// Dialer is used to establish remote connections.
 	Dialer Dialer
 	// SignerFn is used to create an [ssh.Signer] for an authenticated connection.
@@ -85,7 +94,7 @@ func (c *ServerConfig) CheckAndSetDefaults() error {
 	}
 
 	if c.Logger == nil {
-		c.Logger = utils.NewLogger().WithField(trace.Component, "transport")
+		c.Logger = slog.With(teleport.ComponentKey, "transport")
 	}
 
 	if c.agentGetterFn == nil {
@@ -238,8 +247,8 @@ func (s *Service) ProxySSH(stream transportv1pb.TransportService_ProxySSHServer)
 		for {
 			req, err := stream.Recv()
 			if err != nil {
-				if !utils.IsOKNetworkError(err) {
-					s.cfg.Logger.Errorf("ssh stream terminated unexpectedly: %v", err)
+				if !utils.IsOKNetworkError(err) && !errors.Is(err, context.Canceled) && status.Code(err) != codes.Canceled {
+					s.cfg.Logger.ErrorContext(ctx, "ssh stream terminated unexpectedly", "error", err)
 				}
 
 				return
@@ -254,7 +263,7 @@ func (s *Service) ProxySSH(stream transportv1pb.TransportService_ProxySSHServer)
 			case *transportv1pb.ProxySSHRequest_Agent:
 				agentStream.incomingC <- frame.Agent.Payload
 			default:
-				s.cfg.Logger.Errorf("received unexpected ssh frame: %T", frame)
+				s.cfg.Logger.ErrorContext(ctx, "received unexpected ssh frame", "frame", logutils.TypeAttr(frame))
 				continue
 			}
 		}
@@ -281,6 +290,10 @@ func (s *Service) ProxySSH(stream transportv1pb.TransportService_ProxySSHServer)
 	signer := s.cfg.SignerFn(authzContext, req.DialTarget.Cluster)
 	hostConn, err := s.cfg.Dialer.DialHost(ctx, p.Addr, clientDst, host, port, req.DialTarget.Cluster, authzContext.Checker, s.cfg.agentGetterFn(agentStreamRW), signer)
 	if err != nil {
+		// Return ambiguous errors unadorned so that clients can detect them easily.
+		if errors.Is(err, teleport.ErrNodeIsAmbiguous) {
+			return trace.Wrap(err)
+		}
 		return trace.Wrap(err, "failed to dial target host")
 	}
 
@@ -311,7 +324,11 @@ func (s *Service) ProxySSH(stream transportv1pb.TransportService_ProxySSHServer)
 	}
 
 	// copy data to/from the host/user
-	return trace.Wrap(utils.ProxyConn(monitorCtx, hostConn, userConn))
+	err = utils.ProxyConn(monitorCtx, hostConn, userConn)
+	if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
+		err = nil
+	}
+	return trace.Wrap(err)
 }
 
 // getDestinationAddress is used to get client destination for connection coming from gRPC. We don't have a way to get

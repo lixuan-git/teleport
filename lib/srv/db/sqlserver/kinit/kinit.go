@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//    http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 // Package kinit provides utilities for interacting with a KDC (Key Distribution Center) for Kerberos5
 package kinit
@@ -20,6 +24,7 @@ import (
 	"context"
 	"crypto/x509"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,7 +34,6 @@ import (
 	"github.com/gravitational/trace"
 	"github.com/jcmturner/gokrb5/v8/config"
 	"github.com/jcmturner/gokrb5/v8/credentials"
-	"github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/auth/windows"
@@ -122,7 +126,7 @@ func NewCommandLineInitializer(config CommandConfig) *CommandLineInitializer {
 		certGetter:         config.CertGetter,
 		ldapCertificate:    config.LDAPCA,
 		ldapCertificatePEM: config.LDAPCAPEM,
-		log:                logrus.StandardLogger(),
+		logger:             slog.Default(),
 	}
 	if cmd.command == nil {
 		cmd.command = &execCmd{}
@@ -169,7 +173,7 @@ type CommandLineInitializer struct {
 
 	ldapCertificate    *x509.Certificate
 	ldapCertificatePEM string
-	log                logrus.FieldLogger
+	logger             *slog.Logger
 }
 
 // CertGetter is an interface for getting a new cert/key pair along with a CA cert
@@ -209,7 +213,7 @@ func (d *DBCertGetter) GetCertificateBytes(ctx context.Context) (*WindowsCAAndKe
 	}
 
 	certPEM, keyPEM, caCerts, err := windows.CertKeyPEM(ctx, &windows.GenerateCredentialsRequest{
-		CAType:      types.DatabaseCA,
+		CAType:      types.DatabaseClientCA,
 		Username:    d.UserName,
 		Domain:      d.RealmName,
 		TTL:         certTTL,
@@ -242,7 +246,7 @@ func (k *CommandLineInitializer) UseOrCreateCredentials(ctx context.Context) (*c
 	defer func() {
 		err = os.RemoveAll(tmp)
 		if err != nil {
-			k.log.Errorf("failed removing temporary kinit directory: %s", err)
+			k.logger.ErrorContext(ctx, "failed removing temporary kinit directory", "error", err)
 		}
 	}()
 
@@ -304,7 +308,7 @@ func (k *CommandLineInitializer) UseOrCreateCredentials(ctx context.Context) (*c
 	cmd.Env = append(cmd.Env, []string{fmt.Sprintf("%s=%s", krb5ConfigEnv, krbConfPath)}...)
 	kinitOutput, err := cmd.CombinedOutput()
 	if err != nil {
-		k.log.Errorf("Failed to authenticate with KDC: %s", kinitOutput)
+		k.logger.ErrorContext(ctx, "Failed to authenticate with KDC", "cmd_output", string(kinitOutput))
 		return nil, nil, trace.AccessDenied("authentication failed")
 	}
 	ccache, err := credentials.LoadCCache(cachePath)

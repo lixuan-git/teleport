@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package common
 
@@ -20,6 +22,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"testing"
 
@@ -49,8 +52,8 @@ func newTestDelegate(header, value string) *testDelegate {
 	}
 }
 
-func (t *testDelegate) Rewrite(req *http.Request) {
-	req.Header.Set(t.header, t.value)
+func (t *testDelegate) Rewrite(req *httputil.ProxyRequest) {
+	req.Out.Header.Set(t.header, t.value)
 }
 
 func TestHeaderRewriter(t *testing.T) {
@@ -126,10 +129,21 @@ func TestHeaderRewriter(t *testing.T) {
 			delegates = append(delegates, test.extraDelegates...)
 			hr := NewHeaderRewriter(delegates...)
 
-			hr.Rewrite(test.req)
+			// replicate net/http/httputil.ReverseProxy stripping
+			// forwarding headers from the outbound request
+			outReq := test.req.Clone(test.req.Context())
+			outReq.Header.Del("Forwarded")
+			outReq.Header.Del(reverseproxy.XForwardedFor)
+			outReq.Header.Del(reverseproxy.XForwardedHost)
+			outReq.Header.Del(reverseproxy.XForwardedProto)
+
+			hr.Rewrite(&httputil.ProxyRequest{
+				In:  test.req,
+				Out: outReq,
+			})
 
 			for header, value := range test.expectedHeaders {
-				assert.Equal(t, test.req.Header.Get(header), value[0])
+				assert.Equal(t, outReq.Header.Get(header), value[0])
 			}
 		})
 	}

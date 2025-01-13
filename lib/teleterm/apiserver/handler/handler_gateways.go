@@ -1,28 +1,32 @@
-// Copyright 2021 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package handler
 
 import (
 	"context"
 	"fmt"
-	"os/exec"
 	"strings"
 
 	"github.com/gravitational/trace"
 
 	api "github.com/gravitational/teleport/gen/proto/go/teleport/lib/teleterm/v1"
+	"github.com/gravitational/teleport/lib/teleterm/cmd"
 	"github.com/gravitational/teleport/lib/teleterm/daemon"
 	"github.com/gravitational/teleport/lib/teleterm/gateway"
 )
@@ -41,7 +45,7 @@ func (s *Handler) CreateGateway(ctx context.Context, req *api.CreateGatewayReque
 		return nil, trace.Wrap(err)
 	}
 
-	apiGateway, err := s.newAPIGateway(gateway)
+	apiGateway, err := s.newAPIGateway(ctx, gateway)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -55,7 +59,7 @@ func (s *Handler) ListGateways(ctx context.Context, req *api.ListGatewaysRequest
 
 	apiGws := make([]*api.Gateway, 0, len(gws))
 	for _, gw := range gws {
-		apiGateway, err := s.newAPIGateway(gw)
+		apiGateway, err := s.newAPIGateway(ctx, gw)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -77,8 +81,8 @@ func (s *Handler) RemoveGateway(ctx context.Context, req *api.RemoveGatewayReque
 	return &api.EmptyResponse{}, nil
 }
 
-func (s *Handler) newAPIGateway(gateway gateway.Gateway) (*api.Gateway, error) {
-	command, err := s.DaemonService.GetGatewayCLICommand(gateway)
+func (s *Handler) newAPIGateway(ctx context.Context, gateway gateway.Gateway) (*api.Gateway, error) {
+	cmds, err := s.DaemonService.GetGatewayCLICommand(ctx, gateway)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -92,21 +96,21 @@ func (s *Handler) newAPIGateway(gateway gateway.Gateway) (*api.Gateway, error) {
 		Protocol:              gateway.Protocol(),
 		LocalAddress:          gateway.LocalAddress(),
 		LocalPort:             gateway.LocalPort(),
-		GatewayCliCommand:     makeGatewayCLICommand(command),
+		GatewayCliCommand:     makeGatewayCLICommand(cmds),
 	}, nil
 }
 
-func makeGatewayCLICommand(cmd *exec.Cmd) *api.GatewayCLICommand {
-	cmdString := strings.TrimSpace(
+func makeGatewayCLICommand(cmds cmd.Cmds) *api.GatewayCLICommand {
+	preview := strings.TrimSpace(
 		fmt.Sprintf("%s %s",
-			strings.Join(cmd.Env, " "),
-			strings.Join(cmd.Args, " ")))
+			strings.Join(cmds.Preview.Env, " "),
+			strings.Join(cmds.Preview.Args, " ")))
 
 	return &api.GatewayCLICommand{
-		Path:    cmd.Path,
-		Args:    cmd.Args,
-		Env:     cmd.Env,
-		Preview: cmdString,
+		Path:    cmds.Exec.Path,
+		Args:    cmds.Exec.Args,
+		Env:     cmds.Exec.Env,
+		Preview: preview,
 	}
 }
 
@@ -115,12 +119,12 @@ func makeGatewayCLICommand(cmd *exec.Cmd) *api.GatewayCLICommand {
 //
 // In Connect this is used to update the db name of a db connection along with the CLI command.
 func (s *Handler) SetGatewayTargetSubresourceName(ctx context.Context, req *api.SetGatewayTargetSubresourceNameRequest) (*api.Gateway, error) {
-	gateway, err := s.DaemonService.SetGatewayTargetSubresourceName(req.GatewayUri, req.TargetSubresourceName)
+	gateway, err := s.DaemonService.SetGatewayTargetSubresourceName(ctx, req.GatewayUri, req.TargetSubresourceName)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	apiGateway, err := s.newAPIGateway(gateway)
+	apiGateway, err := s.newAPIGateway(ctx, gateway)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -135,7 +139,7 @@ func (s *Handler) SetGatewayLocalPort(ctx context.Context, req *api.SetGatewayLo
 		return nil, trace.Wrap(err)
 	}
 
-	apiGateway, err := s.newAPIGateway(gateway)
+	apiGateway, err := s.newAPIGateway(ctx, gateway)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}

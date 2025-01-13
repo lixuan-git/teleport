@@ -1,36 +1,22 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package config
-
-import (
-	"context"
-	"io/fs"
-	"os"
-	"path"
-
-	"github.com/gravitational/trace"
-
-	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/api/utils/keys"
-	"github.com/gravitational/teleport/lib/auth"
-	"github.com/gravitational/teleport/lib/client"
-	"github.com/gravitational/teleport/lib/tbot/bot"
-	"github.com/gravitational/teleport/lib/tbot/identity"
-)
 
 const (
 	// TemplateSSHClientName is the config name for generating ssh client
@@ -72,87 +58,3 @@ type FileDescription struct {
 	// Destination.
 	IsDir bool
 }
-
-// template defines functions for dynamically writing additional files to
-// a Destination.
-type template interface {
-	// Name returns the name of this config template.
-	name() string
-
-	// Describe generates a list of all files this ConfigTemplate will generate
-	// at runtime. Currently ConfigTemplates are required to know this
-	// statically as this must be callable without any auth clients (or any
-	// secrets) for use with `tbot init`. If an arbitrary number of files must
-	// be generated, they should be placed in a subdirectory.
-	describe() []FileDescription
-
-	// Render writes the config template to the Destination.
-	render(
-		ctx context.Context,
-		p provider,
-		identity *identity.Identity,
-		destination bot.Destination,
-	) error
-}
-
-// BotConfigWriter is a trivial adapter to use the identityfile package with
-// bot destinations.
-type BotConfigWriter struct {
-	ctx context.Context
-
-	// dest is the Destination that will handle writing of files.
-	dest bot.Destination
-
-	// subpath is the subdirectory within the Destination to which the files
-	// should be written.
-	subpath string
-}
-
-// WriteFile writes the file to the Destination. Only the basename of the path
-// is used. Specified permissions are ignored.
-func (b *BotConfigWriter) WriteFile(name string, data []byte, _ os.FileMode) error {
-	p := path.Base(name)
-	if b.subpath != "" {
-		p = path.Join(b.subpath, p)
-	}
-
-	return trace.Wrap(b.dest.Write(b.ctx, p, data))
-}
-
-// Remove removes files. This is a dummy implementation that always returns not found.
-func (b *BotConfigWriter) Remove(name string) error {
-	return &os.PathError{Op: "stat", Path: name, Err: os.ErrNotExist}
-}
-
-// Stat checks file status. This implementation always returns not found.
-func (b *BotConfigWriter) Stat(name string) (fs.FileInfo, error) {
-	return nil, &os.PathError{Op: "stat", Path: name, Err: os.ErrNotExist}
-}
-
-// newClientKey returns a sane client.Key for the given bot identity.
-func newClientKey(ident *identity.Identity, hostCAs []types.CertAuthority) (*client.Key, error) {
-	pk, err := keys.ParsePrivateKey(ident.PrivateKeyBytes)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	return &client.Key{
-		KeyIndex: client.KeyIndex{
-			ClusterName: ident.ClusterName,
-		},
-		PrivateKey:   pk,
-		Cert:         ident.CertBytes,
-		TLSCert:      ident.TLSCertBytes,
-		TrustedCerts: auth.AuthoritiesToTrustedCerts(hostCAs),
-
-		// Note: these fields are never used or persisted with identity files,
-		// so we won't bother to set them. (They may need to be reconstituted
-		// on tsh's end based on cert fields, though.)
-		KubeTLSCerts: make(map[string][]byte),
-		DBTLSCerts:   make(map[string][]byte),
-	}, nil
-}
-
-// executablePathGetter is a function that returns the path of the current
-// executable.
-type executablePathGetter = func() (string, error)

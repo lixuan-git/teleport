@@ -1,29 +1,33 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package enroll
 
 import (
 	"context"
+	"errors"
+	"io"
+	"log/slog"
 
 	"github.com/gravitational/trace"
 	"github.com/gravitational/trace/trail"
-	log "github.com/sirupsen/logrus"
-	"golang.org/x/exp/slices"
 
 	devicepb "github.com/gravitational/teleport/api/gen/proto/go/teleport/devicetrust/v1"
-	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/devicetrust"
 	"github.com/gravitational/teleport/lib/devicetrust/native"
 )
@@ -90,8 +94,7 @@ func (c *Ceremony) RunAdmin(
 
 	rewordAccessDenied := func(err error, action string) error {
 		if trace.IsAccessDenied(trail.FromGRPC(err)) {
-			log.WithError(err).Debug(
-				"Device Trust: Redacting access denied error with user-friendly message")
+			slog.DebugContext(ctx, "Device Trust: Redacting access denied error with user-friendly message", "error", err)
 			return trace.AccessDenied(
 				"User does not have permissions to %s. Contact your cluster device administrator.",
 				action,
@@ -111,9 +114,12 @@ func (c *Ceremony) RunAdmin(
 	for _, dev := range findResp.Devices {
 		if dev.OsType == osType {
 			currentDev = dev
-			log.Debugf(
-				"Device Trust: Found device %q/%v, id=%q",
-				currentDev.AssetTag, devicetrust.FriendlyOSType(currentDev.OsType), currentDev.Id,
+			slog.DebugContext(ctx, "Device Trust: Found device",
+				slog.Group("device",
+					slog.String("asset_tag", currentDev.AssetTag),
+					slog.String("os", devicetrust.FriendlyOSType(currentDev.OsType)),
+					slog.String("id", currentDev.Id),
+				),
 			)
 			break
 		}
@@ -144,17 +150,20 @@ func (c *Ceremony) RunAdmin(
 		if err != nil {
 			return currentDev, outcome, trace.Wrap(rewordAccessDenied(err, "create device enrollment tokens"))
 		}
-		log.Debugf(
-			"Device Trust: Created enrollment token for device %q/%s",
-			currentDev.AssetTag,
-			devicetrust.FriendlyOSType(currentDev.OsType))
+		slog.DebugContext(ctx, "Device Trust: Created enrollment token for device",
+			slog.Group("device",
+				slog.String("asset_tag", currentDev.AssetTag),
+				slog.String("os", devicetrust.FriendlyOSType(currentDev.OsType)),
+				slog.String("id", currentDev.Id),
+			),
+		)
 	}
 	token := currentDev.EnrollToken.GetToken()
 
 	// Then proceed onto enrollment.
 	enrolled, err := c.Run(ctx, devicesClient, debug, token)
 	if err != nil {
-		return enrolled, outcome, trace.Wrap(err)
+		return currentDev, outcome, trace.Wrap(err)
 	}
 
 	outcome++ // "0" becomes "Enrolled", "Registered" becomes "RegisteredAndEnrolled".
@@ -163,35 +172,36 @@ func (c *Ceremony) RunAdmin(
 
 // Run performs the client-side device enrollment ceremony.
 func (c *Ceremony) Run(ctx context.Context, devicesClient devicepb.DeviceTrustServiceClient, debug bool, enrollToken string) (*devicepb.Device, error) {
-	// Start by checking the OSType, this lets us exit early with a nicer message
-	// for unsupported OSes.
-	osType := c.GetDeviceOSType()
-	if !slices.Contains([]devicepb.OSType{
-		devicepb.OSType_OS_TYPE_MACOS,
-		devicepb.OSType_OS_TYPE_WINDOWS,
-	}, osType) {
-		return nil, trace.BadParameter(
-			"device enrollment not supported for current OS (%s)",
-			types.ResourceOSTypeToString(osType),
-		)
-	}
-
 	init, err := c.EnrollDeviceInit()
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 	init.Token = enrollToken
 
-	// 1. Init.
+	return c.run(ctx, devicesClient, debug, init)
+}
+
+func (c *Ceremony) run(ctx context.Context, devicesClient devicepb.DeviceTrustServiceClient, debug bool, init *devicepb.EnrollDeviceInit) (*devicepb.Device, error) {
+	// Sanity check.
+	if init.GetToken() == "" {
+		return nil, trace.BadParameter("enroll init message lacks enrollment token")
+	}
+
 	stream, err := devicesClient.EnrollDevice(ctx)
 	if err != nil {
 		return nil, trace.Wrap(devicetrust.HandleUnimplemented(err))
 	}
+	defer stream.CloseSend()
+
+	// 1. Init.
 	if err := stream.Send(&devicepb.EnrollDeviceRequest{
 		Payload: &devicepb.EnrollDeviceRequest_Init{
 			Init: init,
 		},
-	}); err != nil {
+	}); err != nil && !errors.Is(err, io.EOF) {
+		// [io.EOF] indicates that the server has closed the stream.
+		// The client should handle the underlying error on the subsequent Recv call.
+		// All other errors are client-side errors and should be returned.
 		return nil, trace.Wrap(devicetrust.HandleUnimplemented(err))
 	}
 	resp, err := stream.Recv()
@@ -201,15 +211,15 @@ func (c *Ceremony) Run(ctx context.Context, devicesClient devicepb.DeviceTrustSe
 	// Unimplemented errors are not expected to happen after this point.
 
 	// 2. Challenge.
-	switch osType {
+	switch c.GetDeviceOSType() {
 	case devicepb.OSType_OS_TYPE_MACOS:
 		err = c.enrollDeviceMacOS(stream, resp)
 		// err handled below
-	case devicepb.OSType_OS_TYPE_WINDOWS:
+	case devicepb.OSType_OS_TYPE_LINUX, devicepb.OSType_OS_TYPE_WINDOWS:
 		err = c.enrollDeviceTPM(ctx, stream, resp, debug)
 		// err handled below
 	default:
-		// This should be caught by the OSType guard at start of function.
+		// Safety check.
 		panic("no enrollment function provided for os")
 	}
 	if err != nil {
@@ -245,7 +255,13 @@ func (c *Ceremony) enrollDeviceMacOS(stream devicepb.DeviceTrustService_EnrollDe
 			},
 		},
 	})
-	return trace.Wrap(err)
+	if err != nil && !errors.Is(err, io.EOF) {
+		// [io.EOF] indicates that the server has closed the stream.
+		// The client should handle the underlying error on the subsequent Recv call.
+		// All other errors are client-side errors and should be returned.
+		return trace.Wrap(err)
+	}
+	return nil
 }
 
 func (c *Ceremony) enrollDeviceTPM(ctx context.Context, stream devicepb.DeviceTrustService_EnrollDeviceClient, resp *devicepb.EnrollDeviceResponse, debug bool) error {
@@ -268,5 +284,11 @@ func (c *Ceremony) enrollDeviceTPM(ctx context.Context, stream devicepb.DeviceTr
 			TpmChallengeResponse: challengeResponse,
 		},
 	})
-	return trace.Wrap(err)
+	// [io.EOF] indicates that the server has closed the stream.
+	// The client should handle the underlying error on the subsequent Recv call.
+	// All other errors are client-side errors and should be returned.
+	if err != nil && !errors.Is(err, io.EOF) {
+		return trace.Wrap(err)
+	}
+	return nil
 }

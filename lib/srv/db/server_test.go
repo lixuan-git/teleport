@@ -1,39 +1,47 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package db
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/go-mysql-org/go-mysql/client"
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/jackc/pgconn"
+	"github.com/jonboulle/clockwork"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/mongo"
 
+	"github.com/gravitational/teleport/api/client/proto"
 	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/api/utils/retryutils"
 	"github.com/gravitational/teleport/lib/defaults"
+	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/limiter"
-	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/srv/db/mysql"
 )
 
 // TestDatabaseServerStart validates that started database server updates its
@@ -62,13 +70,21 @@ func TestDatabaseServerStart(t *testing.T) {
 	}
 
 	// Make sure servers were announced and their labels updated.
-	servers, err := testCtx.authClient.GetDatabaseServers(ctx, apidefaults.Namespace)
-	require.NoError(t, err)
-	require.Len(t, servers, 4)
-	for _, server := range servers {
-		require.Equal(t, map[string]string{"echo": "test"},
-			server.GetDatabase().GetAllLabels())
-	}
+	retryutils.RetryStaticFor(5*time.Second, 20*time.Millisecond, func() error {
+		servers, err := testCtx.authClient.GetDatabaseServers(ctx, apidefaults.Namespace)
+		if err != nil {
+			return err
+		}
+		if len(servers) != 4 {
+			return fmt.Errorf("expected 4 servers, got %d", len(servers))
+		}
+		for _, server := range servers {
+			if diff := cmp.Diff(map[string]string{"echo": "test"}, server.GetDatabase().GetAllLabels()); diff != "" {
+				return fmt.Errorf("expected echo:test label, diff: %s", diff)
+			}
+		}
+		return nil
+	})
 }
 
 func TestDatabaseServerLimiting(t *testing.T) {
@@ -131,7 +147,7 @@ func TestDatabaseServerLimiting(t *testing.T) {
 	})
 
 	t.Run("mysql", func(t *testing.T) {
-		dbConns := make([]*client.Conn, 0)
+		dbConns := make([]mysql.TestClientConn, 0)
 		t.Cleanup(func() {
 			// Disconnect all clients.
 			for _, dbConn := range dbConns {
@@ -182,6 +198,75 @@ func TestDatabaseServerLimiting(t *testing.T) {
 
 		require.FailNow(t, "we should exceed the connection limit by now")
 	})
+}
+
+func TestDatabaseServerAutoDisconnect(t *testing.T) {
+	const (
+		user   = "bob"
+		role   = "admin"
+		dbName = "postgres"
+		dbUser = user
+	)
+
+	ctx := context.Background()
+	allowDbUsers := []string{types.Wildcard}
+	allowDbNames := []string{types.Wildcard}
+
+	testCtx := setupTestContext(ctx, t, withSelfHostedPostgres("postgres"))
+
+	go testCtx.startHandlingConnections()
+	t.Cleanup(func() {
+		require.NoError(t, testCtx.Close())
+	})
+
+	const clientIdleTimeout = time.Second * 30
+
+	// create user/role with client idle timeout
+	testCtx.createUserAndRole(ctx, t, user, role, allowDbUsers, allowDbNames, withClientIdleTimeout(clientIdleTimeout))
+
+	// connect
+	pgConn, err := testCtx.postgresClient(ctx, user, "postgres", dbUser, dbName)
+	require.NoError(t, err)
+
+	// immediate query should work
+	_, err = pgConn.Exec(ctx, "select 1").ReadAll()
+	require.NoError(t, err)
+
+	// advance clock several times, perform query.
+	// the activity should update the idle activity timer.
+	for i := 0; i < 10; i++ {
+		advanceInSteps(testCtx.clock, clientIdleTimeout/2)
+		_, err = pgConn.Exec(ctx, "select 1").ReadAll()
+		require.NoErrorf(t, err, "failed on iteration %v", i+1)
+	}
+
+	// advance clock by full idle timeout (plus a safety margin, to allow for reads in flight to be finished), expect the client to be disconnected automatically.
+	advanceInSteps(testCtx.clock, clientIdleTimeout+time.Second*5)
+	waitForEvent(t, testCtx, events.ClientDisconnectCode)
+
+	// expect failure after timeout.
+	_, err = pgConn.Exec(ctx, "select 1").ReadAll()
+	require.Error(t, err)
+
+	require.NoError(t, pgConn.Close(ctx))
+}
+
+// advanceInSteps makes the clockwork.FakeClock behave closer to the real clock, smoothing the transition for large advances in time.
+// This works around a class of issues in the production code which expects that clock is smooth, not choppy.
+// Most testing code should NOT need to use this function.
+//
+// In technical terms, it divides the clock advancement into 100 smaller steps, with a short sleep after each one.
+func advanceInSteps(clock clockwork.FakeClock, total time.Duration) {
+	step := total / 100
+	if step <= 0 {
+		step = 1
+	}
+
+	end := clock.Now().Add(total)
+	for clock.Now().Before(end) {
+		clock.Advance(step)
+		time.Sleep(time.Millisecond * 1)
+	}
 }
 
 func TestHeartbeatEvents(t *testing.T) {
@@ -251,6 +336,76 @@ func TestHeartbeatEvents(t *testing.T) {
 	}
 }
 
+func TestDatabaseServiceHeartbeatEvents(t *testing.T) {
+	t.Run("no label when running on-prem", func(t *testing.T) {
+		ctx := context.Background()
+		var heartbeatEvents int64
+		heartbeatRecorder := func(err error) {
+			require.NoError(t, err)
+			atomic.AddInt64(&heartbeatEvents, 1)
+		}
+
+		testCtx := setupTestContext(ctx, t)
+		server := testCtx.setupDatabaseServer(ctx, t, agentParams{
+			NoStart:     true,
+			OnHeartbeat: heartbeatRecorder,
+		})
+		require.NoError(t, server.Start(ctx))
+		t.Cleanup(func() {
+			server.Close()
+		})
+
+		var listResp *types.ListResourcesResponse
+		var err error
+		require.Eventually(t, func() bool {
+			listResp, err = testCtx.authServer.ListResources(ctx, proto.ListResourcesRequest{ResourceType: types.KindDatabaseService})
+			require.NoError(t, err)
+
+			return atomic.LoadInt64(&heartbeatEvents) == 1 && len(listResp.Resources) == 1
+		}, 2*time.Second, 500*time.Millisecond)
+
+		require.NotContains(t, listResp.Resources[0].GetAllLabels(), "teleport.dev/awsoidc-agent")
+
+		dbServices, err := types.ResourcesWithLabels(listResp.Resources).AsDatabaseServices()
+		require.NoError(t, err)
+		require.Equal(t, "teleport.cluster.local", dbServices[0].GetHostname())
+	})
+	t.Run("when running as AWS OIDC ECS/Fargate Agent, it has a label indicating that", func(t *testing.T) {
+		ctx := context.Background()
+		var heartbeatEvents int64
+		heartbeatRecorder := func(err error) {
+			require.NoError(t, err)
+			atomic.AddInt64(&heartbeatEvents, 1)
+		}
+
+		t.Setenv(types.InstallMethodAWSOIDCDeployServiceEnvVar, "yes")
+		testCtx := setupTestContext(ctx, t)
+		server := testCtx.setupDatabaseServer(ctx, t, agentParams{
+			NoStart:     true,
+			OnHeartbeat: heartbeatRecorder,
+		})
+		require.NoError(t, server.Start(ctx))
+		t.Cleanup(func() {
+			server.Close()
+		})
+
+		var listResp *types.ListResourcesResponse
+		var err error
+		require.Eventually(t, func() bool {
+			listResp, err = testCtx.authServer.ListResources(ctx, proto.ListResourcesRequest{ResourceType: types.KindDatabaseService})
+			require.NoError(t, err)
+
+			return atomic.LoadInt64(&heartbeatEvents) == 1 && len(listResp.Resources) == 1
+		}, 2*time.Second, 500*time.Millisecond)
+
+		require.Contains(t, listResp.Resources[0].GetAllLabels(), "teleport.dev/awsoidc-agent")
+
+		dbServices, err := types.ResourcesWithLabels(listResp.Resources).AsDatabaseServices()
+		require.NoError(t, err)
+		require.Equal(t, "teleport.cluster.local", dbServices[0].GetHostname())
+	})
+}
+
 func TestShutdown(t *testing.T) {
 	tests := []struct {
 		name                             string
@@ -285,34 +440,48 @@ func TestShutdown(t *testing.T) {
 			})
 
 			// Validate that the server is proxying db0 after start.
-			require.Equal(t, server.getProxiedDatabases(), types.Databases{db0})
+			require.Equal(t, types.Databases{db0}, server.getProxiedDatabases())
 
-			// Validate heartbeat is present after start.
-			server.ForceHeartbeat()
-			dbServers, err := testCtx.authClient.GetDatabaseServers(ctx, apidefaults.Namespace)
-			require.NoError(t, err)
-			require.Len(t, dbServers, 1)
-			require.Equal(t, dbServers[0].GetDatabase(), db0)
+			// Validate that the heartbeat is eventually emitted and that
+			// the configured databases exist in the inventory.
+			require.EventuallyWithT(t, func(t *assert.CollectT) {
+				dbServers, err := testCtx.authClient.GetDatabaseServers(ctx, apidefaults.Namespace)
+				if !assert.NoError(t, err) {
+					return
+				}
+				if !assert.Len(t, dbServers, 1) {
+					return
+				}
+				if !assert.Empty(t, cmp.Diff(dbServers[0].GetDatabase(), db0, cmpopts.IgnoreFields(types.Metadata{}, "Revision", "Expires"))) {
+					return
+				}
+			}, 10*time.Second, 100*time.Millisecond)
 
-			// Shutdown should not return error.
-			shutdownCtx, cancel := context.WithTimeout(ctx, time.Second*5)
-			t.Cleanup(cancel)
-			if test.hasForkedChild {
-				shutdownCtx = services.ProcessForkedContext(shutdownCtx)
+			require.NoError(t, server.Shutdown(ctx))
+
+			// Send a Goodbye to simulate process shutdown.
+			if !test.hasForkedChild {
+				require.NoError(t, server.cfg.InventoryHandle.SendGoodbye(ctx))
 			}
 
-			require.NoError(t, server.Shutdown(shutdownCtx))
+			require.NoError(t, server.cfg.InventoryHandle.Close())
 
-			// Validate that the server is not proxying db0 after close.
-			require.Empty(t, server.getProxiedDatabases())
-
-			// Validate database servers based on the test.
-			dbServersAfterShutdown, err := testCtx.authClient.GetDatabaseServers(ctx, apidefaults.Namespace)
-			require.NoError(t, err)
+			// Validate db servers based on the test.
 			if test.wantDatabaseServersAfterShutdown {
-				require.Equal(t, dbServers, dbServersAfterShutdown)
+				dbServersAfterShutdown, err := server.cfg.AuthClient.GetDatabaseServers(ctx, apidefaults.Namespace)
+				require.NoError(t, err)
+				require.Len(t, dbServersAfterShutdown, 1)
+				require.Empty(t, cmp.Diff(dbServersAfterShutdown[0].GetDatabase(), db0, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 			} else {
-				require.Empty(t, dbServersAfterShutdown)
+				require.EventuallyWithT(t, func(t *assert.CollectT) {
+					dbServersAfterShutdown, err := server.cfg.AuthClient.GetDatabaseServers(ctx, apidefaults.Namespace)
+					if !assert.NoError(t, err) {
+						return
+					}
+					if !assert.Empty(t, dbServersAfterShutdown) {
+						return
+					}
+				}, 10*time.Second, 100*time.Millisecond)
 			}
 		})
 	}
@@ -428,20 +597,25 @@ func databaseServerWithActiveConnection(t *testing.T, ctx context.Context) (*Ser
 	testCtx := setupTestContext(ctx, t, withSelfHostedPostgres(databaseName))
 	go testCtx.startHandlingConnections()
 	testCtx.createUserAndRole(ctx, t, "alice", "admin", []string{"*"}, []string{"*"})
-	dbTestServer, ok := testCtx.postgres[databaseName]
-	require.True(t, ok)
 
 	connCtx, cancelConn := context.WithCancel(ctx)
 	t.Cleanup(cancelConn)
 	connErrCh := make(chan error)
 
-	go func() {
-		conn, err := testCtx.postgresClient(ctx, "alice", "postgres", "postgres", "postgres")
-		if err != nil {
-			connErrCh <- err
-			return
-		}
+	conn, err := testCtx.postgresClient(ctx, "alice", "postgres", "postgres", "postgres")
+	require.NoError(t, err, "failed to establish connection")
 
+	// Immediately sends a query. This ensures the connection is healthy and
+	// active.
+	_, err = conn.Exec(ctx, "select 1").ReadAll()
+	if err != nil {
+		conn.Close(ctx)
+		require.Fail(t, "failed to send initial query")
+	}
+
+	require.Equal(t, int32(1), testCtx.server.activeConnections.Load(), "expected one active connection, but got none")
+
+	go func() {
 		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
 		defer conn.Close(ctx)
@@ -460,25 +634,6 @@ func databaseServerWithActiveConnection(t *testing.T, ctx context.Context) (*Ser
 			}
 		}
 	}()
-
-	require.Eventually(t, func() bool {
-		select {
-		case err := <-connErrCh:
-			assert.Failf(t, "unexpected connection close", "conn error: %v", err)
-		default:
-		}
-		return testCtx.server.activeConnections.Load() == int32(1)
-	}, time.Second, 100*time.Millisecond, "expected one active connection, but got none")
-
-	// Ensures the first query has been received.
-	require.Eventually(t, func() bool {
-		select {
-		case err := <-connErrCh:
-			assert.Failf(t, "unexpected connection close", "conn error: %v", err)
-		default:
-		}
-		return dbTestServer.db.QueryCount() >= uint32(1)
-	}, time.Second, 100*time.Millisecond, "database test server hasn't received queries")
 
 	return testCtx.server, connErrCh, cancelConn
 }

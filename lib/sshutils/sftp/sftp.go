@@ -1,28 +1,32 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 // Package sftp handles file transfers client-side via SFTP.
 package sftp
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"os"
 	"path" // SFTP requires UNIX-style path separators
@@ -34,9 +38,9 @@ import (
 	"github.com/gravitational/trace"
 	"github.com/pkg/sftp"
 	"github.com/schollz/progressbar/v3"
-	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
 
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/sshutils/scp"
 )
@@ -48,6 +52,10 @@ type Options struct {
 	// PreserveAttrs preserves access and modification times
 	// from the original file
 	PreserveAttrs bool
+	// Quiet indicates whether progress should be displayed.
+	Quiet bool
+	// ProgressWriter is used to write the progress output.
+	ProgressWriter io.Writer
 }
 
 // Config describes the settings of a file transfer
@@ -62,7 +70,7 @@ type Config struct {
 	// (used only on the client)
 	ProgressStream func(fileInfo os.FileInfo) io.ReadWriter
 	// Log optionally specifies the logger
-	Log log.FieldLogger
+	Log *slog.Logger
 }
 
 // FileSystem describes file operations to be done either locally or over SFTP
@@ -214,17 +222,21 @@ func (h HTTPTransferRequest) checkDefaults() error {
 func (c *Config) setDefaults() {
 	logger := c.Log
 	if logger == nil {
-		logger = log.StandardLogger()
+		logger = slog.Default()
 	}
-	c.Log = logger.WithFields(log.Fields{
-		trace.Component: "SFTP",
-		trace.ComponentFields: log.Fields{
-			"SrcPaths":      c.srcPaths,
-			"DstPath":       c.dstPath,
-			"Recursive":     c.opts.Recursive,
-			"PreserveAttrs": c.opts.PreserveAttrs,
-		},
-	})
+	c.Log = logger.With(
+		teleport.ComponentKey, "SFTP",
+		"src_paths", c.srcPaths,
+		"dst_path", c.dstPath,
+		"recursive", c.opts.Recursive,
+		"preserve_attrs", c.opts.PreserveAttrs,
+	)
+
+	if !c.opts.Quiet {
+		c.ProgressStream = func(fileInfo os.FileInfo) io.ReadWriter {
+			return NewProgressBar(fileInfo.Size(), fileInfo.Name(), cmp.Or(c.opts.ProgressWriter, io.Writer(os.Stdout)))
+		}
+	}
 }
 
 // TransferFiles transfers files from the configured source paths to the
@@ -236,23 +248,17 @@ func (c *Config) TransferFiles(ctx context.Context, sshClient *ssh.Client) error
 	}
 	defer s.Close()
 
-	// File transfers in a moderated session require these two variables
-	// to check for approval on the ssh server. If they exist in the
-	// context, set them in our env vars
+	// File transfers in a moderated session require this variable
+	// to check for approval on the ssh server
 	if moderatedSessionID, ok := ctx.Value(ModeratedSessionID).(string); ok {
 		s.Setenv(string(ModeratedSessionID), moderatedSessionID)
 	}
-	if fileTransferRequestID, ok := ctx.Value(FileTransferRequestID).(string); ok {
-		s.Setenv(string(FileTransferRequestID), fileTransferRequestID)
-	}
-	// set dstPath in env var to check against file transfer request location
-	s.Setenv(FileTransferDstPath, c.dstPath)
 
 	pe, err := s.StderrPipe()
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	if err := s.RequestSubsystem("sftp"); err != nil {
+	if err := s.RequestSubsystem(teleport.SFTPSubsystem); err != nil {
 		// If the subsystem request failed and a generic error is
 		// returned, return the session's stderr as the error if it's
 		// non-empty, as the session's stderr may have a more useful
@@ -413,10 +419,9 @@ func (c *Config) transfer(ctx context.Context) error {
 				return trace.Wrap(err, "could not access %s path %q", c.srcFS.Type(), match)
 			}
 			if fi.IsDir() && !c.opts.Recursive {
-				// Note: using any other error constructor than BadParameter
-				// might lead to relogin attempt and a completely obscure
-				// error message
-				return trace.BadParameter("%q is a directory, but the recursive option was not passed", match)
+				// Note: Using an error constructor included in lib/client.IsErrorResolvableWithRelogin,
+				// e.g. BadParameter, will lead to relogin attempt and a completely obscure error message.
+				return trace.Wrap(&NonRecursiveDirectoryTransferError{Path: match})
 			}
 			fileInfos = append(fileInfos, fi)
 		}
@@ -481,7 +486,7 @@ func (c *Config) transfer(ctx context.Context) error {
 
 // transferDir transfers a directory
 func (c *Config) transferDir(ctx context.Context, dstPath, srcPath string, srcFileInfo os.FileInfo) error {
-	c.Log.Debugf("copying %s dir %q to %s dir %q", c.srcFS.Type(), srcPath, c.dstFS.Type(), dstPath)
+	c.Log.DebugContext(ctx, "transferring contents of directory", "source_fs", c.srcFS.Type(), "source_path", srcPath, "dest_fs", c.dstFS.Type(), "dest_path", dstPath)
 
 	err := c.dstFS.Mkdir(ctx, dstPath)
 	if err != nil && !errors.Is(err, os.ErrExist) {
@@ -525,7 +530,7 @@ func (c *Config) transferDir(ctx context.Context, dstPath, srcPath string, srcFi
 
 // transferFile transfers a file
 func (c *Config) transferFile(ctx context.Context, dstPath, srcPath string, srcFileInfo os.FileInfo) error {
-	c.Log.Debugf("copying %s file %q to %s file %q", c.srcFS.Type(), srcPath, c.dstFS.Type(), dstPath)
+	c.Log.DebugContext(ctx, "transferring file", "source_fs", c.srcFS.Type(), "source_file", srcPath, "dest_fs", c.dstFS.Type(), "dest_file", dstPath)
 
 	srcFile, err := c.srcFS.Open(ctx, srcPath)
 	if err != nil {
@@ -669,4 +674,16 @@ func NewProgressBar(size int64, desc string, writer io.Writer) *progressbar.Prog
 		progressbar.OptionFullWidth(),
 		progressbar.OptionSetRenderBlankState(true),
 	)
+}
+
+// NonRecursiveDirectoryTransferError is returned when an attempt is made
+// to download a directory without providing the recursive option.
+// It's used to distinguish this specific situation in clients which
+// do not support the recursive option.
+type NonRecursiveDirectoryTransferError struct {
+	Path string
+}
+
+func (n *NonRecursiveDirectoryTransferError) Error() string {
+	return fmt.Sprintf("%q is a directory, but the recursive option was not passed", n.Path)
 }

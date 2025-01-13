@@ -1,16 +1,20 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package servicecfg
 
@@ -24,6 +28,7 @@ import (
 	"github.com/gravitational/trace"
 
 	"github.com/gravitational/teleport/api/client/webclient"
+	"github.com/gravitational/teleport/lib/automaticupgrades"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/limiter"
 	"github.com/gravitational/teleport/lib/multiplexer"
@@ -134,10 +139,6 @@ type ProxyConfig struct {
 	// UI provides config options for the web UI
 	UI webclient.UIConfig
 
-	// AssistAPIKey is the OpenAI API key.
-	// TODO: This key will be moved to a plugin once support for plugins is implemented.
-	AssistAPIKey string
-
 	// TrustXForwardedFor enables the service to take client source IPs from
 	// the "X-Forwarded-For" headers for web APIs recevied from layer 7 load
 	// balancers or reverse proxies.
@@ -152,6 +153,16 @@ type ProxyConfig struct {
 	// as a label and used by reverse tunnel agents in proxy peering mode. Zero
 	// is a valid generation.
 	ProxyGroupGeneration uint64
+
+	// AutomaticUpgradesChannels is a map of all version channels used by the
+	// proxy built-in version server to retrieve target versions. This is part
+	// of the automatic upgrades.
+	AutomaticUpgradesChannels automaticupgrades.Channels
+
+	// QUICProxyPeering will make it so that proxy peering will support inbound
+	// QUIC connections and will use QUIC to connect to peer proxies that
+	// advertise support for it.
+	QUICProxyPeering bool
 }
 
 // WebPublicAddr returns the address for the web endpoint on this proxy that
@@ -199,18 +210,15 @@ func (c ProxyConfig) KubeAddr() (string, error) {
 }
 
 // PublicPeerAddr attempts to returns the public address the proxy advertises
-// for proxy peering clients if available. It falls back to PeerAddr othewise.
+// for proxy peering clients if available; otherwise, it falls back to trying to
+// guess an appropriate public address based on the listen address.
 func (c ProxyConfig) PublicPeerAddr() (*utils.NetAddr, error) {
 	addr := &c.PeerPublicAddr
-	if addr.IsEmpty() || addr.IsHostUnspecified() {
-		return c.PeerAddr()
+	if !addr.IsEmpty() && !addr.IsHostUnspecified() {
+		return addr, nil
 	}
-	return addr, nil
-}
 
-// PeerAddr returns the address the proxy advertises for proxy peering clients.
-func (c ProxyConfig) PeerAddr() (*utils.NetAddr, error) {
-	addr := &c.PeerAddress
+	addr = &c.PeerAddress
 	if addr.IsEmpty() {
 		addr = defaults.ProxyPeeringListenAddr()
 	}
@@ -230,6 +238,15 @@ func (c ProxyConfig) PeerAddr() (*utils.NetAddr, error) {
 	}
 
 	return addr, nil
+}
+
+// PeerListenAddr returns the proxy peering listen address that was configured,
+// or the default one otherwise.
+func (c ProxyConfig) PeerListenAddr() *utils.NetAddr {
+	if c.PeerAddress.IsEmpty() {
+		return defaults.ProxyPeeringListenAddr()
+	}
+	return &c.PeerAddress
 }
 
 // KubeProxyConfig specifies the Kubernetes configuration for Teleport's proxy service

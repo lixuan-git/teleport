@@ -1,32 +1,39 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package resources_test
 
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/gravitational/trace"
+	"github.com/stretchr/testify/require"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/gravitational/teleport/api/types"
 	resourcesv3 "github.com/gravitational/teleport/integrations/operator/apis/resources/v3"
+	"github.com/gravitational/teleport/integrations/operator/controllers/reconcilers"
+	"github.com/gravitational/teleport/integrations/operator/controllers/resources/secretlookup"
 	"github.com/gravitational/teleport/integrations/operator/controllers/resources/testlib"
 )
 
@@ -40,10 +47,12 @@ var oidcSpec = types.OIDCConnectorSpecV3{
 		Roles: []string{"roleA"},
 	}},
 	RedirectURLs: []string{"https://redirect"},
+	MaxAge:       &types.MaxAge{Value: types.Duration(time.Hour)},
 }
 
 type oidcTestingPrimitives struct {
 	setup *testSetup
+	reconcilers.ResourceWithoutLabelsAdapter[types.OIDCConnector]
 }
 
 func (g *oidcTestingPrimitives) Init(setup *testSetup) {
@@ -60,7 +69,8 @@ func (g *oidcTestingPrimitives) CreateTeleportResource(ctx context.Context, name
 		return trace.Wrap(err)
 	}
 	oidc.SetOrigin(types.OriginKubernetes)
-	return trace.Wrap(g.setup.TeleportClient.UpsertOIDCConnector(ctx, oidc))
+	_, err = g.setup.TeleportClient.CreateOIDCConnector(ctx, oidc)
+	return trace.Wrap(err)
 }
 
 func (g *oidcTestingPrimitives) GetTeleportResource(ctx context.Context, name string) (types.OIDCConnector, error) {
@@ -112,15 +122,8 @@ func (g *oidcTestingPrimitives) ModifyKubernetesResource(ctx context.Context, na
 }
 
 func (g *oidcTestingPrimitives) CompareTeleportAndKubernetesResource(tResource types.OIDCConnector, kubeResource *resourcesv3.TeleportOIDCConnector) (bool, string) {
-	teleportMap, _ := teleportResourceToMap(tResource)
-	kubernetesMap, _ := teleportResourceToMap(kubeResource.ToTeleport())
-
-	equal := cmp.Equal(teleportMap["spec"], kubernetesMap["spec"])
-	if !equal {
-		return equal, cmp.Diff(teleportMap["spec"], kubernetesMap["spec"])
-	}
-
-	return equal, ""
+	diff := cmp.Diff(tResource, kubeResource.ToTeleport(), testlib.CompareOptions()...)
+	return diff == "", diff
 }
 
 func TestOIDCConnectorCreation(t *testing.T) {
@@ -136,4 +139,52 @@ func TestOIDCConnectorDeletionDrift(t *testing.T) {
 func TestOIDCConnectorUpdate(t *testing.T) {
 	test := &oidcTestingPrimitives{}
 	testlib.ResourceUpdateTest[types.OIDCConnector, *resourcesv3.TeleportOIDCConnector](t, test)
+}
+
+func TestOIDCConnectorSecretLookup(t *testing.T) {
+	test := &oidcTestingPrimitives{}
+	setup := testlib.SetupTestEnv(t)
+	test.Init(setup)
+	ctx := context.Background()
+
+	crName := validRandomResourceName("oidc")
+	secretName := validRandomResourceName("oidc-secret")
+	secretKey := "client-secret"
+	secretValue := validRandomResourceName("secret-value")
+
+	secret := &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secretName,
+			Namespace: setup.Namespace.Name,
+			Annotations: map[string]string{
+				secretlookup.AllowLookupAnnotation: crName,
+			},
+		},
+		StringData: map[string]string{
+			secretKey: secretValue,
+		},
+		Type: v1.SecretTypeOpaque,
+	}
+	kubeClient := setup.K8sClient
+	require.NoError(t, kubeClient.Create(ctx, secret))
+
+	oidc := &resourcesv3.TeleportOIDCConnector{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      crName,
+			Namespace: setup.Namespace.Name,
+		},
+		Spec: resourcesv3.TeleportOIDCConnectorSpec(oidcSpec),
+	}
+
+	oidc.Spec.ClientSecret = "secret://" + secretName + "/" + secretKey
+
+	require.NoError(t, kubeClient.Create(ctx, oidc))
+
+	testlib.FastEventually(t, func() bool {
+		oidc, err := test.GetTeleportResource(ctx, crName)
+		if err != nil {
+			return false
+		}
+		return oidc.GetClientSecret() == secretValue
+	})
 }

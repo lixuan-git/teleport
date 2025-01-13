@@ -1,61 +1,106 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package client
 
 import (
 	"context"
 
+	"github.com/gravitational/trace"
+
 	"github.com/gravitational/teleport/api/client/proto"
-	wancli "github.com/gravitational/teleport/lib/auth/webauthncli"
-	wantypes "github.com/gravitational/teleport/lib/auth/webauthntypes"
-	"github.com/gravitational/teleport/lib/client/mfa"
+	"github.com/gravitational/teleport/api/mfa"
+	libmfa "github.com/gravitational/teleport/lib/client/mfa"
+	"github.com/gravitational/teleport/lib/client/sso"
 )
 
-// PromptMFAFunc matches the signature of [mfa.Prompt.Run].
-type PromptMFAFunc func(ctx context.Context, chal *proto.MFAAuthenticateChallenge) (*proto.MFAAuthenticateResponse, error)
-
-// WebauthnLoginFunc matches the signature of [wancli.Login].
-type WebauthnLoginFunc func(ctx context.Context, origin string, assertion *wantypes.CredentialAssertion, prompt wancli.LoginPrompt, opts *wancli.LoginOpts) (*proto.MFAAuthenticateResponse, string, error)
-
-// NewMFAPrompt creates a new MFA prompt from client settings.
-func (tc *TeleportClient) NewMFAPrompt(opts ...mfa.PromptOpt) PromptMFAFunc {
-	if tc.PromptMFAFunc != nil {
-		return tc.PromptMFAFunc
+// NewMFACeremony returns a new MFA ceremony configured for this client.
+func (tc *TeleportClient) NewMFACeremony() *mfa.Ceremony {
+	return &mfa.Ceremony{
+		CreateAuthenticateChallenge: tc.createAuthenticateChallenge,
+		PromptConstructor:           tc.NewMFAPrompt,
+		SSOMFACeremonyConstructor:   tc.NewSSOMFACeremony,
 	}
-
-	prompt := mfa.NewPrompt(tc.WebProxyAddr)
-	prompt.AuthenticatorAttachment = tc.AuthenticatorAttachment
-	prompt.PreferOTP = tc.PreferOTP
-	prompt.AllowStdinHijack = tc.AllowStdinHijack
-
-	if tc.WebauthnLogin != nil {
-		prompt.WebauthnLogin = tc.WebauthnLogin
-		prompt.WebauthnSupported = true
-	}
-
-	for _, opt := range opts {
-		opt(prompt)
-	}
-
-	return prompt.Run
 }
 
-// PromptMFA prompts for MFA for the given challenge using the clients standard settings.
-// Use [NewMFAPrompt] to create a prompt with customizable settings.
-func (tc *TeleportClient) PromptMFA(ctx context.Context, chal *proto.MFAAuthenticateChallenge) (*proto.MFAAuthenticateResponse, error) {
-	return tc.NewMFAPrompt()(ctx, chal)
+// createAuthenticateChallenge creates and returns MFA challenges for a users registered MFA devices.
+func (tc *TeleportClient) createAuthenticateChallenge(ctx context.Context, req *proto.CreateAuthenticateChallengeRequest) (*proto.MFAAuthenticateChallenge, error) {
+	clusterClient, err := tc.ConnectToCluster(ctx)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	rootClient, err := clusterClient.ConnectToRootCluster(ctx)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return rootClient.CreateAuthenticateChallenge(ctx, req)
+}
+
+// WebauthnLoginFunc is a function that performs WebAuthn login.
+// Mimics the signature of [webauthncli.Login].
+type WebauthnLoginFunc = libmfa.WebauthnLoginFunc
+
+// NewMFAPrompt creates a new MFA prompt from client settings.
+func (tc *TeleportClient) NewMFAPrompt(opts ...mfa.PromptOpt) mfa.Prompt {
+	cfg := tc.newPromptConfig(opts...)
+
+	var prompt mfa.Prompt = libmfa.NewCLIPrompt(&libmfa.CLIPromptConfig{
+		PromptConfig:     *cfg,
+		Writer:           tc.Stderr,
+		PreferOTP:        tc.PreferOTP,
+		PreferSSO:        tc.PreferSSO,
+		AllowStdinHijack: tc.AllowStdinHijack,
+		StdinFunc:        tc.StdinFunc,
+	})
+
+	if tc.MFAPromptConstructor != nil {
+		prompt = tc.MFAPromptConstructor(cfg)
+	}
+
+	return prompt
+}
+
+func (tc *TeleportClient) newPromptConfig(opts ...mfa.PromptOpt) *libmfa.PromptConfig {
+	cfg := libmfa.NewPromptConfig(tc.WebProxyAddr, opts...)
+	cfg.AuthenticatorAttachment = tc.AuthenticatorAttachment
+	if tc.WebauthnLogin != nil {
+		cfg.WebauthnLoginFunc = tc.WebauthnLogin
+		cfg.WebauthnSupported = true
+	}
+
+	return cfg
+}
+
+// NewSSOMFACeremony creates a new SSO MFA ceremony.
+func (tc *TeleportClient) NewSSOMFACeremony(ctx context.Context) (mfa.SSOMFACeremony, error) {
+	rdConfig, err := tc.ssoRedirectorConfig(ctx, "" /*connectorDisplayName*/)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	rd, err := sso.NewRedirector(rdConfig)
+	if err != nil {
+		return nil, trace.Wrap(err, "failed to create a redirector for SSO MFA")
+	}
+
+	if tc.SSOMFACeremonyConstructor != nil {
+		return tc.SSOMFACeremonyConstructor(rd), nil
+	}
+
+	return sso.NewCLIMFACeremony(rd), nil
 }

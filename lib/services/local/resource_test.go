@@ -1,18 +1,20 @@
 /*
-Copyright 2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package local
 
@@ -23,11 +25,12 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/jonboulle/clockwork"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/bcrypt"
-	"google.golang.org/protobuf/testing/protocmp"
 
+	"github.com/gravitational/teleport/api/constants"
 	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/services"
@@ -50,7 +53,35 @@ func TestCreateResourcesProvisionToken(t *testing.T) {
 	s := NewProvisioningService(tt.bk)
 	fetchedToken, err := s.GetToken(ctx, "foo")
 	require.NoError(t, err)
-	require.Empty(t, cmp.Diff(token, fetchedToken))
+	require.Empty(t, cmp.Diff(token, fetchedToken, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
+}
+
+func TestCreateResource(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	tt := setupServicesContext(ctx, t)
+	cap, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
+		Type: constants.Local,
+	})
+	require.NoError(t, err)
+
+	// Check that the initial call to CreateResources creates the given resources.
+	s, err := NewClusterConfigurationService(tt.bk)
+	require.NoError(t, err)
+	err = CreateResources(ctx, tt.bk, cap)
+	require.NoError(t, err)
+	got, err := s.GetAuthPreference(ctx)
+	require.NoError(t, err)
+	require.Equal(t, cap.GetType(), got.GetType())
+
+	// Check that already exists errors are ignored and the resource is not
+	// updated.
+	cap.SetType(constants.SAML)
+	err = CreateResources(ctx, tt.bk, cap)
+	require.NoError(t, err)
+	got, err = s.GetAuthPreference(ctx)
+	require.NoError(t, err)
+	require.NotEqual(t, cap.GetType(), got.GetType())
 }
 
 func TestUserResource(t *testing.T) {
@@ -83,19 +114,20 @@ func runUserResourceTest(
 	require.NoError(t, err)
 
 	// Check that dynamically created item is compatible with service
-	s := NewIdentityService(tt.bk)
-	b, err := s.GetUser("bob", withSecrets)
+	s, err := NewTestIdentityService(tt.bk)
 	require.NoError(t, err)
-	require.Equal(t, services.UsersEquals(bob, b), true, "dynamically inserted user does not match")
-	allUsers, err := s.GetUsers(withSecrets)
+	b, err := s.GetUser(ctx, "bob", withSecrets)
 	require.NoError(t, err)
-	require.Equal(t, len(allUsers), 2, "expected exactly two users")
+	require.True(t, services.UsersEquals(bob, b), "dynamically inserted user does not match")
+	allUsers, err := s.GetUsers(ctx, withSecrets)
+	require.NoError(t, err)
+	require.Len(t, allUsers, 2, "expected exactly two users")
 	for _, user := range allUsers {
 		switch user.GetName() {
 		case "alice":
-			require.Equal(t, services.UsersEquals(alice, user), true, "alice does not match")
+			require.True(t, services.UsersEquals(alice, user), "alice does not match")
 		case "bob":
-			require.Equal(t, services.UsersEquals(bob, user), true, "bob does not match")
+			require.True(t, services.UsersEquals(bob, user), "bob does not match")
 		default:
 			t.Errorf("Unexpected user %q", user.GetName())
 		}
@@ -103,9 +135,9 @@ func runUserResourceTest(
 
 	// Advance the clock to let the users to expire.
 	tt.bk.Clock().(clockwork.FakeClock).Advance(2 * time.Minute)
-	allUsers, err = s.GetUsers(withSecrets)
+	allUsers, err = s.GetUsers(ctx, withSecrets)
 	require.NoError(t, err)
-	require.Equal(t, len(allUsers), 0, "expected all users to expire")
+	require.Empty(t, allUsers, "expected all users to expire")
 }
 
 func TestCertAuthorityResource(t *testing.T) {
@@ -154,7 +186,7 @@ func TestTrustedClusterResource(t *testing.T) {
 	err = CreateResources(ctx, tt.bk, foo, bar)
 	require.NoError(t, err)
 
-	s := NewPresenceService(tt.bk)
+	s := NewCAService(tt.bk)
 	_, err = s.GetTrustedCluster(ctx, "foo")
 	require.NoError(t, err)
 	_, err = s.GetTrustedCluster(ctx, "bar")
@@ -194,7 +226,8 @@ func TestGithubConnectorResource(t *testing.T) {
 	err := CreateResources(ctx, tt.bk, connector)
 	require.NoError(t, err)
 
-	s := NewIdentityService(tt.bk)
+	s, err := NewTestIdentityService(tt.bk)
+	require.NoError(t, err)
 	_, err = s.GetGithubConnector(ctx, "github", true)
 	require.NoError(t, err)
 }
@@ -228,6 +261,7 @@ func newUserTestCase(t *testing.T, name string, roles []string, withSecrets bool
 	if withSecrets {
 		auth := localAuthSecretsTestCase(t)
 		user.SetLocalAuth(&auth)
+		user.SetWeakestDevice(types.MFADeviceKind_MFA_DEVICE_KIND_TOTP)
 	}
 	return &user
 }
@@ -248,5 +282,5 @@ func TestBootstrapLock(t *testing.T) {
 
 	l, err := tt.suite.Access.GetLock(ctx, "test")
 	require.NoError(t, err)
-	require.Empty(t, cmp.Diff(nl, l, protocmp.Transform()))
+	require.Empty(t, cmp.Diff(nl, l, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 }

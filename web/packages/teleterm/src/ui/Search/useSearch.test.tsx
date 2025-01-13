@@ -1,34 +1,37 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React from 'react';
-import { renderHook } from '@testing-library/react-hooks';
+import { renderHook } from '@testing-library/react';
 
-import { ServerUri } from 'teleterm/ui/uri';
-import { MockAppContext } from 'teleterm/ui/fixtures/mocks';
-import { SearchResult } from 'teleterm/ui/services/resources';
+import { ShowResources } from 'gen-proto-ts/teleport/lib/teleterm/v1/cluster_pb';
+
 import {
-  makeServer,
   makeKube,
   makeLabelsList,
+  makeLeafCluster,
   makeRootCluster,
+  makeServer,
 } from 'teleterm/services/tshd/testHelpers';
+import { MockAppContext } from 'teleterm/ui/fixtures/mocks';
+import { SearchResult } from 'teleterm/ui/services/resources';
+import { ServerUri } from 'teleterm/ui/uri';
 
 import { MockAppContextProvider } from '../fixtures/MockAppContextProvider';
-
 import { makeResourceResult } from './testHelpers';
 import { rankResults, useFilterSearch, useResourceSearch } from './useSearch';
 
@@ -52,11 +55,38 @@ describe('rankResults', () => {
     expect(sortedResults[1]).toEqual(server);
   });
 
+  it('prefers accessible resources over requestable ones', () => {
+    const serverAccessible = makeResourceResult({
+      kind: 'server',
+      resource: makeServer({ hostname: 'sales-foo' }),
+    });
+    const serverRequestable = makeResourceResult({
+      kind: 'server',
+      resource: makeServer({ hostname: 'sales-bar' }),
+      requiresRequest: true,
+    });
+    const labelMatch = makeResourceResult({
+      kind: 'server',
+      resource: makeServer({
+        hostname: 'lorem-ipsum',
+        labels: makeLabelsList({ foo: 'sales' }),
+      }),
+    });
+    const sortedResults = rankResults(
+      [labelMatch, serverRequestable, serverAccessible],
+      'sales'
+    );
+
+    expect(sortedResults[0].resource).toEqual(serverAccessible.resource);
+    expect(sortedResults[1].resource).toEqual(serverRequestable.resource);
+    expect(sortedResults[2].resource).toEqual(labelMatch.resource);
+  });
+
   it('saves individual label match scores', () => {
     const server = makeResourceResult({
       kind: 'server',
       resource: makeServer({
-        labelsList: makeLabelsList({ quux: 'bar-baz', foo: 'bar' }),
+        labels: makeLabelsList({ quux: 'bar-baz', foo: 'bar' }),
       }),
     });
 
@@ -85,7 +115,7 @@ describe('rankResults', () => {
         makeResourceResult({
           kind: 'server',
           resource: makeServer({
-            labelsList: makeLabelsList({ foo: 'bar1' }),
+            labels: makeLabelsList({ foo: 'bar1' }),
           }),
         })
       );
@@ -97,7 +127,7 @@ describe('rankResults', () => {
         kind: 'server',
         resource: makeServer({
           uri: lowestScoreServerUri,
-          labelsList: makeLabelsList({ foo: 'bar123456' }),
+          labels: makeLabelsList({ foo: 'bar123456' }),
         }),
       })
     );
@@ -109,7 +139,7 @@ describe('rankResults', () => {
         kind: 'server',
         resource: makeServer({
           uri: highestScoreServerUri,
-          labelsList: makeLabelsList({ foo: 'bar' }),
+          labels: makeLabelsList({ foo: 'bar' }),
         }),
       })
     );
@@ -138,10 +168,11 @@ describe('useResourceSearch', () => {
       .map(() => ({
         kind: 'server' as const,
         resource: makeServer({}),
+        requiresRequest: false,
       }));
     jest
       .spyOn(appContext.resourcesService, 'searchResources')
-      .mockResolvedValue([{ status: 'fulfilled', value: servers }]);
+      .mockResolvedValue(servers);
 
     const { result } = renderHook(() => useResourceSearch(), {
       wrapper: ({ children }) => (
@@ -150,14 +181,15 @@ describe('useResourceSearch', () => {
         </MockAppContextProvider>
       ),
     });
-    const searchResult = await result.current('foo', []);
+    const searchResult = await result.current('foo', [], false);
 
     expect(searchResult.results).toEqual(servers);
     expect(appContext.resourcesService.searchResources).toHaveBeenCalledWith({
       clusterUri: cluster.uri,
       search: 'foo',
-      filter: undefined,
+      filters: [],
       limit: 100,
+      includeRequestable: false,
     });
     expect(appContext.resourcesService.searchResources).toHaveBeenCalledTimes(
       1
@@ -172,7 +204,7 @@ describe('useResourceSearch', () => {
     });
     jest
       .spyOn(appContext.resourcesService, 'searchResources')
-      .mockResolvedValue([{ status: 'fulfilled', value: [] }]);
+      .mockResolvedValue([]);
 
     const { result } = renderHook(() => useResourceSearch(), {
       wrapper: ({ children }) => (
@@ -182,13 +214,14 @@ describe('useResourceSearch', () => {
       ),
     });
     const filter = { filter: 'cluster' as const, clusterUri: cluster.uri };
-    await result.current('', [filter]);
+    await result.current('', [filter], false);
 
     expect(appContext.resourcesService.searchResources).toHaveBeenCalledWith({
       clusterUri: cluster.uri,
       search: '',
-      filter: undefined,
-      limit: 5,
+      filters: [],
+      limit: 10,
+      includeRequestable: false,
     });
     expect(appContext.resourcesService.searchResources).toHaveBeenCalledTimes(
       1
@@ -203,7 +236,7 @@ describe('useResourceSearch', () => {
     });
     jest
       .spyOn(appContext.resourcesService, 'searchResources')
-      .mockResolvedValue([{ status: 'fulfilled', value: [] }]);
+      .mockResolvedValue([]);
 
     const { result } = renderHook(() => useResourceSearch(), {
       wrapper: ({ children }) => (
@@ -212,12 +245,102 @@ describe('useResourceSearch', () => {
         </MockAppContextProvider>
       ),
     });
-    await result.current('', []);
+    await result.current('', [], false);
     expect(appContext.resourcesService.searchResources).not.toHaveBeenCalled();
+  });
+
+  it('does not fetch any resources if advanced search is enabled', async () => {
+    const appContext = new MockAppContext();
+    const cluster = makeRootCluster();
+    appContext.clustersService.setState(draftState => {
+      draftState.clusters.set(cluster.uri, cluster);
+    });
+    jest
+      .spyOn(appContext.resourcesService, 'searchResources')
+      .mockResolvedValue([]);
+
+    const { result } = renderHook(() => useResourceSearch(), {
+      wrapper: ({ children }) => (
+        <MockAppContextProvider appContext={appContext}>
+          {children}
+        </MockAppContextProvider>
+      ),
+    });
+    await result.current('foo', [], true);
+    expect(appContext.resourcesService.searchResources).not.toHaveBeenCalled();
+  });
+
+  it('fetches requestable resources for leaves if the root cluster allows it', async () => {
+    const appContext = new MockAppContext();
+    const rootCluster = makeRootCluster({
+      showResources: ShowResources.REQUESTABLE,
+      features: { advancedAccessWorkflows: true, isUsageBasedBilling: false },
+    });
+    const leafCluster = makeLeafCluster({
+      showResources: ShowResources.UNSPECIFIED,
+    });
+    appContext.clustersService.setState(draftState => {
+      draftState.clusters.set(rootCluster.uri, rootCluster);
+      draftState.clusters.set(leafCluster.uri, leafCluster);
+    });
+    jest
+      .spyOn(appContext.resourcesService, 'searchResources')
+      .mockResolvedValue([]);
+
+    const { result } = renderHook(() => useResourceSearch(), {
+      wrapper: ({ children }) => (
+        <MockAppContextProvider appContext={appContext}>
+          {children}
+        </MockAppContextProvider>
+      ),
+    });
+    await result.current('foo', [], false);
+    expect(appContext.resourcesService.searchResources).toHaveBeenCalledTimes(
+      2
+    );
+    expect(appContext.resourcesService.searchResources).toHaveBeenCalledWith({
+      clusterUri: rootCluster.uri,
+      filters: [],
+      includeRequestable: true,
+      limit: 100,
+      search: 'foo',
+    });
+    expect(appContext.resourcesService.searchResources).toHaveBeenCalledWith({
+      clusterUri: leafCluster.uri,
+      filters: [],
+      includeRequestable: true,
+      limit: 100,
+      search: 'foo',
+    });
   });
 });
 
 describe('useFiltersSearch', () => {
+  it('resource type filter is matched by the readable name', () => {
+    const appContext = new MockAppContext();
+    appContext.clustersService.setState(draftState => {
+      const rootCluster = makeRootCluster();
+      draftState.clusters.set(rootCluster.uri, rootCluster);
+    });
+
+    const { result } = renderHook(() => useFilterSearch(), {
+      wrapper: ({ children }) => (
+        <MockAppContextProvider appContext={appContext}>
+          {children}
+        </MockAppContextProvider>
+      ),
+    });
+    const clusterFilters = result.current('serv', []);
+    expect(clusterFilters).toEqual([
+      {
+        kind: 'resource-type-filter',
+        resource: 'node',
+        nameMatch: 'serv',
+        score: 100,
+      },
+    ]);
+  });
+
   it('does not return cluster filters if there is only one cluster', () => {
     const appContext = new MockAppContext();
     appContext.clustersService.setState(draftState => {

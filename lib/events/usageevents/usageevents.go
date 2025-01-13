@@ -1,26 +1,27 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package usageevents
 
 import (
+	"cmp"
 	"context"
-
-	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
+	"log/slog"
 
 	"github.com/gravitational/teleport"
 	apievents "github.com/gravitational/teleport/api/types/events"
@@ -30,8 +31,8 @@ import (
 // UsageLogger is a trivial audit log sink that forwards an anonymized subset of
 // audit log events to Teleport.
 type UsageLogger struct {
-	// Entry is a log entry
-	*logrus.Entry
+	// logger emits log messages
+	logger *slog.Logger
 
 	// inner is a wrapped audit log implementation
 	inner apievents.Emitter
@@ -58,10 +59,11 @@ func (u *UsageLogger) reportAuditEvent(ctx context.Context, event apievents.Audi
 }
 
 func (u *UsageLogger) EmitAuditEvent(ctx context.Context, event apievents.AuditEvent) error {
+	ctx = context.WithoutCancel(ctx)
 	if err := u.reportAuditEvent(ctx, event); err != nil {
 		// We don't ever want this to fail or bubble up errors, so the best we
 		// can do is complain to the logs.
-		u.Warnf("Failed to filter audit event: %+v", err)
+		u.logger.WarnContext(ctx, "Failed to filter audit event", "error", err)
 	}
 
 	if u.inner != nil {
@@ -74,16 +76,10 @@ func (u *UsageLogger) EmitAuditEvent(ctx context.Context, event apievents.AuditE
 // New creates a new usage event IAuditLog impl, which wraps another IAuditLog
 // impl and forwards a subset of audit log events to the cluster UsageReporter
 // service.
-func New(reporter usagereporter.UsageReporter, log logrus.FieldLogger, inner apievents.Emitter) (*UsageLogger, error) {
-	if log == nil {
-		log = logrus.StandardLogger()
-	}
-
+func New(reporter usagereporter.UsageReporter, log *slog.Logger, inner apievents.Emitter) (*UsageLogger, error) {
+	logger := cmp.Or(log, slog.Default())
 	return &UsageLogger{
-		Entry: log.WithField(
-			trace.Component,
-			teleport.Component(teleport.ComponentUsageReporting),
-		),
+		logger:   logger.With(teleport.ComponentKey, teleport.ComponentUsageReporting),
 		reporter: reporter,
 		inner:    inner,
 	}, nil

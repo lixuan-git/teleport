@@ -1,16 +1,20 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package watcherjob
 
@@ -39,6 +43,7 @@ const (
 )
 
 type EventFunc func(context.Context, types.Event) error
+type WatchInitFunc func(types.WatchStatus)
 
 type Config struct {
 	Watch            types.Watch
@@ -49,10 +54,11 @@ type Config struct {
 
 type job struct {
 	lib.ServiceJob
-	config    Config
-	eventFunc EventFunc
-	events    types.Events
-	eventCh   chan *types.Event
+	config          Config
+	eventFunc       EventFunc
+	events          types.Events
+	eventCh         chan *types.Event
+	onWatchInitFunc WatchInitFunc
 }
 
 type eventKey struct {
@@ -64,7 +70,17 @@ func NewJob(client teleport.Client, config Config, fn EventFunc) (lib.ServiceJob
 	return NewJobWithEvents(client, config, fn)
 }
 
+// NewJobWithConfirmedWatchKinds returns a new watcherJob and passes confirmed watch kinds
+// from the initialisation down confirmedWatchKindsCh.
+func NewJobWithConfirmedWatchKinds(events types.Events, config Config, fn EventFunc, watchInitFunc WatchInitFunc) (lib.ServiceJob, error) {
+	return newJobWithEvents(events, config, fn, watchInitFunc)
+}
+
 func NewJobWithEvents(events types.Events, config Config, fn EventFunc) (lib.ServiceJob, error) {
+	return newJobWithEvents(events, config, fn, nil)
+}
+
+func newJobWithEvents(events types.Events, config Config, fn EventFunc, watchInitFunc WatchInitFunc) (job, error) {
 	if config.MaxConcurrency == 0 {
 		config.MaxConcurrency = DefaultMaxConcurrency
 	}
@@ -74,15 +90,16 @@ func NewJobWithEvents(events types.Events, config Config, fn EventFunc) (lib.Ser
 	if flagVar := os.Getenv(failFastEnvVarName); !config.FailFast && flagVar != "" {
 		flag, err := strconv.ParseBool(flagVar)
 		if err != nil {
-			return nil, trace.WrapWithMessage(err, "failed to parse content '%s' of the %s environment variable", flagVar, failFastEnvVarName)
+			return job{}, trace.WrapWithMessage(err, "failed to parse content '%s' of the %s environment variable", flagVar, failFastEnvVarName)
 		}
 		config.FailFast = flag
 	}
 	job := job{
-		events:    events,
-		config:    config,
-		eventFunc: fn,
-		eventCh:   make(chan *types.Event, config.MaxConcurrency),
+		events:          events,
+		config:          config,
+		eventFunc:       fn,
+		eventCh:         make(chan *types.Event, config.MaxConcurrency),
+		onWatchInitFunc: watchInitFunc,
 	}
 	job.ServiceJob = lib.NewServiceJob(func(ctx context.Context) error {
 		process := lib.MustGetProcess(ctx)
@@ -106,30 +123,31 @@ func NewJobWithEvents(events types.Events, config Config, fn EventFunc) (lib.Ser
 			// We are not supporting liveness/readiness yet, but if we do it would make sense to use job's readiness
 			job.SetReady(false)
 
+			// Note: we must always return an error, even if everything went great and we're doing a graceful shutdown.
+			// The process library will trigger a complete shutdown only if the critical job exits with an error.
 			switch {
 			case trace.IsConnectionProblem(err):
 				if config.FailFast {
 					return trace.WrapWithMessage(err, "Connection problem detected. Exiting as fail fast is on.")
 				}
-				log.WithError(err).Error("Connection problem detected. Attempting to reconnect.")
+				log.ErrorContext(ctx, "Connection problem detected, attempting to reconnect", "error", err)
 			case errors.Is(err, io.EOF):
 				if config.FailFast {
 					return trace.WrapWithMessage(err, "Watcher stream closed. Exiting as fail fast is on.")
 				}
-				log.WithError(err).Error("Watcher stream closed. Attempting to reconnect.")
+				log.ErrorContext(ctx, "Watcher stream closed attempting to reconnect", "error", err)
 			case lib.IsCanceled(err):
-				log.Debug("Watcher context is canceled")
-				// Context cancellation is not an error
-				return nil
+				log.DebugContext(ctx, "Watcher context is canceled")
+				return trace.Wrap(err)
 			default:
-				log.WithError(err).Error("Watcher event loop failed")
+				log.ErrorContext(ctx, "Watcher event loop failed", "error", err)
 				return trace.Wrap(err)
 			}
 
 			// To mitigate a potentially aggressive retry loop, we wait
 			if err := bk.Do(ctx); err != nil {
-				log.Debug("Watcher context was canceled while waiting before a reconnection")
-				return nil
+				log.DebugContext(ctx, "Watcher context was canceled while waiting before a reconnection")
+				return trace.Wrap(err)
 			}
 		}
 	})
@@ -144,7 +162,7 @@ func (job job) watchEvents(ctx context.Context) error {
 	}
 	defer func() {
 		if err := watcher.Close(); err != nil {
-			logger.Get(ctx).WithError(err).Error("Failed to close a watcher")
+			logger.Get(ctx).ErrorContext(ctx, "Failed to close a watcher", "error", err)
 		}
 	}()
 
@@ -152,7 +170,7 @@ func (job job) watchEvents(ctx context.Context) error {
 		return trace.Wrap(err)
 	}
 
-	logger.Get(ctx).Debug("Watcher connected")
+	logger.Get(ctx).DebugContext(ctx, "Watcher connected")
 	job.SetReady(true)
 
 	for {
@@ -168,7 +186,10 @@ func (job job) watchEvents(ctx context.Context) error {
 					return trace.Wrap(ctx.Err())
 				}
 			}
-			return trace.Wrap(watcher.Error())
+			if err := watcher.Error(); err != nil {
+				return trace.Wrap(err)
+			}
+			return trace.Errorf("watcher closed without error")
 		}
 	}
 }
@@ -179,6 +200,11 @@ func (job job) waitInit(ctx context.Context, watcher types.Watcher, timeout time
 	case event := <-watcher.Events():
 		if event.Type != types.OpInit {
 			return trace.ConnectionProblem(nil, "unexpected event type %q", event.Type)
+		}
+		if watchStatus, ok := event.Resource.(types.WatchStatus); ok {
+			if job.onWatchInitFunc != nil {
+				job.onWatchInitFunc(watchStatus)
+			}
 		}
 		return nil
 	case <-time.After(timeout):
@@ -227,7 +253,7 @@ func (job job) eventLoop(ctx context.Context) error {
 			event := *eventPtr
 			resource := event.Resource
 			if resource == nil {
-				log.Error("received an event with empty resource field")
+				log.ErrorContext(ctx, "received an event with empty resource field")
 			}
 			key := eventKey{kind: resource.GetKind(), name: resource.GetName()}
 			if queue, loaded := queues[key]; loaded {

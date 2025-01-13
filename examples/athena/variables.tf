@@ -43,3 +43,45 @@ variable "table_name" {
 variable "workgroup" {
   description = "Name of Athena workgroup"
 }
+
+variable "workgroup_max_scanned_bytes_per_query" {
+  description = "Limit per query of max scanned bytes"
+  default     = 1073741824 # 1GB
+}
+
+# search_event_limiter variables allows to configured rate limit on top of
+# search events API to prevent increasing costs in case of aggressive use of API.
+# In current version Athena Audit logger is not prepared for polling of API.
+# Burst=20, time=1m and amount=5, means that you can do 20 requests without any
+# throttling, next requests will be throttled, and tokens will be filled to
+# rate limit bucket at amount 5 every 1m.
+variable "search_event_limiter_burst" {
+  description = "Number of tokens available for rate limit used on top of search event API"
+  default     = 20
+}
+
+variable "search_event_limiter_time" {
+  description = "Duration between the addition of tokens to the bucket for rate limit used on top of search event API"
+  default     = "1m"
+}
+
+variable "search_event_limiter_amount" {
+  description = "Number of tokens added to the bucket during specific interval for rate limit used on top of search event API"
+  default     = 5
+}
+
+variable "access_monitoring_trusted_relationship_role_arn" {
+  description = "AWS Role ARN that will be used to configure trusted relationship between provided role and Access Monitoring role allowing to assume Access Monitoring role by the provided role"
+  default     = ""
+}
+
+variable "access_monitoring" {
+  description = "Enabled Access Monitoring"
+  type        = bool
+  default     = false
+}
+
+variable "access_monitoring_prefix" {
+  description = "Prefix for resources created by Access Monitoring"
+  default     = ""
+}

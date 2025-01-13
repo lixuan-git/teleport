@@ -1,18 +1,20 @@
 /*
-Copyright 2020-2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package common
 
@@ -24,16 +26,18 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/ghodss/yaml"
 	"github.com/gravitational/trace"
 	dockerterm "github.com/moby/term"
-	"golang.org/x/exp/slices"
+	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -60,8 +64,9 @@ import (
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/api/utils/keypaths"
 	"github.com/gravitational/teleport/lib/asciitable"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/client"
+	kubeclient "github.com/gravitational/teleport/lib/client/kube"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/kube/kubeconfig"
 	kubeutils "github.com/gravitational/teleport/lib/kube/utils"
@@ -112,14 +117,13 @@ func newKubeJoinCommand(parent *kingpin.CmdClause) *kubeJoinCommand {
 }
 
 func (c *kubeJoinCommand) getSessionMeta(ctx context.Context, tc *client.TeleportClient) (types.SessionTracker, error) {
-	proxy, err := tc.ConnectToProxy(ctx)
+	clusterClient, err := tc.ConnectToCluster(ctx)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	site := proxy.CurrentCluster()
-
-	return site.GetSessionTracker(ctx, c.session)
+	tracker, err := clusterClient.AuthClient.GetSessionTracker(ctx, c.session)
+	return tracker, trace.Wrap(err)
 }
 
 func (c *kubeJoinCommand) run(cf *CLIConf) error {
@@ -142,10 +146,10 @@ func (c *kubeJoinCommand) run(cf *CLIConf) error {
 
 	cluster := meta.GetClusterName()
 	kubeCluster := meta.GetKubeCluster()
-	var k *client.Key
+	var k *client.KeyRing
 
 	// Try loading existing keys.
-	k, err = tc.LocalAgent().GetKey(cluster, client.WithKubeCerts{})
+	k, err = tc.LocalAgent().GetKeyRing(cluster, client.WithKubeCerts{})
 	if err != nil && !trace.IsNotFound(err) {
 		return trace.Wrap(err)
 	}
@@ -158,7 +162,7 @@ func (c *kubeJoinCommand) run(cf *CLIConf) error {
 			return trace.Wrap(err)
 		}
 		if crt != nil && time.Until(crt.NotAfter) > time.Minute {
-			log.Debugf("Re-using existing TLS cert for kubernetes cluster %q", kubeCluster)
+			logger.DebugContext(cf.Context, "Re-using existing TLS cert for kubernetes cluster", "cluster", kubeCluster)
 		} else {
 			err = client.RetryWithRelogin(cf.Context, tc, func() error {
 				var err error
@@ -175,7 +179,7 @@ func (c *kubeJoinCommand) run(cf *CLIConf) error {
 			}
 
 			// Cache the new cert on disk for reuse.
-			if err := tc.LocalAgent().AddKubeKey(k); err != nil {
+			if err := tc.LocalAgent().AddKubeKeyRing(k); err != nil {
 				return trace.Wrap(err)
 			}
 		}
@@ -509,7 +513,7 @@ type kubeSessionsCommand struct {
 
 func newKubeSessionsCommand(parent *kingpin.CmdClause) *kubeSessionsCommand {
 	c := &kubeSessionsCommand{
-		CmdClause: parent.Command("sessions", "Get a list of active Kubernetes sessions."),
+		CmdClause: parent.Command("sessions", "Get a list of active Kubernetes sessions. (DEPRECATED: use tsh sessions ls --kind=kube instead)"),
 	}
 	c.Flag("format", defaults.FormatFlagDescription(defaults.DefaultFormats...)).Short('f').Default(teleport.Text).EnumVar(&c.format, defaults.DefaultFormats...)
 	c.Flag("cluster", clusterHelp).Short('c').StringVar(&c.siteName)
@@ -525,63 +529,19 @@ func (c *kubeSessionsCommand) run(cf *CLIConf) error {
 		return trace.Wrap(err)
 	}
 
-	proxy, err := tc.ConnectToProxy(cf.Context)
+	clusterClient, err := tc.ConnectToCluster(cf.Context)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	defer clusterClient.Close()
+
+	sessions, err := clusterClient.AuthClient.GetActiveSessionTrackers(cf.Context)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
-	site := proxy.CurrentCluster()
-	sessions, err := site.GetActiveSessionTrackers(cf.Context)
-	if err != nil {
-		return trace.Wrap(err)
-	}
-
-	filteredSessions := make([]types.SessionTracker, 0)
-	for _, session := range sessions {
-		if session.GetSessionKind() == types.KubernetesSessionKind {
-			filteredSessions = append(filteredSessions, session)
-		}
-	}
-
-	sort.Slice(filteredSessions, func(i, j int) bool {
-		return filteredSessions[i].GetCreated().Before(filteredSessions[j].GetCreated())
-	})
-
-	format := strings.ToLower(c.format)
-	switch format {
-	case teleport.Text, "":
-		printSessions(cf.Stdout(), filteredSessions)
-	case teleport.JSON, teleport.YAML:
-		out, err := serializeKubeSessions(sessions, format)
-		if err != nil {
-			return trace.Wrap(err)
-		}
-		fmt.Fprintln(cf.Stdout(), out)
-	default:
-		return trace.BadParameter("unsupported format %q", c.format)
-	}
-	return nil
-}
-
-func serializeKubeSessions(sessions []types.SessionTracker, format string) (string, error) {
-	var out []byte
-	var err error
-	if format == teleport.JSON {
-		out, err = utils.FastMarshalIndent(sessions, "", "  ")
-	} else {
-		out, err = yaml.Marshal(sessions)
-	}
-	return string(out), trace.Wrap(err)
-}
-
-func printSessions(output io.Writer, sessions []types.SessionTracker) {
-	table := asciitable.MakeTable([]string{"ID", "State", "Created", "Hostname", "Address", "Login", "Reason"})
-	for _, s := range sessions {
-		table.AddRow([]string{s.GetSessionID(), s.GetState().String(), s.GetCreated().Format(time.RFC3339), s.GetHostname(), s.GetAddress(), s.GetLogin(), s.GetReason()})
-	}
-
-	tableOutput := table.AsBuffer().String()
-	fmt.Fprintln(output, tableOutput)
+	filteredSessions := sortAndFilterSessions(sessions, []types.SessionKind{types.KubernetesSessionKind})
+	return trace.Wrap(serializeSessions(filteredSessions, strings.ToLower(c.format), cf.Stdout()))
 }
 
 type kubeCredentialsCommand struct {
@@ -624,7 +584,7 @@ func takeKubeCredLock(ctx context.Context, homePath, proxy string, lockTimeout t
 	// If kube credentials lockfile already exists, it means last time kube credentials was called
 	// we had an error while trying to issue certificate, return an error asking user to login manually.
 	if _, err := os.Stat(kubeCredLockfilePath); err == nil {
-		log.Debugf("Kube credentials lockfile was found at %q, aborting.", kubeCredLockfilePath)
+		logger.DebugContext(ctx, "Kube credentials lock file was found, aborting", "lock_file", kubeCredLockfilePath)
 		return nil, trace.Wrap(errKubeCredLockfileFound)
 	}
 
@@ -634,7 +594,7 @@ func takeKubeCredLock(ctx context.Context, homePath, proxy string, lockTimeout t
 	// Take a lock while we're trying to issue certificate and possibly relogin
 	unlock, err := utils.FSTryWriteLockTimeout(ctx, kubeCredLockfilePath, lockTimeout)
 	if err != nil {
-		log.Debugf("could not take kube credentials lock: %v", err.Error())
+		logger.DebugContext(ctx, "could not take kube credentials lock", "error", err)
 		return nil, trace.Wrap(errKubeCredLockfileFound)
 	}
 
@@ -642,14 +602,17 @@ func takeKubeCredLock(ctx context.Context, homePath, proxy string, lockTimeout t
 		// We must unlock the lockfile before removing it, otherwise unlock operation will fail
 		// on Windows.
 		if err := unlock(); err != nil {
-			log.WithError(err).Warnf("could not unlock kube credentials lock")
+			logger.WarnContext(ctx, "could not unlock kube credentials lock", "error", err)
 		}
 		if !removeFile {
 			return
 		}
 		// Remove kube credentials lockfile.
 		if err = os.Remove(kubeCredLockfilePath); err != nil && !os.IsNotExist(err) {
-			log.WithError(err).Warnf("could not remove kube credentials lockfile %q", kubeCredLockfilePath)
+			logger.WarnContext(ctx, "could not remove kube credentials lock file",
+				"lock_file", kubeCredLockfilePath,
+				"error", err,
+			)
 		}
 	}, nil
 }
@@ -670,22 +633,23 @@ func (c *kubeCredentialsCommand) run(cf *CLIConf) error {
 	// This operation takes a long time when the store has a lot of keys and when
 	// we call the function multiple times in parallel.
 	// Although client.LoadKeysToKubeFromStore function speeds up the process since
-	// it removes all transversals, it still has to read 2 different files from the disk:
-	// - $TSH_HOME/keys/$PROXY/$USER-kube/$TELEPORT_CLUSTER/$KUBE_CLUSTER-x509.pem
-	// - $TSH_HOME/keys/$PROXY/$USER
+	// it removes all transversals, it still has to read 2 different files from
+	// the disk and acquire a read lock on the key file:
+	// - $TSH_HOME/keys/$PROXY/$USER-kube/$TELEPORT_CLUSTER/$KUBE_CLUSTER.crt
+	// - $TSH_HOME/keys/$PROXY/$USER-kube/$TELEPORT_CLUSTER/$KUBE_CLUSTER.key
 	//
 	// In addition to these files, $TSH_HOME/$profile.yaml is also read from
 	// cf.GetProfile call above.
-	if kubeCert, privKey, err := client.LoadKeysToKubeFromStore(
+	if keyPEM, certPEM, err := client.LoadKeysToKubeFromStore(
 		profile,
 		cf.HomePath,
 		c.teleportCluster,
 		c.kubeCluster,
 	); err == nil {
-		crt, _ := tlsca.ParseCertificatePEM(kubeCert)
+		crt, _ := tlsca.ParseCertificatePEM(certPEM)
 		if crt != nil && time.Until(crt.NotAfter) > time.Minute {
-			log.Debugf("Re-using existing TLS cert for Kubernetes cluster %q", c.kubeCluster)
-			return c.writeByteResponse(cf.Stdout(), kubeCert, privKey, crt.NotAfter)
+			logger.DebugContext(cf.Context, "Re-using existing TLS cert for Kubernetes cluster", "cluster", c.kubeCluster)
+			return c.writeByteResponse(cf.Stdout(), certPEM, keyPEM, crt.NotAfter)
 		}
 	}
 
@@ -703,7 +667,7 @@ func (c *kubeCredentialsCommand) issueCert(cf *CLIConf) error {
 
 	_, span := tc.Tracer.Start(cf.Context, "tsh.kubeCredentials/GetKey")
 	// Try loading existing keys.
-	k, err := tc.LocalAgent().GetKey(c.teleportCluster, client.WithKubeCerts{})
+	k, err := tc.LocalAgent().GetKeyRing(c.teleportCluster, client.WithKubeCerts{})
 	span.End()
 
 	if err != nil && !trace.IsNotFound(err) {
@@ -719,7 +683,7 @@ func (c *kubeCredentialsCommand) issueCert(cf *CLIConf) error {
 			return trace.Wrap(err)
 		}
 		if crt != nil && time.Until(crt.NotAfter) > time.Minute {
-			log.Debugf("Re-using existing TLS cert for Kubernetes cluster %q", c.kubeCluster)
+			logger.DebugContext(cf.Context, "Re-using existing TLS cert for Kubernetes cluster", "cluster", c.kubeCluster)
 
 			return c.writeKeyResponse(cf.Stdout(), k, c.kubeCluster)
 		}
@@ -727,7 +691,7 @@ func (c *kubeCredentialsCommand) issueCert(cf *CLIConf) error {
 		// a new one.
 	}
 
-	log.Debugf("Requesting TLS cert for Kubernetes cluster %q", c.kubeCluster)
+	logger.DebugContext(cf.Context, "Requesting TLS cert for Kubernetes cluster", "cluster", c.kubeCluster)
 	var unlockKubeCred func(bool)
 	deleteKubeCredsLock := false
 	defer func() {
@@ -769,7 +733,12 @@ func (c *kubeCredentialsCommand) issueCert(cf *CLIConf) error {
 				if cf.MockSSOLogin != nil {
 					lockTimeout = utils.FSLockRetryDelay
 				}
-				unlockKubeCred, err = takeKubeCredLock(cf.Context, cf.HomePath, cf.Proxy, lockTimeout)
+				proxy := cf.Proxy
+				// if proxy is empty, fallback to WebProxyAddr
+				if proxy == "" {
+					proxy = tc.WebProxyAddr
+				}
+				unlockKubeCred, err = takeKubeCredLock(cf.Context, cf.HomePath, proxy, lockTimeout)
 				return trace.Wrap(err)
 			},
 		),
@@ -788,11 +757,22 @@ func (c *kubeCredentialsCommand) issueCert(cf *CLIConf) error {
 	// via the RBAC rules, but we also need to make sure that the user has
 	// access to the cluster with at least one kubernetes_user or kubernetes_group
 	// defined.
-	if err := checkIfCertsAreAllowedToAccessCluster(k, c.kubeCluster); err != nil {
+	// This is a safety check in order to print a better message to the user even
+	// before hitting Teleport Kubernetes Proxy.
+	// We only enforce this check for root clusters, since we don't have knowledge
+	// of the RBAC role mappings for remote clusters.
+	rootClusterName, err := tc.RootClusterName(cf.Context)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	if err := kubeclient.CheckIfCertsAreAllowedToAccessCluster(k,
+		rootClusterName,
+		c.teleportCluster,
+		c.kubeCluster); err != nil {
 		return trace.Wrap(err)
 	}
 	// Cache the new cert on disk for reuse.
-	if err := tc.LocalAgent().AddKubeKey(k); err != nil {
+	if err := tc.LocalAgent().AddKubeKeyRing(k); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -814,50 +794,8 @@ func (c *kubeCredentialsCommand) checkLocalProxyRequirement(profile *profile.Pro
 	return nil
 }
 
-// checkIfCertsAreAllowedToAccessCluster evaluates if the new cert created by the user
-// to access kubeCluster has at least one kubernetes_user or kubernetes_group
-// defined. If not, it returns an error.
-// This is a safety check in order to print a better message to the user even
-// before hitting Teleport Kubernetes Proxy.
-func checkIfCertsAreAllowedToAccessCluster(k *client.Key, kubeCluster string) error {
-	for k8sCluster, cert := range k.KubeTLSCerts {
-		if k8sCluster != kubeCluster {
-			continue
-		}
-		log.Debugf("Got TLS cert for Kubernetes cluster %q", k8sCluster)
-		exist, err := checkIfCertHasKubeGroupsAndUsers(cert)
-		if err != nil {
-			return trace.Wrap(err)
-		} else if exist {
-			return nil
-		}
-	}
-	errMsg := "Your user's Teleport role does not allow Kubernetes access." +
-		" Please ask cluster administrator to ensure your role has appropriate kubernetes_groups and kubernetes_users set."
-	return trace.AccessDenied(errMsg)
-}
-
-// checkIfCertHasKubeGroupsAndUsers checks if the certificate has Kubernetes groups or users
-// in the Subject Name. If it does, it returns true, otherwise false.
-// Having no Kubernetes groups or users in the certificate means that the user
-// is not allowed to access the Kubernetes cluster since Kubernetes Access enforces
-// the presence of at least one of Kubernetes groups or users in the certificate.
-// If the certificate does not have any Kubernetes groups or users, the
-func checkIfCertHasKubeGroupsAndUsers(certB []byte) (bool, error) {
-	cert, err := tlsca.ParseCertificatePEM(certB)
-	if err != nil {
-		return false, trace.Wrap(err)
-	}
-	for _, name := range cert.Subject.Names {
-		if name.Type.Equal(tlsca.KubeGroupsASN1ExtensionOID) || name.Type.Equal(tlsca.KubeUsersASN1ExtensionOID) {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-func (c *kubeCredentialsCommand) writeKeyResponse(output io.Writer, key *client.Key, kubeClusterName string) error {
-	crt, err := key.KubeX509Cert(kubeClusterName)
+func (c *kubeCredentialsCommand) writeKeyResponse(output io.Writer, keyRing *client.KeyRing, kubeClusterName string) error {
+	crt, err := keyRing.KubeX509Cert(kubeClusterName)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -868,34 +806,39 @@ func (c *kubeCredentialsCommand) writeKeyResponse(output io.Writer, key *client.
 		expiry = expiry.Add(-1 * time.Minute)
 	}
 
-	// TODO (Joerger): Create a custom k8s Auth Provider or Exec Provider to use non-rsa
-	// private keys for kube credentials (if possible)
-	rsaKeyPEM, err := key.PrivateKey.RSAPrivateKeyPEM()
+	cred, ok := keyRing.KubeTLSCredentials[kubeClusterName]
+	if !ok {
+		return trace.NotFound("TLS credential for kubernetes cluster %q not found", kubeClusterName)
+	}
+
+	// TODO (Joerger): Create a custom k8s Auth Provider or Exec Provider to use
+	// hardware private keys for kube credentials (if possible)
+	keyPEM, err := cred.PrivateKey.SoftwarePrivateKeyPEM()
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
-	return trace.Wrap(c.writeResponse(output, key.KubeTLSCerts[kubeClusterName], rsaKeyPEM, expiry))
+	return trace.Wrap(c.writeResponse(output, cred.Cert, keyPEM, expiry))
 }
 
 // writeByteResponse writes the exec credential response to the output stream.
-func (c *kubeCredentialsCommand) writeByteResponse(output io.Writer, kubeTLSCert, rsaKeyPEM []byte, expiry time.Time) error {
+func (c *kubeCredentialsCommand) writeByteResponse(output io.Writer, kubeTLSCert, keyPEM []byte, expiry time.Time) error {
 	// Indicate slightly earlier expiration to avoid the cert expiring
 	// mid-request, if possible.
 	if time.Until(expiry) > time.Minute {
 		expiry = expiry.Add(-1 * time.Minute)
 	}
 
-	return trace.Wrap(c.writeResponse(output, kubeTLSCert, rsaKeyPEM, expiry))
+	return trace.Wrap(c.writeResponse(output, kubeTLSCert, keyPEM, expiry))
 }
 
 // writeResponse writes the exec credential response to the output stream.
-func (c *kubeCredentialsCommand) writeResponse(output io.Writer, kubeTLSCert, rsaKeyPEM []byte, expiry time.Time) error {
+func (c *kubeCredentialsCommand) writeResponse(output io.Writer, kubeTLSCert, keyPEM []byte, expiry time.Time) error {
 	resp := &clientauthentication.ExecCredential{
 		Status: &clientauthentication.ExecCredentialStatus{
 			ExpirationTimestamp:   &metav1.Time{Time: expiry},
 			ClientCertificateData: string(kubeTLSCert),
-			ClientKeyData:         string(rsaKeyPEM),
+			ClientKeyData:         string(keyPEM),
 		},
 	}
 	data, err := runtime.Encode(kubeCodecs.LegacyCodec(kubeGroupVersion), resp)
@@ -1075,32 +1018,70 @@ func serializeKubeClusters(kubeClusters []types.KubeCluster, selectedCluster, fo
 }
 
 func (c *kubeLSCommand) runAllClusters(cf *CLIConf) error {
-	var listings kubeListings
-
-	err := forEachProfile(cf, func(tc *client.TeleportClient, profile *client.ProfileStatus) error {
-		req := proto.ListResourcesRequest{
-			SearchKeywords:      tc.SearchKeywords,
-			PredicateExpression: tc.PredicateExpression,
-			Labels:              tc.Labels,
-		}
-
-		kubeClusters, err := tc.ListKubernetesClustersWithFiltersAllClusters(cf.Context, req)
-		if err != nil {
-			return trace.Wrap(err)
-		}
-		for clusterName, kubeClusters := range kubeClusters {
-			for _, kc := range kubeClusters {
-				listings = append(listings, kubeListing{
-					Proxy:       profile.ProxyURL.Host,
-					Cluster:     clusterName,
-					KubeCluster: kc,
-				})
-			}
-		}
-		return nil
-	})
+	clusters, err := getClusterClients(cf, types.KindKubeServer)
 	if err != nil {
 		return trace.Wrap(err)
+	}
+
+	defer func() {
+		// close all clients
+		for _, cluster := range clusters {
+			_ = cluster.Close()
+		}
+	}()
+
+	// Fetch listings for all clusters in parallel with an upper limit
+	group, groupCtx := errgroup.WithContext(cf.Context)
+	group.SetLimit(10)
+
+	// mu guards access to dbListings
+	var (
+		mu       sync.Mutex
+		listings kubeListings
+		errors   []error
+	)
+	for _, cluster := range clusters {
+		cluster := cluster
+		if cluster.connectionError != nil {
+			mu.Lock()
+			errors = append(errors, cluster.connectionError)
+			mu.Unlock()
+			continue
+		}
+
+		group.Go(func() error {
+			kc, err := kubeutils.ListKubeClustersWithFilters(groupCtx, cluster.auth, cluster.req)
+			if err != nil {
+				logger.ErrorContext(groupCtx, "Failed to get kube clusters", "error", err)
+				mu.Lock()
+				errors = append(errors, trace.ConnectionProblem(err, "failed to list kube clusters for cluster %s: %v", cluster.name, err))
+				mu.Unlock()
+
+				return nil
+			}
+
+			localListings := make([]kubeListing, 0, len(kc))
+			for _, kubeCluster := range kc {
+				localListings = append(localListings, kubeListing{
+					Proxy:       cluster.profile.ProxyURL.Host,
+					Cluster:     cluster.name,
+					KubeCluster: kubeCluster,
+				})
+			}
+
+			mu.Lock()
+			listings = append(listings, localListings...)
+			mu.Unlock()
+			return nil
+		})
+	}
+
+	if err := group.Wait(); err != nil {
+		return trace.Wrap(err)
+	}
+
+	if len(listings) == 0 && len(errors) > 0 {
+		return trace.NewAggregate(errors...)
 	}
 
 	format := strings.ToLower(c.format)
@@ -1119,7 +1100,7 @@ func (c *kubeLSCommand) runAllClusters(cf *CLIConf) error {
 		return trace.BadParameter("Unrecognized format %q", c.format)
 	}
 
-	return nil
+	return trace.NewAggregate(errors...)
 }
 
 func formatKubeListingsAsText(listings kubeListings, quiet, verbose bool) string {
@@ -1428,17 +1409,14 @@ Learn more at https://goteleport.com/docs/architecture/tls-routing/#working-with
 
 func fetchKubeClusters(ctx context.Context, tc *client.TeleportClient) (teleportCluster string, kubeClusters []types.KubeCluster, err error) {
 	err = client.RetryWithRelogin(ctx, tc, func() error {
-		pc, err := tc.ConnectToProxy(ctx)
+		clusterClient, err := tc.ConnectToCluster(ctx)
 		if err != nil {
 			return trace.Wrap(err)
 		}
-		defer pc.Close()
+		defer clusterClient.Close()
 
-		ac := pc.CurrentCluster()
-		defer ac.Close()
-
-		teleportCluster = pc.ClusterName()
-		kubeClusters, err = kubeutils.ListKubeClustersWithFilters(ctx, ac, proto.ListResourcesRequest{
+		teleportCluster = clusterClient.ClusterName()
+		kubeClusters, err = kubeutils.ListKubeClustersWithFilters(ctx, clusterClient.AuthClient, proto.ListResourcesRequest{
 			SearchKeywords:      tc.SearchKeywords,
 			PredicateExpression: tc.PredicateExpression,
 			Labels:              tc.Labels,
@@ -1469,7 +1447,7 @@ type kubernetesStatus struct {
 	clusterAddr         string
 	teleportClusterName string
 	kubeClusters        []types.KubeCluster
-	credentials         *client.Key
+	credentials         *client.KeyRing
 	tlsServerName       string
 }
 
@@ -1479,7 +1457,7 @@ func fetchKubeStatus(ctx context.Context, tc *client.TeleportClient) (*kubernete
 	kubeStatus := &kubernetesStatus{
 		clusterAddr: tc.KubeClusterAddr(),
 	}
-	kubeStatus.credentials, err = tc.LocalAgent().GetCoreKey()
+	kubeStatus.credentials, err = tc.LocalAgent().GetCoreKeyRing()
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -1522,7 +1500,7 @@ func buildKubeConfigUpdate(cf *CLIConf, kubeStatus *kubernetesStatus, overrideCo
 	if len(kubeStatus.kubeClusters) == 0 {
 		// If there are no registered k8s clusters, we may have an older teleport cluster.
 		// Fall back to the old kubeconfig, with static credentials from v.Credentials.
-		log.Debug("Disabling exec plugin mode for kubeconfig because this Teleport cluster has no Kubernetes clusters.")
+		logger.DebugContext(cf.Context, "Disabling exec plugin mode for kubeconfig because this Teleport cluster has no Kubernetes clusters")
 		return v, nil
 	}
 
@@ -1666,25 +1644,32 @@ func (c *kubeLoginCommand) accessRequestForKubeCluster(ctx context.Context, cf *
 		}
 	}
 
-	// Roles to request will be automatically determined on the backend.
-	req, err := services.NewAccessRequestWithResources(tc.Username, nil /* roles */, requestResourceIDs)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
+	var req types.AccessRequest
+	fmt.Println("request mode", cf.RequestMode)
+	switch cf.RequestMode {
+	case accessRequestModeResource, "":
+		// Roles to request will be automatically determined on the backend.
+		req, err = services.NewAccessRequestWithResources(tc.Username, nil /* roles */, requestResourceIDs)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
 
-	// Set the DryRun flag and send the request to auth for full validation. If
-	// the user has no search_as_roles or is not allowed to connect to the Kube cluster
-	// we will get an error here.
-	req.SetDryRun(true)
-	req.SetRequestReason("Dry run, this request will not be created. If you see this, there is a bug.")
-	if err := tc.WithRootClusterClient(ctx, func(clt auth.ClientI) error {
-		req, err = clt.CreateAccessRequestV2(ctx, req)
-		return trace.Wrap(err)
-	}); err != nil {
-		return nil, trace.Wrap(err)
+		// Set the DryRun flag and send the request to auth for full validation. If
+		// the user has no search_as_roles or is not allowed to connect to the Kube cluster
+		// we will get an error here.
+		req.SetDryRun(true)
+		req.SetRequestReason("Dry run, this request will not be created. If you see this, there is a bug.")
+		if err := tc.WithRootClusterClient(ctx, func(clt authclient.ClientI) error {
+			req, err = clt.CreateAccessRequestV2(ctx, req)
+			return trace.Wrap(err)
+		}); err != nil {
+			return nil, trace.Wrap(err)
+		}
+		req.SetDryRun(false)
+		req.SetRequestReason("")
+	default:
+		return nil, trace.BadParameter("unexpected request mode %q", cf.RequestMode)
 	}
-	req.SetDryRun(false)
-	req.SetRequestReason("")
 
 	return req, nil
 }

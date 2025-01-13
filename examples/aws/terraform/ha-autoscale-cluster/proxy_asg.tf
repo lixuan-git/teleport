@@ -2,7 +2,7 @@
 // set up in the public subnet. This is the only group of servers that are
 // accepting traffic from the internet.
 
-// letsencrypt
+// Let's Encrypt
 resource "aws_autoscaling_group" "proxy" {
   name                      = "${var.cluster_name}-proxy"
   max_size                  = 5
@@ -15,7 +15,7 @@ resource "aws_autoscaling_group" "proxy" {
 
   launch_template {
     name    = aws_launch_template.proxy.name
-    version = "$Latest"
+    version = aws_launch_template.proxy.latest_version
   }
 
   // Auto scaling group is associated with load balancer
@@ -44,6 +44,26 @@ resource "aws_autoscaling_group" "proxy" {
     propagate_at_launch = true
   }
 
+  dynamic "tag" {
+    for_each = data.aws_default_tags.this.tags
+    content {
+      key                 = tag.key
+      value               = tag.value
+      propagate_at_launch = true
+    }
+  }
+
+  dynamic "instance_refresh" {
+    for_each = var.enable_proxy_asg_instance_refresh ? [1] : []
+    content {
+      strategy = "Rolling"
+      preferences {
+        auto_rollback          = true
+        min_healthy_percentage = 50
+      }
+    }
+  }
+
   // external autoscale algos can modify these values,
   // so ignore changes to them
   lifecycle {
@@ -68,7 +88,7 @@ resource "aws_autoscaling_group" "proxy_acm" {
 
   launch_template {
     name    = aws_launch_template.proxy.name
-    version = "$Latest"
+    version = aws_launch_template.proxy.latest_version
   }
 
   // Auto scaling group is associated with load balancer
@@ -95,6 +115,26 @@ resource "aws_autoscaling_group" "proxy_acm" {
     key                 = "TeleportRole"
     value               = "proxy"
     propagate_at_launch = true
+  }
+
+  dynamic "tag" {
+    for_each = data.aws_default_tags.this.tags
+    content {
+      key                 = tag.key
+      value               = tag.value
+      propagate_at_launch = true
+    }
+  }
+
+  dynamic "instance_refresh" {
+    for_each = var.enable_proxy_asg_instance_refresh ? [1] : []
+    content {
+      strategy = "Rolling"
+      preferences {
+        auto_rollback          = true
+        min_healthy_percentage = 50
+      }
+    }
   }
 
   // external autoscale algos can modify these values,
@@ -124,13 +164,11 @@ resource "aws_launch_template" "proxy" {
       region                   = data.aws_region.current.name
       cluster_name             = var.cluster_name
       auth_server_addr         = aws_lb.auth.dns_name
-      proxy_server_lb_addr     = var.use_acm ? aws_lb.proxy_acm[0].dns_name : aws_lb.proxy[0].dns_name
+      proxy_server_lb_addr     = var.use_acm ? var.use_tls_routing ? aws_lb.proxy_acm[0].dns_name : aws_lb.proxy[0].dns_name : aws_lb.proxy[0].dns_name
       proxy_server_nlb_alias   = var.route53_domain_acm_nlb_alias
-      influxdb_addr            = "http://${aws_lb.monitor.dns_name}:8086"
       email                    = var.email
       domain_name              = var.route53_domain
       s3_bucket                = var.s3_bucket_name
-      telegraf_version         = var.telegraf_version
       enable_mongodb_listener  = var.enable_mongodb_listener
       enable_mysql_listener    = var.enable_mysql_listener
       enable_postgres_listener = var.enable_postgres_listener
@@ -165,5 +203,13 @@ resource "aws_launch_template" "proxy" {
 
   iam_instance_profile {
     name = aws_iam_instance_profile.proxy.id
+  }
+
+  dynamic "tag_specifications" {
+    for_each = ["instance", "volume", "network-interface"]
+    content {
+      resource_type = tag_specifications.value
+      tags          = data.aws_default_tags.this.tags
+    }
   }
 }

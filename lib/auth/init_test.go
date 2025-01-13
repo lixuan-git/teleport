@@ -1,18 +1,20 @@
 /*
-Copyright 2015-2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package auth
 
@@ -20,33 +22,46 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/coreos/go-semver/semver"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/google/uuid"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/exp/slices"
+	"google.golang.org/protobuf/proto"
 	kyaml "k8s.io/apimachinery/pkg/util/yaml"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/constants"
+	dbobjectimportrulev1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/dbobjectimportrule/v1"
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/api/types/label"
 	apisshutils "github.com/gravitational/teleport/api/utils/sshutils"
+	"github.com/gravitational/teleport/entitlements"
+	"github.com/gravitational/teleport/lib"
 	"github.com/gravitational/teleport/lib/auth/keystore"
+	"github.com/gravitational/teleport/lib/auth/state"
+	"github.com/gravitational/teleport/lib/auth/storage"
 	"github.com/gravitational/teleport/lib/auth/testauthority"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/backend/lite"
+	"github.com/gravitational/teleport/lib/cryptosuites"
 	"github.com/gravitational/teleport/lib/modules"
 	"github.com/gravitational/teleport/lib/observability/tracing"
 	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/services/suite"
+	"github.com/gravitational/teleport/lib/srv/db/common/databaseobjectimportrule"
 	"github.com/gravitational/teleport/lib/sshutils"
 	"github.com/gravitational/teleport/lib/utils"
 	"github.com/gravitational/teleport/lib/utils/proxy"
@@ -73,12 +88,12 @@ func TestReadIdentity(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	id, err := ReadSSHIdentityFromKeyPair(priv, cert)
+	id, err := state.ReadSSHIdentityFromKeyPair(priv, cert)
 	require.NoError(t, err)
-	require.Equal(t, id.ClusterName, "example.com")
-	require.Equal(t, id.ID, IdentityID{HostUUID: "id1.example.com", Role: types.RoleNode})
-	require.Equal(t, id.CertBytes, cert)
-	require.Equal(t, id.KeyBytes, priv)
+	require.Equal(t, "example.com", id.ClusterName)
+	require.Equal(t, state.IdentityID{HostUUID: "id1.example.com", Role: types.RoleNode}, id.ID)
+	require.Equal(t, cert, id.CertBytes)
+	require.Equal(t, priv, id.KeyBytes)
 
 	// test TTL by converting the generated cert to text -> back and making sure ExpireAfter is valid
 	ttl := 10 * time.Second
@@ -106,7 +121,7 @@ func TestBadIdentity(t *testing.T) {
 	require.NoError(t, err)
 
 	// bad cert type
-	_, err = ReadSSHIdentityFromKeyPair(priv, pub)
+	_, err = state.ReadSSHIdentityFromKeyPair(priv, pub)
 	require.IsType(t, trace.BadParameter(""), err)
 
 	// missing authority domain
@@ -121,7 +136,7 @@ func TestBadIdentity(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	_, err = ReadSSHIdentityFromKeyPair(priv, cert)
+	_, err = state.ReadSSHIdentityFromKeyPair(priv, cert)
 	require.IsType(t, trace.BadParameter(""), err)
 
 	// missing host uuid
@@ -136,7 +151,7 @@ func TestBadIdentity(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	_, err = ReadSSHIdentityFromKeyPair(priv, cert)
+	_, err = state.ReadSSHIdentityFromKeyPair(priv, cert)
 	require.IsType(t, trace.BadParameter(""), err)
 
 	// unrecognized role
@@ -151,8 +166,245 @@ func TestBadIdentity(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	_, err = ReadSSHIdentityFromKeyPair(priv, cert)
+	_, err = state.ReadSSHIdentityFromKeyPair(priv, cert)
 	require.IsType(t, trace.BadParameter(""), err)
+}
+
+func TestSignatureAlgorithmSuite(t *testing.T) {
+	ctx := context.Background()
+
+	suiteName := func(suite types.SignatureAlgorithmSuite) string {
+		suiteName, err := suite.MarshalText()
+		require.NoError(t, err)
+		return string(suiteName)
+	}
+
+	assertSuitesEqual := func(t *testing.T, expected, actual types.SignatureAlgorithmSuite) {
+		t.Helper()
+		assert.Equal(t, suiteName(expected), suiteName(actual))
+	}
+
+	modules.SetTestModules(t, &modules.TestModules{
+		TestFeatures: modules.Features{
+			Entitlements: map[entitlements.EntitlementKind]modules.EntitlementInfo{
+				entitlements.HSM: {Enabled: true},
+			},
+		},
+	})
+
+	setupInitConfig := func(t *testing.T, capOrigin string, fips, hsm bool) InitConfig {
+		cfg := setupConfig(t)
+		cfg.FIPS = fips
+		if hsm {
+			cfg.KeyStoreConfig = keystore.HSMTestConfig(t)
+		}
+		cfg.AuthPreference.SetOrigin(capOrigin)
+		if capOrigin != types.OriginDefaults {
+			cfg.AuthPreference.SetSignatureAlgorithmSuite(types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_UNSPECIFIED)
+		}
+		// Pre-generate all CAs to keep tests fast esp. with SoftHSM.
+		for _, caType := range types.CertAuthTypes {
+			cfg.BootstrapResources = append(cfg.BootstrapResources, suite.NewTestCAWithConfig(suite.TestCAConfig{
+				Type:        caType,
+				ClusterName: cfg.ClusterName.GetClusterName(),
+				Clock:       cfg.Clock,
+			}))
+		}
+		return cfg
+	}
+
+	testCases := map[string]struct {
+		fips                  bool
+		hsm                   bool
+		cloud                 bool
+		expectDefaultSuite    types.SignatureAlgorithmSuite
+		expectUnallowedSuites []types.SignatureAlgorithmSuite
+	}{
+		"basic": {
+			expectDefaultSuite: types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_BALANCED_V1,
+		},
+		"fips": {
+			fips:               true,
+			expectDefaultSuite: types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_FIPS_V1,
+			expectUnallowedSuites: []types.SignatureAlgorithmSuite{
+				types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_BALANCED_V1,
+				types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_HSM_V1,
+			},
+		},
+		"hsm": {
+			hsm:                true,
+			expectDefaultSuite: types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_HSM_V1,
+			expectUnallowedSuites: []types.SignatureAlgorithmSuite{
+				types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_BALANCED_V1,
+			},
+		},
+		"fips and hsm": {
+			fips:               true,
+			hsm:                true,
+			expectDefaultSuite: types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_FIPS_V1,
+			expectUnallowedSuites: []types.SignatureAlgorithmSuite{
+				types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_BALANCED_V1,
+				types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_HSM_V1,
+			},
+		},
+		"cloud": {
+			cloud:              true,
+			expectDefaultSuite: types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_HSM_V1,
+			expectUnallowedSuites: []types.SignatureAlgorithmSuite{
+				types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_BALANCED_V1,
+			},
+		},
+	}
+
+	// Test the behavior of auth server init. A default signature algorithm
+	// suite should never overwrite a persisted signature algorithm suite for an
+	// existing cluster, even if that was also a default.
+	t.Run("init", func(t *testing.T) {
+		for _, origin := range []string{types.OriginDefaults, types.OriginConfigFile} {
+			t.Run(origin, func(t *testing.T) {
+				for desc, tc := range testCases {
+					t.Run(desc, func(t *testing.T) {
+						if tc.cloud {
+							modules.SetTestModules(t, &modules.TestModules{
+								TestFeatures: modules.Features{
+									Cloud: true,
+									Entitlements: map[entitlements.EntitlementKind]modules.EntitlementInfo{
+										entitlements.HSM: {Enabled: true},
+									},
+								},
+							})
+						}
+
+						// Assert that a fresh cluster with no signature_algorithm_suite
+						// configured gets the expected default suite, whether
+						// or not anything else in the cluster auth preference is set.
+						cfg := setupInitConfig(t, origin, tc.fips, tc.hsm)
+						auth1, err := Init(ctx, cfg)
+						require.NoError(t, err)
+						t.Cleanup(func() { auth1.Close() })
+						authPref, err := auth1.GetAuthPreference(ctx)
+						require.NoError(t, err)
+						assert.Equal(t, origin, authPref.GetMetadata().Labels[types.OriginLabel])
+						assertSuitesEqual(t, tc.expectDefaultSuite, authPref.GetSignatureAlgorithmSuite())
+
+						// Start a second auth server with the same backend and
+						// config, assert that the default suite remains.
+						auth2, err := Init(ctx, cfg)
+						require.NoError(t, err)
+						t.Cleanup(func() { auth2.Close() })
+						authPref, err = auth2.GetAuthPreference(ctx)
+						require.NoError(t, err)
+						assert.Equal(t, origin, authPref.GetMetadata().Labels[types.OriginLabel])
+						assertSuitesEqual(t, tc.expectDefaultSuite, authPref.GetSignatureAlgorithmSuite())
+
+						// In the stored cluster_auth_preference, reset the
+						// signature_algorithm_suite to unspecified (still with
+						// the same origin) to mimic an older cluster with the old
+						// defaults, in the next step it will be "upgraded".
+						authPref.SetSignatureAlgorithmSuite(types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_UNSPECIFIED)
+						_, err = auth2.UpsertAuthPreference(ctx, authPref)
+						require.NoError(t, err)
+						authPref, err = auth2.GetAuthPreference(ctx)
+						require.NoError(t, err)
+						// Sanity check it persisted.
+						assert.Equal(t, origin, authPref.GetMetadata().Labels[types.OriginLabel])
+						assertSuitesEqual(t, types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_UNSPECIFIED, authPref.GetSignatureAlgorithmSuite())
+
+						// Start a third brand new auth server sharing the same
+						// backend and config. The new auth starting up should
+						// apply the new default auth preference and persist it
+						// to the backend, but it should not modify the existing
+						// signature algorithm suite even though it's
+						// unspecified. This is meant to test that a v16 auth
+						// server upgraded to v17 will still have an unspecified
+						// signature algorithm suite and won't get a new one
+						// until explicitly opting in.
+						auth3, err := Init(ctx, cfg)
+						require.NoError(t, err)
+						t.Cleanup(func() { auth3.Close() })
+						authPref, err = auth3.GetAuthPreference(ctx)
+						require.NoError(t, err)
+						assert.Equal(t, origin, authPref.GetMetadata().Labels[types.OriginLabel])
+						assertSuitesEqual(t, types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_UNSPECIFIED, authPref.GetSignatureAlgorithmSuite())
+
+						// Assert that the selected algorithm is RSA2048 when the suite is
+						// unspecified.
+						alg, err := cryptosuites.AlgorithmForKey(ctx,
+							cryptosuites.GetCurrentSuiteFromAuthPreference(auth3),
+							cryptosuites.UserTLS)
+						require.NoError(t, err)
+						assert.Equal(t, cryptosuites.RSA2048.String(), alg.String())
+					})
+				}
+			})
+		}
+	})
+
+	// Test that the auth preference cannot be upserted with a signature
+	// algorithm suite incompatible with the cluster FIPS and HSM settings.
+	t.Run("upsert", func(t *testing.T) {
+		for desc, tc := range testCases {
+			t.Run(desc, func(t *testing.T) {
+				if tc.cloud {
+					modules.SetTestModules(t, &modules.TestModules{
+						TestFeatures: modules.Features{
+							Cloud: true,
+							Entitlements: map[entitlements.EntitlementKind]modules.EntitlementInfo{
+								entitlements.HSM: {Enabled: true},
+							},
+						},
+					})
+				}
+				cfg := TestAuthServerConfig{
+					Dir:  t.TempDir(),
+					FIPS: tc.fips,
+					AuthPreferenceSpec: &types.AuthPreferenceSpecV2{
+						// Cloud requires second factor enabled.
+						SecondFactor: constants.SecondFactorOn,
+						Webauthn: &types.Webauthn{
+							RPID: "teleport.example.com",
+						},
+					},
+				}
+				if tc.hsm {
+					cfg.KeystoreConfig = keystore.HSMTestConfig(t)
+				}
+				testAuthServer, err := NewTestAuthServer(cfg)
+				require.NoError(t, err)
+				tlsServer, err := testAuthServer.NewTestTLSServer()
+				require.NoError(t, err)
+				clt, err := tlsServer.NewClient(TestAdmin())
+				require.NoError(t, err)
+
+				for _, suiteValue := range types.SignatureAlgorithmSuite_value {
+					suite := types.SignatureAlgorithmSuite(suiteValue)
+					t.Run(suiteName(suite), func(t *testing.T) {
+						authPref, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
+							SignatureAlgorithmSuite: suite,
+						})
+						require.NoError(t, err)
+
+						_, err = clt.UpsertAuthPreference(ctx, authPref)
+						if slices.Contains(tc.expectUnallowedSuites, suite) {
+							var badParameterErr *trace.BadParameterError
+							assert.ErrorAs(t, err, &badParameterErr)
+							return
+						} else {
+							assert.NoError(t, err)
+						}
+
+						// Reset should go back to the default suite.
+						err = clt.ResetAuthPreference(ctx)
+						require.NoError(t, err)
+						authPref, err = clt.GetAuthPreference(ctx)
+						require.NoError(t, err)
+						assert.Equal(t, types.OriginDefaults, authPref.GetMetadata().Labels[types.OriginLabel])
+						assertSuitesEqual(t, tc.expectDefaultSuite, authPref.GetSignatureAlgorithmSuite())
+					})
+				}
+			})
+		}
+	})
 }
 
 type testDynamicallyConfigurableParams struct {
@@ -289,7 +541,8 @@ func TestAuthPreference(t *testing.T) {
 		},
 		withConfigFile: func(t *testing.T, conf *InitConfig) types.ResourceWithOrigin {
 			fromConfigFile, err := types.NewAuthPreferenceFromConfigFile(types.AuthPreferenceSpecV2{
-				Type: constants.OIDC,
+				Type:                    constants.OIDC,
+				SignatureAlgorithmSuite: types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_BALANCED_V1,
 			})
 			require.NoError(t, err)
 			conf.AuthPreference = fromConfigFile
@@ -297,6 +550,7 @@ func TestAuthPreference(t *testing.T) {
 		},
 		withAnotherConfigFile: func(t *testing.T, conf *InitConfig) types.ResourceWithOrigin {
 			conf.AuthPreference = newWebauthnAuthPreferenceConfigFromFile(t)
+			conf.AuthPreference.SetSignatureAlgorithmSuite(types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_HSM_V1)
 			return conf.AuthPreference
 		},
 		setDynamic: func(t *testing.T, authServer *Server) {
@@ -304,7 +558,7 @@ func TestAuthPreference(t *testing.T) {
 				SecondFactor: constants.SecondFactorOff,
 			})
 			require.NoError(t, err)
-			err = authServer.SetAuthPreference(ctx, dynamically)
+			_, err = authServer.UpsertAuthPreference(ctx, dynamically)
 			require.NoError(t, err)
 		},
 		getStored: func(t *testing.T, authServer *Server) types.ResourceWithOrigin {
@@ -312,6 +566,36 @@ func TestAuthPreference(t *testing.T) {
 			require.NoError(t, err)
 			return authPref
 		},
+	})
+}
+
+func TestAuthPreferenceSecondFactorOnly(t *testing.T) {
+	modules.SetInsecureTestMode(false)
+	defer modules.SetInsecureTestMode(true)
+	ctx := context.Background()
+
+	t.Run("starting with second_factor disabled fails", func(t *testing.T) {
+		conf := setupConfig(t)
+		authPref, err := types.NewAuthPreferenceFromConfigFile(types.AuthPreferenceSpecV2{
+			SecondFactor: constants.SecondFactorOff,
+		})
+		require.NoError(t, err)
+
+		conf.AuthPreference = authPref
+		_, err = Init(ctx, conf)
+		require.Error(t, err)
+	})
+
+	t.Run("starting with defaults and dynamically updating to disable second factor fails", func(t *testing.T) {
+		conf := setupConfig(t)
+		s, err := Init(ctx, conf)
+		require.NoError(t, err)
+		authpref, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
+			SecondFactor: constants.SecondFactorOff,
+		})
+		require.NoError(t, err)
+		_, err = s.UpsertAuthPreference(ctx, authpref)
+		require.Error(t, err)
 	})
 }
 
@@ -347,7 +631,7 @@ func TestClusterNetworkingConfig(t *testing.T) {
 			})
 			require.NoError(t, err)
 			dynamically.SetOrigin(types.OriginDynamic)
-			err = authServer.SetClusterNetworkingConfig(ctx, dynamically)
+			_, err = authServer.UpsertClusterNetworkingConfig(ctx, dynamically)
 			require.NoError(t, err)
 		},
 		getStored: func(t *testing.T, authServer *Server) types.ResourceWithOrigin {
@@ -389,7 +673,7 @@ func TestSessionRecordingConfig(t *testing.T) {
 			})
 			require.NoError(t, err)
 			dynamically.SetOrigin(types.OriginDynamic)
-			err = authServer.SetSessionRecordingConfig(ctx, dynamically)
+			_, err = authServer.UpsertSessionRecordingConfig(ctx, dynamically)
 			require.NoError(t, err)
 		},
 		getStored: func(t *testing.T, authServer *Server) types.ResourceWithOrigin {
@@ -409,7 +693,7 @@ func TestClusterID(t *testing.T) {
 	cc, err := authServer.GetClusterName()
 	require.NoError(t, err)
 	clusterID := cc.GetClusterID()
-	require.NotEqual(t, clusterID, "")
+	require.NotEmpty(t, clusterID)
 
 	// do it again and make sure cluster ID hasn't changed
 	authServer, err = Init(context.Background(), conf)
@@ -418,7 +702,7 @@ func TestClusterID(t *testing.T) {
 
 	cc, err = authServer.GetClusterName()
 	require.NoError(t, err)
-	require.Equal(t, cc.GetClusterID(), clusterID)
+	require.Equal(t, clusterID, cc.GetClusterID())
 }
 
 // TestClusterName ensures that a cluster can not be renamed.
@@ -453,6 +737,40 @@ func keysIn[K comparable, V any](m map[K]V) []K {
 	return result
 }
 
+type failingTrustInternal struct {
+	services.TrustInternal
+}
+
+func (t *failingTrustInternal) CreateCertAuthority(ctx context.Context, ca types.CertAuthority) error {
+	return trace.Errorf("error")
+}
+
+// TestInitCertFailureRecovery ensures the auth server is able to recover from
+// a failure in the cert creation process.
+func TestInitCertFailureRecovery(t *testing.T) {
+	ctx := context.Background()
+	cap, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
+		Type: constants.SAML,
+	})
+	require.NoError(t, err)
+
+	conf := setupConfig(t)
+
+	// BootstrapResources have lead to an unrecoverable state in the past.
+	// See https://github.com/gravitational/teleport/pull/49638.
+	conf.BootstrapResources = []types.Resource{cap}
+	_, err = Init(ctx, conf, func(s *Server) error {
+		s.TrustInternal = &failingTrustInternal{
+			TrustInternal: s.TrustInternal,
+		}
+		return nil
+	})
+	require.Error(t, err)
+
+	_, err = Init(ctx, conf)
+	require.NoError(t, err)
+}
+
 // TestPresets tests behavior of presets
 func TestPresets(t *testing.T) {
 	ctx := context.Background()
@@ -461,6 +779,7 @@ func TestPresets(t *testing.T) {
 		teleport.PresetEditorRoleName,
 		teleport.PresetAccessRoleName,
 		teleport.PresetAuditorRoleName,
+		teleport.PresetTerraformProviderRoleName,
 	}
 
 	t.Run("EmptyCluster", func(t *testing.T) {
@@ -490,7 +809,7 @@ func TestPresets(t *testing.T) {
 
 		access := services.NewPresetEditorRole()
 		access.SetLogins(types.Allow, []string{"root"})
-		err := as.CreateRole(ctx, access)
+		access, err := as.CreateRole(ctx, access)
 		require.NoError(t, err)
 
 		err = createPresetRoles(ctx, as)
@@ -526,14 +845,14 @@ func TestPresets(t *testing.T) {
 			outdatedRules = append(outdatedRules, r)
 		}
 		editorRole.SetRules(types.Allow, outdatedRules)
-		err := as.CreateRole(ctx, editorRole)
+		editorRole, err := as.CreateRole(ctx, editorRole)
 		require.NoError(t, err)
 
 		// Set up an old Access Role.
 		// Remove the new DatabaseServiceLabels default
 		accessRole := services.NewPresetAccessRole()
 		accessRole.SetDatabaseServiceLabels(types.Allow, types.Labels{})
-		err = as.CreateRole(ctx, accessRole)
+		accessRole, err = as.CreateRole(ctx, accessRole)
 		require.NoError(t, err)
 
 		err = createPresetRoles(ctx, as)
@@ -571,7 +890,7 @@ func TestPresets(t *testing.T) {
 
 		// Create a new set of rules based on the Editor Role,
 		// setting a deny rule for a default allow rule
-		outdateAllowRules := []types.Rule{}
+		var outdateAllowRules []types.Rule
 		for _, r := range allowRules {
 			if slices.Contains(r.Resources, types.KindConnectionDiagnostic) {
 				continue
@@ -586,7 +905,7 @@ func TestPresets(t *testing.T) {
 		denyRules = append(denyRules, denyConnectionDiagnosticRule)
 		editorRole.SetRules(types.Deny, denyRules)
 
-		err := as.CreateRole(ctx, editorRole)
+		editorRole, err := as.CreateRole(ctx, editorRole)
 		require.NoError(t, err)
 
 		// Set up a changed Access Role
@@ -596,7 +915,7 @@ func TestPresets(t *testing.T) {
 		// Explicitly deny DatabaseServiceLabels
 		accessRole.SetDatabaseServiceLabels(types.Deny, types.Labels{types.Wildcard: []string{types.Wildcard}})
 
-		err = as.CreateRole(ctx, accessRole)
+		accessRole, err = as.CreateRole(ctx, accessRole)
 		require.NoError(t, err)
 
 		// Apply defaults.
@@ -647,10 +966,12 @@ func TestPresets(t *testing.T) {
 				defer mu.Unlock()
 				require.Contains(t, expectedPresetRoles, r.GetName())
 				require.NotContains(t, createdPresets, r.GetName())
-				require.False(t, types.IsSystemResource(r))
+				require.False(t, types.IsSystemResource(r) && r.GetName() != teleport.SystemOktaRequesterRoleName)
 				createdPresets[r.GetName()] = r
 			}).
-			Return(nil)
+			Return(func(_ context.Context, r types.Role) (types.Role, error) {
+				return r, nil
+			})
 
 		// EXPECT that any (and ONLY) system resources will be upserted
 		roleManager.
@@ -665,7 +986,9 @@ func TestPresets(t *testing.T) {
 				createdSystemRoles[r.GetName()] = r
 			}).
 			Maybe().
-			Return(nil)
+			Return(func(_ context.Context, r types.Role) (types.Role, error) {
+				return r, nil
+			})
 
 		err := createPresetRoles(ctx, roleManager)
 		require.NoError(t, err)
@@ -687,7 +1010,7 @@ func TestPresets(t *testing.T) {
 				defer mu.Unlock()
 				require.Contains(t, createdPresets, args[1].(types.Role).GetName())
 			}).
-			Return(trace.AlreadyExists("dupe"))
+			Return(nil, trace.AlreadyExists("dupe"))
 
 		// EXPECT that any (and ONLY) expected system roles will be
 		// automatically upserted
@@ -695,7 +1018,9 @@ func TestPresets(t *testing.T) {
 			On("UpsertRole", mock.Anything, mock.Anything).
 			Run(requireSystemResource(t, 1)).
 			Maybe().
-			Return(nil)
+			Return(func(_ context.Context, r types.Role) (types.Role, error) {
+				return r, nil
+			})
 
 		// EXPECT that all of the roles created in the previous step (and ONLY the
 		// roles created in the previous step will be queried.
@@ -739,7 +1064,7 @@ func TestPresets(t *testing.T) {
 				require.Contains(t, createdPresets, r.GetName())
 				delete(remainingPresets, r.GetName())
 			}).
-			Return(trace.AlreadyExists("dupe"))
+			Return(nil, trace.AlreadyExists("dupe"))
 
 		// EXPECT that all of the roles created in the first step (and ONLY the
 		// roles created in the first step will be queried.
@@ -753,13 +1078,13 @@ func TestPresets(t *testing.T) {
 		// AND our modified editor resource will be updated using an upsert
 		roleManager.
 			On("UpsertRole", mock.Anything, mock.Anything).
-			Return(func(_ context.Context, r types.Role) error {
+			Return(func(_ context.Context, r types.Role) (types.Role, error) {
 				if types.IsSystemResource(r) {
 					require.Contains(t, expectedSystemRoles, r.GetName())
-					return nil
+					return r, nil
 				}
 				require.Equal(t, teleport.PresetEditorRoleName, r.GetName())
-				return nil
+				return r, nil
 			})
 
 		err = createPresetRoles(ctx, roleManager)
@@ -784,10 +1109,13 @@ func TestPresets(t *testing.T) {
 			teleport.PresetDeviceAdminRoleName,
 			teleport.PresetDeviceEnrollRoleName,
 			teleport.PresetRequireTrustedDeviceRoleName,
+			teleport.SystemOktaRequesterRoleName, // This is treated as a preset
 		}, presetRoleNames...)
 
 		enterpriseSystemRoleNames := []string{
 			teleport.SystemAutomaticAccessApprovalRoleName,
+			teleport.SystemOktaAccessRoleName,
+			teleport.SystemIdentityCenterAccessRoleName,
 		}
 
 		enterpriseUsers := []types.User{
@@ -818,7 +1146,7 @@ func TestPresets(t *testing.T) {
 
 			// Preset Users were created
 			for _, user := range enterpriseUsers {
-				_, err := as.GetUser(user.GetName(), false)
+				_, err := as.GetUser(ctx, user.GetName(), false)
 				require.NoError(t, err)
 			}
 		})
@@ -836,19 +1164,19 @@ func TestPresets(t *testing.T) {
 
 			// Set the expectation that all user creations will succeed EXCEPT
 			// for our known system user
-			auth.On("CreateUser", ctx, mock.Anything).
+			auth.On("CreateUser", mock.Anything, mock.Anything).
 				Run(requireSystemResource(t, 1)).
 				Maybe().
-				Return(nil)
+				Return(sysUser, nil)
 
 			// All attempts to upsert should succeed, and record the being upserted
-			upsertedUsers := []string{}
-			auth.On("UpsertUser", mock.Anything).
+			var upsertedUsers []string
+			auth.On("UpsertUser", mock.Anything, mock.Anything).
 				Run(func(args mock.Arguments) {
-					u := args.Get(0).(types.User)
+					u := args.Get(1).(types.User)
 					upsertedUsers = append(upsertedUsers, u.GetName())
 				}).
-				Return(nil)
+				Return(sysUser, nil)
 
 			// WHEN I attempt to create the preset users...
 			err := createPresetUsers(ctx, auth)
@@ -861,6 +1189,22 @@ func TestPresets(t *testing.T) {
 	})
 }
 
+func TestGetPresetUsers(t *testing.T) {
+	// no preset users for OSS
+	modules.SetTestModules(t, &modules.TestModules{
+		TestBuildType: modules.BuildOSS,
+	})
+	require.Empty(t, getPresetUsers())
+
+	// preset user @teleport-access-approval-bot on enterprise
+	modules.SetTestModules(t, &modules.TestModules{
+		TestBuildType: modules.BuildEnterprise,
+	})
+	require.Equal(t, []types.User{
+		services.NewSystemAutomaticAccessBotUser(),
+	}, getPresetUsers())
+}
+
 type mockUserManager struct {
 	mock.Mock
 }
@@ -871,31 +1215,31 @@ func newMockUserManager(t *testing.T) *mockUserManager {
 	return m
 }
 
-func (m *mockUserManager) CreateUser(ctx context.Context, user types.User) error {
-	type delegateFn = func(types.User) error
+func (m *mockUserManager) CreateUser(ctx context.Context, user types.User) (types.User, error) {
+	type delegateFn = func(context.Context, types.User) (types.User, error)
 	args := m.Called(ctx, user)
 	if delegate, ok := args.Get(0).(delegateFn); ok {
-		return delegate(user)
-	}
-	return args.Error(0)
-}
-
-func (m *mockUserManager) GetUser(username string, withSecrets bool) (types.User, error) {
-	type delegateFn = func(username string, withSecrets bool) (types.User, error)
-	args := m.Called(username, withSecrets)
-	if delegate, ok := args.Get(0).(delegateFn); ok {
-		return delegate(username, withSecrets)
+		return delegate(ctx, user)
 	}
 	return args.Get(0).(types.User), args.Error(1)
 }
 
-func (m *mockUserManager) UpsertUser(user types.User) error {
-	type delegateFn = func(types.User) error
-	args := m.Called(user)
+func (m *mockUserManager) GetUser(ctx context.Context, username string, withSecrets bool) (types.User, error) {
+	type delegateFn = func(ctx context.Context, username string, withSecrets bool) (types.User, error)
+	args := m.Called(ctx, username, withSecrets)
 	if delegate, ok := args.Get(0).(delegateFn); ok {
-		return delegate(user)
+		return delegate(ctx, username, withSecrets)
 	}
-	return args.Error(0)
+	return args.Get(0).(types.User), args.Error(1)
+}
+
+func (m *mockUserManager) UpsertUser(ctx context.Context, user types.User) (types.User, error) {
+	type delegateFn = func(context.Context, types.User) (types.User, error)
+	args := m.Called(ctx, user)
+	if delegate, ok := args.Get(0).(delegateFn); ok {
+		return delegate(ctx, user)
+	}
+	return args.Get(0).(types.User), args.Error(1)
 }
 
 var _ PresetUsers = &mockUserManager{}
@@ -913,13 +1257,16 @@ func newMockRoleManager(t *testing.T) *mockRoleManager {
 }
 
 // CreateRole creates a role.
-func (m *mockRoleManager) CreateRole(ctx context.Context, role types.Role) error {
-	type delegateFn = func(context.Context, types.Role) error
+func (m *mockRoleManager) CreateRole(ctx context.Context, role types.Role) (types.Role, error) {
+	type delegateFn = func(context.Context, types.Role) (types.Role, error)
 	args := m.Called(ctx, role)
 	if delegate, ok := args[0].(delegateFn); ok {
 		return delegate(ctx, role)
 	}
-	return args.Error(0)
+	if args[0] == nil {
+		return nil, args.Error(1)
+	}
+	return args[0].(types.Role), args.Error(1)
 }
 
 func (m *mockRoleManager) GetRole(ctx context.Context, name string) (types.Role, error) {
@@ -928,16 +1275,19 @@ func (m *mockRoleManager) GetRole(ctx context.Context, name string) (types.Role,
 	if delegate, ok := args[0].(delegateFn); ok {
 		return delegate(ctx, name)
 	}
+	if args[0] == nil {
+		return nil, args.Error(1)
+	}
 	return args[0].(types.Role), args.Error(1)
 }
 
-func (m *mockRoleManager) UpsertRole(ctx context.Context, role types.Role) error {
-	type delegateFn = func(context.Context, types.Role) error
+func (m *mockRoleManager) UpsertRole(ctx context.Context, role types.Role) (types.Role, error) {
+	type delegateFn = func(context.Context, types.Role) (types.Role, error)
 	args := m.Called(ctx, role)
 	if delegate, ok := args[0].(delegateFn); ok {
 		return delegate(ctx, role)
 	}
-	return args.Error(0)
+	return args[0].(types.Role), args.Error(1)
 }
 
 func requireSystemResource(t *testing.T, argno int) func(mock.Arguments) {
@@ -962,16 +1312,28 @@ func setupConfig(t *testing.T) InitConfig {
 	bk, err := lite.New(context.TODO(), backend.Params{"path": tempDir})
 	require.NoError(t, err)
 
+	processStorage, err := storage.NewProcessStorage(
+		context.Background(),
+		filepath.Join(tempDir, teleport.ComponentProcess),
+	)
+	require.NoError(t, err)
+
 	clusterName, err := services.NewClusterNameWithRandomID(types.ClusterNameSpecV2{
 		ClusterName: "me.localhost",
 	})
 	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		bk.Close()
+		processStorage.Close()
+	})
 
 	return InitConfig{
 		DataDir:                 tempDir,
 		HostUUID:                "00000000-0000-0000-0000-000000000000",
 		NodeName:                "foo",
 		Backend:                 bk,
+		VersionStorage:          processStorage,
 		Authority:               testauthority.New(),
 		ClusterAuditConfig:      types.DefaultClusterAuditConfig(),
 		ClusterNetworkingConfig: types.DefaultClusterNetworkingConfig(),
@@ -980,12 +1342,7 @@ func setupConfig(t *testing.T) InitConfig {
 		StaticTokens:            types.DefaultStaticTokens(),
 		AuthPreference:          types.DefaultAuthPreference(),
 		SkipPeriodicOperations:  true,
-		KeyStoreConfig: keystore.Config{
-			Software: keystore.SoftwareConfig{
-				RSAKeyPairSource: testauthority.New().GenerateKeyPair,
-			},
-		},
-		Tracer: tracing.NoopTracer(teleport.ComponentAuth),
+		Tracer:                  tracing.NoopTracer(teleport.ComponentAuth),
 	}
 }
 
@@ -1052,6 +1409,21 @@ spec:
     key: LS0tLS1CRUdJTiBSU0EgUFJJVkFURSBLRVktLS0tLQpNSUlFcEFJQkFBS0NBUUVBdmZQYlVPV3RMYU9QYndzTDVSRENWemFXMnliRUVmbzZNd3RrYVVFditnQjhocVBwCjhyU1VPa2EyYzBJbU11WGFIa05Qa1lUaTNPQmsvQmdUN3RKQlh0TS9mSDJjUy85S0l2NENwRlBQdHhEWWRaKzIKUHArYlJENkpiNVh0R0VaM2w4T1k0SkdBblpramRTM3JvMnFNL1NhMnJrOStEaDVkN1VvWU13RVJMbnoxRTlqKwpjbVFMQWJxSUhOQnNEY3RTZklya013cUNqTXlqZDMyN1YxMG9ua3M1NXBUOG5Oc3N4NnBrM1lEK3JndVdwRk00CkRxdlhXbkVTYWxHMEZNbHZSRlR1TlhUL3BmdGNMT29FWVVwL3FFYkFTdkprbEppT3UvRmRlcUxhamtlbmZjbGIKeVZPa1o5ZjlXOTJ6UXlxK3BGeUpkQmtGN041bys3UUFOMDdBUlFJREFRQUJBb0lCQVFDWkFiTHBxUGdrU1JtaQpncTFrS0duQ3dwQWxtMFpZak0wUWpONm5BZ0ZaU2NjRTFVZi9Yb0gvcHpJVUNYYW5qUXB6VWhqbnlMak0zbHU1CnpOTlJqajlsMkpmTStZbEtsaXJyb053VDdnYmxHVWFqQ0xGT0pGWjNWRUIwaDduaDBmRkhhQ0RlMDVWY1hSeDQKcVRLa0FaSHI0S0ZLSzNJSWdXRjdZREc1OCtRWkl0N01BdDQyc1NrUlhaenNyaUVzVWxZNU9xT1dlVHlkYy93dQpDK292V1FlOUU2bnRSc0EvY25nS0M1bnp6T0pCano3SlVTMGQ2UnBGK1Zodk9SRlZ6YTZKMnpRRXJsWWtFdVVUCkJYdThsVmhhcDVOU09nd3ByZXVmb2tNZVY4eGRNdUxuVEthdHVjajIwT3JFRUlHZVFrb08yTzhTeDJtNitOS0kKbzBTT2kzU0pBb0dCQU5LVkk4R0JHQUpSUlV2NVBnVkNDQ1VHSkFBRmtxY0FMTFlaZ0NMZCtLYStBVW41L2VONwpWemR4b2VqNG1UcnFOb0RLTnk5b0N2Z1RBWTlWZ3RZZllpdlNQbW5ZZk9FbTJUR2pLRTJSYzhBd0R5UWdHWFJVCm5WOUVueHRUUHF5dU9tQTFqa0ladXBLeUU0b0drdTE4MDRVaTB2d2pJUWI3cDdML0ZGYksvaGlmQW9HQkFPYnIKclBrOHdicnBlVk9QWmVudzVzbjVhTUpjdDM3emt4dHZzejVSVWlsZnZtVkdja1lyMU41SGpmZjVVVGcwNmNWdgp1N0dGY0NLQmhncFdqSXM3dHZ4cDhUVFM1VEZaWHZqY2VhRC91ZkFiN3ZUVnR0L1hRMFUwQ28rcDdzMENKWlZKCjY2MUtUU1RCYlFtR0xYYmNqNmFYdVM3bzFJM1FRU1l4NW5LV1F5aWJBb0dCQUtBTWZocUtGVWRkb1g5MnRhNmwKV3k5WWxXLzJ6RmxsQnBaNGx5em83QjArK0JmVGl5V2tEc3V5NzgzemMvS1ZKRXVLWlpzQVJxWDVQQXhHZjZSaQpRZWp3YUVObUtMT3ZKUkJXNDBEaE5jcHlQRy9HZmRJdXBWVk5BR2h5UW9aWC9VSTJNaU1IRHdpRGs5b3AyTzNyCkc1QnF3VlNsRm1zS1JaRUQwZCtOZE1ZZEFvR0FkVDNQRXJQd1FHL3RzNmtvdTBBZVRRbWVVS0EyWWZSVkNpY0sKUUdlVmFZQTg4THAxcG43Mmt1eU5mZ3ROVzFZeUlwWDZHOFYrQzJicm9UQVVKMVRvTVB1eEJYclY5dHBEUitMWQp0ZzlnWGpJd2ZvcExVUmJBQnRESFUrMlpXdWp1SC8vcDhvKzQzeUo5czhvMkp4VVFzaXB5VVFqUmNqYjcvT0owCitGU21RR1VDZ1lBdU5XcFhrbVkzbGtRSEFpU3RlblhTT2Zqc0xsbm5XWFJoTDVBYTZqRVZRT3FnUldVQnZ2YWkKK1RQRTNUTHQ5MGwveTZOdjU0dDdrT1QvSlEvREU4WmFiMERlTjdBRzRwRjMwNkxpYlpZNmswc3M1UDNXME8vbAozekJzQ0lEY3BHOWw4bDZSNkUwdHN0Z0I1c25hOE4rRzA2V3Q1R0M0UitRSVd1YTVpUmtVTXc9PQotLS0tLUVORCBSU0EgUFJJVkFURSBLRVktLS0tLQo=
   type: user
 sub_kind: user
+version: v2`
+	databaseClientCAYAML = `
+kind: cert_authority
+metadata:
+  id: 1696989861240620000
+  name: me.localhost
+spec:
+  active_keys:
+    tls:
+      - cert: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSURqVENDQW5XZ0F3SUJBZ0lSQU5XcUtsOWR3WGYrVTBWUmhxNGEyaTB3RFFZSktvWklodmNOQVFFTEJRQXcKWURFVk1CTUdBMVVFQ2hNTWJXVXViRzlqWVd4b2IzTjBNUlV3RXdZRFZRUURFd3h0WlM1c2IyTmhiR2h2YzNReApNREF1QmdOVkJBVVRKekk0TkRBd09URXhNams0TlRBek1qYzRPVEV3TURJNE5qUXlPREV6TmpRMk9UQTVNamt3Ck9UQWVGdzB5TXpFd01URXdNakEwTWpGYUZ3MHpNekV3TURnd01qQTBNakZhTUdBeEZUQVRCZ05WQkFvVERHMWwKTG14dlkyRnNhRzl6ZERFVk1CTUdBMVVFQXhNTWJXVXViRzlqWVd4b2IzTjBNVEF3TGdZRFZRUUZFeWN5T0RRdwpNRGt4TVRJNU9EVXdNekkzT0RreE1EQXlPRFkwTWpneE16WTBOamt3T1RJNU1Ea3dnZ0VpTUEwR0NTcUdTSWIzCkRRRUJBUVVBQTRJQkR3QXdnZ0VLQW9JQkFRRGlDNU5GVDhmUy9hSzdSSVVRVnFjVmFxaFBzMFNuU0prTmd3azEKUHZkeFV1OWZZMlNwek5NaUUzSGZlb0Y4S1h2YUU0aHJzMEFGOVRmYlpJTnM1RjNHNTNzOUg3Q2JXWHpOWVRtZApCN0gyWEVxVGp3N0xGL2pzYzkwcTN4ZnZqMkk0Z29tOUdYK3dGMXdaRldjZXVJRkJTdXdCRkV6a1Yzc1o5NEVqClBsWUIxK2lnNlJoWGhvUjdhRlJUNDFvZmtMUUovMDdBVmR4blUranp5VkVFSVk3SjUwUWU3bFc2Nk9wL3BncmwKR1FBSnkwbnowUVpVYVJjVmZrODVHK3NwMnhjcUJ6clJHbXNybmw1TmhMdGJqcUJIUkZ2cU5XS1pLa1V2M0NjUApiTytWT1krV1FmV0UzRThhekxUQ2ppcnJXYWVXeTNLR0RTZGF5YktOK0FKbVpqU3hBZ01CQUFHalFqQkFNQTRHCkExVWREd0VCL3dRRUF3SUJwakFQQmdOVkhSTUJBZjhFQlRBREFRSC9NQjBHQTFVZERnUVdCQlFhVmMzdXlYWnoKdDBWLzFnNzE3MzMrRjFhaHNqQU5CZ2txaGtpRzl3MEJBUXNGQUFPQ0FRRUF6NTVkVnVFdmVLdnJtYThzL0dWSQo2Q0t5akNNYXNjWmhwV1JIT3QxRjQ1T0pjcXg1RDBQeVhSenZXS2NTYzlZTkN0M1BzSi8yNGp3VDlLaElqK2NiClQ5Z0h5WXNkb3pWY2NzMXNZTkFjK3VFSmRSOEsydHJqa1JJN0Q5VmZvTEJJVFlHUkJGTWpSOEE1bENlUzVnTkgKRG42V09rSlpRUi9UQS9IbFFlUmttMW5teUp3VVVQOVA0aUVWVlVSS0lMRVVNTS9EdERXdTZuNnM2K0pVVXNDNwp5QmI2T3JQeVRGbkV4TFljN2RhYUM1bm5UVDZHY2xUSm4wYkJ2UmtXdUFVa1FtWXJyYkpBMnhEVjFBL0JOcmp3Ci9aU2ErU1ZlVWJxSW05ZEVESE4zQUhXcmJzbWwyVjI3YUtrMHVUK0JmeUJBZ3NSdGpMN0U2YUdJanlNcStlOW4KYmc9PQotLS0tLUVORCBDRVJUSUZJQ0FURS0tLS0tCg==
+        key: LS0tLS1CRUdJTiBSU0EgUFJJVkFURSBLRVktLS0tLQpNSUlFb3dJQkFBS0NBUUVBNGd1VFJVL0gwdjJpdTBTRkVGYW5GV3FvVDdORXAwaVpEWU1KTlQ3M2NWTHZYMk5rCnFjelRJaE54MzNxQmZDbDcyaE9JYTdOQUJmVTMyMlNEYk9SZHh1ZDdQUit3bTFsOHpXRTVuUWV4OWx4S2s0OE8KeXhmNDdIUGRLdDhYNzQ5aU9JS0p2Umwvc0JkY0dSVm5IcmlCUVVyc0FSUk01RmQ3R2ZlQkl6NVdBZGZvb09rWQpWNGFFZTJoVVUrTmFINUMwQ2Y5T3dGWGNaMVBvODhsUkJDR095ZWRFSHU1VnV1anFmNllLNVJrQUNjdEo4OUVHClZHa1hGWDVQT1J2cktkc1hLZ2M2MFJwcks1NWVUWVM3VzQ2Z1IwUmI2alZpbVNwRkw5d25EMnp2bFRtUGxrSDEKaE54UEdzeTB3bzRxNjFtbmxzdHloZzBuV3NteWpmZ0NabVkwc1FJREFRQUJBb0lCQUQ5R01EWkJxOVRDek0rUQowWktPUHZ6K3V4aDhQT1o2cXVVZVhmQjZyTGNiR1FoaGdTY0t2N3NWS0ZYL0s4bStydjJQWkN1SnBJMUdaQmxVCm5IbFp2MnBURjZzM2VLOHpzSHlwRDRDR1MrbURVaGpWL2JVYUE4TGtkKzl0UFgwQWJPVVduVW5Dbm55RFBYT0UKQ3phTlBSa3l5TGRRb0dsMmwyM2dXMVNyT1ZZUVBEUjZncWVJZVFYa3pHYUFUQ2twZWYrOVk4US9pTkZUR05oZAppamtXSUZOdEYzQjdIODUwdnR0VFFRckE3QXQ3ZnN2bmo2YVVDUkQ3MmFYZGJmeHIwK0VQbUR6WGNhejM3U20yClg3ZkJrakRFa0pCa0gwVnBnZHdvMDh3cmtzbnBieUNpbE95alp4Z3lhUWw2NGFKcGVUN1FHbEMxcm1kUEFmTU4KSEdweFBwVUNnWUVBK21vbllBVW1oSVpTR0R6VjI0NFc0QVRnVFdGb2gxb24wKzlZZ2xxR1RUZFFBM2dXYy9ReQowSmJ6QXpOVFZnODNibWhvU3NtbUMwZ1BoSytBb3BCZXc5ZlVxMmhIOVptUzVjZE1CaTJ6cFdvZHQrWXMvNys1Ckk3d3d2bGgvY3llelQvU0ZyazVCVVB0azZFR1pLZk1KdGZlNDcvb05uUzRmc3lmYlAyWDVUWHNDZ1lFQTV4WkcKSmhiYkwwWFljL0plc0JucXBuRFZHNXhkbkh6aGx0aVB3QzdGbHRDRUpuNFdhTUNpSUtsL0o3VGUzbndqMHk0YQpSVzFTWGN6anc5dHZxY0V3aE9CQUZBUHlsd0FWWjUyOTRzdWZzMnk4SHBFcFhhMjlIRXNReW50TE9JRFZyYkVsClJCV1pEb0xhbllVRTNtWml5WnZ0ZU9TT0hTajVhUnIzRTg1UmtNTUNnWUFweUVLUG8reGNXbWtpUUN4U3VPK2EKSzFZZHN5NFV2M2M3eG9qWEh6R2ZlcVl3SGY1cEZJclNBUTNGTC9Bc3dOYzM1ZFhZL0xKbTJYdzFZRzh2TUxXUApLZGtEVEtBTkc3WEYveTN4TGZqMmxiRWx1Uk16RFJOZ0lndGtCeklremEvK25FY2Q0VkxHcDF1YjRTNGtNTGdqCkU1VlkvVGorUys3Z0hydFhaYlZtTndLQmdET3A2eTBBMXlnT2VZSVNvZERGT296VGxSR0ROL3FRZ083MG84N1gKcGgwOXFRM2lDcWlJeUxaOHJvejJCdzIrdTFPdmJ2Z3VwTWVMMHpBcWt5QmtyTEJJWW9zWEJ0bHpqMVdIRXJqdAp4VnFiNk1MOHVUN1VaUDg2V1JxcnpmbG45RjNNeVFRYndBaGFnUDNPaTNRZGQrQ1RGOWg3WUxwc09yYWc3TFJrCjRCOTVBb0dCQU9maHNVSzVSZm1RU1ZzN08wMmMrdWFVelB2dnEwaXNqNW45dWlOaFQxdjFDUGY4YStZdkkyTisKcWV5bHkwRjN3L2sxbElaUzFjWlMwRDVWMUd6bmVHTUgreWYwVFAvNmlUcElHTC94N1pTNGJEZjE3dEc5dklDdgoya1JBTno5WHpzVzFETm9CRkJmZXg5NDFmT0RzdHlvdThvYmF3dDdJWThTdU1GMHV3aDlBCi0tLS0tRU5EIFJTQSBQUklWQVRFIEtFWS0tLS0tCg==
+  additional_trusted_keys: {}
+  cluster_name: me.localhost
+  type: db_client
+sub_kind: db_client
 version: v2`
 	databaseCAYAML = `kind: cert_authority
 metadata:
@@ -1127,7 +1499,8 @@ func TestInit_bootstrap(t *testing.T) {
 	hostCA := resourceFromYAML(t, hostCAYAML).(types.CertAuthority)
 	userCA := resourceFromYAML(t, userCAYAML).(types.CertAuthority)
 	jwtCA := resourceFromYAML(t, jwtCAYAML).(types.CertAuthority)
-	dbCA := resourceFromYAML(t, databaseCAYAML).(types.CertAuthority)
+	dbServerCA := resourceFromYAML(t, databaseCAYAML).(types.CertAuthority)
+	dbClientCA := resourceFromYAML(t, databaseClientCAYAML).(types.CertAuthority)
 	osshCA := resourceFromYAML(t, openSSHCAYAML).(types.CertAuthority)
 	samlCA := resourceFromYAML(t, samlCAYAML).(types.CertAuthority)
 
@@ -1137,8 +1510,10 @@ func TestInit_bootstrap(t *testing.T) {
 	invalidUserCA.(*types.CertAuthorityV2).Spec.ActiveKeys.SSH = nil
 	invalidJWTCA := resourceFromYAML(t, jwtCAYAML).(types.CertAuthority)
 	invalidJWTCA.(*types.CertAuthorityV2).Spec.ActiveKeys.JWT = nil
-	invalidDBCA := resourceFromYAML(t, databaseCAYAML).(types.CertAuthority)
-	invalidDBCA.(*types.CertAuthorityV2).Spec.ActiveKeys.TLS = nil
+	invalidDBServerCA := resourceFromYAML(t, databaseCAYAML).(types.CertAuthority)
+	invalidDBServerCA.(*types.CertAuthorityV2).Spec.ActiveKeys.TLS = nil
+	invalidDBClientCA := resourceFromYAML(t, databaseClientCAYAML).(types.CertAuthority)
+	invalidDBClientCA.(*types.CertAuthorityV2).Spec.ActiveKeys.TLS = nil
 	invalidOSSHCA := resourceFromYAML(t, openSSHCAYAML).(types.CertAuthority)
 	invalidOSSHCA.(*types.CertAuthorityV2).Spec.ActiveKeys.SSH = nil
 	invalidSAMLCA := resourceFromYAML(t, samlCAYAML).(types.CertAuthority)
@@ -1158,7 +1533,8 @@ func TestInit_bootstrap(t *testing.T) {
 					hostCA.Clone(),
 					userCA.Clone(),
 					jwtCA.Clone(),
-					dbCA.Clone(),
+					dbServerCA.Clone(),
+					dbClientCA.Clone(),
 					osshCA.Clone(),
 					samlCA.Clone(),
 				)
@@ -1173,7 +1549,8 @@ func TestInit_bootstrap(t *testing.T) {
 					invalidHostCA.Clone(),
 					userCA.Clone(),
 					jwtCA.Clone(),
-					dbCA.Clone(),
+					dbServerCA.Clone(),
+					dbClientCA.Clone(),
 					osshCA.Clone(),
 					samlCA.Clone(),
 				)
@@ -1188,7 +1565,8 @@ func TestInit_bootstrap(t *testing.T) {
 					hostCA.Clone(),
 					invalidUserCA.Clone(),
 					jwtCA.Clone(),
-					dbCA.Clone(),
+					dbServerCA.Clone(),
+					dbClientCA.Clone(),
 					osshCA.Clone(),
 					samlCA.Clone(),
 				)
@@ -1203,7 +1581,8 @@ func TestInit_bootstrap(t *testing.T) {
 					hostCA.Clone(),
 					userCA.Clone(),
 					invalidJWTCA.Clone(),
-					dbCA.Clone(),
+					dbServerCA.Clone(),
+					dbClientCA.Clone(),
 					osshCA.Clone(),
 					samlCA.Clone(),
 				)
@@ -1218,7 +1597,23 @@ func TestInit_bootstrap(t *testing.T) {
 					hostCA.Clone(),
 					userCA.Clone(),
 					jwtCA.Clone(),
-					invalidDBCA.Clone(),
+					invalidDBServerCA.Clone(),
+					osshCA.Clone(),
+					samlCA.Clone(),
+				)
+			},
+			assertError: require.Error,
+		},
+		{
+			name: "NOK bootstrap Database Client CA missing keys",
+			modifyConfig: func(cfg *InitConfig) {
+				cfg.BootstrapResources = append(
+					cfg.BootstrapResources,
+					hostCA.Clone(),
+					userCA.Clone(),
+					jwtCA.Clone(),
+					dbServerCA.Clone(),
+					invalidDBClientCA.Clone(),
 					osshCA.Clone(),
 					samlCA.Clone(),
 				)
@@ -1233,7 +1628,8 @@ func TestInit_bootstrap(t *testing.T) {
 					hostCA.Clone(),
 					userCA.Clone(),
 					jwtCA.Clone(),
-					dbCA.Clone(),
+					dbServerCA.Clone(),
+					dbClientCA.Clone(),
 					invalidOSSHCA.Clone(),
 					samlCA.Clone(),
 				)
@@ -1248,7 +1644,8 @@ func TestInit_bootstrap(t *testing.T) {
 					hostCA.Clone(),
 					userCA.Clone(),
 					jwtCA.Clone(),
-					dbCA.Clone(),
+					dbServerCA.Clone(),
+					dbClientCA.Clone(),
 					osshCA.Clone(),
 					invalidSAMLCA.Clone(),
 				)
@@ -1271,7 +1668,7 @@ const (
 	userYAML = `kind: user
 version: v2
 metadata:
-  name: joe
+  name: myuser
 spec:
   roles: ["admin"]`
 	tokenYAML = `kind: token
@@ -1286,6 +1683,51 @@ spec:
   github:
     allow:
       - repository: gravitational/example`
+	roleYAML = `kind: role
+version: v7
+metadata:
+  name: admin
+  expires: "3000-01-01T00:00:00Z"
+spec:
+  allow:
+    logins: ['admin']
+    kubernetes_groups: ['edit']
+    node_labels:
+      '*': '*'
+    kubernetes_labels:
+      '*': '*'
+    kubernetes_resources:
+      - kind: '*'
+        namespace: '*'
+        name: '*'
+        verbs: ['*']`
+	lockYAML = `
+kind: lock
+version: v2
+metadata:
+  name: b1c785d8-8165-41fc-8dd6-252d534334d3
+spec:
+  created_at: "2023-11-07T18:44:35.361806Z"
+  created_by: Admin
+  target:
+    user: myuser
+`
+	clusterNetworkingConfYAML = `
+kind: cluster_networking_config
+metadata:
+  name: cluster-networking-config
+spec:
+  proxy_listener_mode: 1
+`
+	authPrefYAML = `
+kind: cluster_auth_preference
+metadata:
+  name: cluster-auth-preference
+spec:
+  second_factor: off
+  type: local
+version: v2
+`
 )
 
 func TestInit_ApplyOnStartup(t *testing.T) {
@@ -1293,6 +1735,10 @@ func TestInit_ApplyOnStartup(t *testing.T) {
 
 	user := resourceFromYAML(t, userYAML).(types.User)
 	token := resourceFromYAML(t, tokenYAML).(types.ProvisionToken)
+	role := resourceFromYAML(t, roleYAML).(types.Role)
+	lock := resourceFromYAML(t, lockYAML).(types.Lock)
+	clusterNetworkingConfig := resourceFromYAML(t, clusterNetworkingConfYAML).(types.ClusterNetworkingConfig)
+	authPref := resourceFromYAML(t, authPrefYAML).(types.AuthPreference)
 
 	tests := []struct {
 		name         string
@@ -1302,7 +1748,10 @@ func TestInit_ApplyOnStartup(t *testing.T) {
 		{
 			name: "Apply unsupported resource",
 			modifyConfig: func(cfg *InitConfig) {
+				cfg.ApplyOnStartupResources = append(cfg.ApplyOnStartupResources, lock)
 				cfg.ApplyOnStartupResources = append(cfg.ApplyOnStartupResources, user)
+				cfg.ApplyOnStartupResources = append(cfg.ApplyOnStartupResources, role)
+				cfg.ApplyOnStartupResources = append(cfg.ApplyOnStartupResources, token)
 			},
 			assertError: require.Error,
 		},
@@ -1310,6 +1759,51 @@ func TestInit_ApplyOnStartup(t *testing.T) {
 			name: "Apply ProvisionToken",
 			modifyConfig: func(cfg *InitConfig) {
 				cfg.ApplyOnStartupResources = append(cfg.ApplyOnStartupResources, token)
+			},
+			assertError: require.NoError,
+		},
+		{
+			name: "Apply User (invalid, missing role)",
+			modifyConfig: func(cfg *InitConfig) {
+				cfg.ApplyOnStartupResources = append(cfg.ApplyOnStartupResources, user)
+			},
+			assertError: require.Error,
+		},
+		// We test both user+role and role+user to validate that ordering doesn't matter
+		{
+			name: "Apply User+Role",
+			modifyConfig: func(cfg *InitConfig) {
+				cfg.ApplyOnStartupResources = append(cfg.ApplyOnStartupResources, user)
+				cfg.ApplyOnStartupResources = append(cfg.ApplyOnStartupResources, role)
+			},
+			assertError: require.NoError,
+		},
+		{
+			name: "Apply Role+User",
+			modifyConfig: func(cfg *InitConfig) {
+				cfg.ApplyOnStartupResources = append(cfg.ApplyOnStartupResources, user)
+				cfg.ApplyOnStartupResources = append(cfg.ApplyOnStartupResources, role)
+			},
+			assertError: require.NoError,
+		},
+		{
+			name: "Apply Role",
+			modifyConfig: func(cfg *InitConfig) {
+				cfg.ApplyOnStartupResources = append(cfg.ApplyOnStartupResources, role)
+			},
+			assertError: require.NoError,
+		},
+		{
+			name: "Apply ClusterNetworkingConfig",
+			modifyConfig: func(cfg *InitConfig) {
+				cfg.ApplyOnStartupResources = append(cfg.ApplyOnStartupResources, clusterNetworkingConfig)
+			},
+			assertError: require.NoError,
+		},
+		{
+			name: "Apply AuthPreference",
+			modifyConfig: func(cfg *InitConfig) {
+				cfg.ApplyOnStartupResources = append(cfg.ApplyOnStartupResources, authPref)
 			},
 			assertError: require.NoError,
 		},
@@ -1339,7 +1833,7 @@ func resourceFromYAML(t *testing.T, value string) types.Resource {
 
 func resourceDiff(res1, res2 types.Resource) string {
 	return cmp.Diff(res1, res2,
-		cmpopts.IgnoreFields(types.Metadata{}, "ID", "Namespace"),
+		cmpopts.IgnoreFields(types.Metadata{}, "Revision", "Namespace"),
 		cmpopts.EquateEmpty())
 }
 
@@ -1548,7 +2042,7 @@ func TestIdentityChecker(t *testing.T) {
 				"test",
 				utils.NetAddr{AddrNetwork: "tcp", Addr: "localhost:0"},
 				handler,
-				[]ssh.Signer{test.cert},
+				sshutils.StaticHostSigners(test.cert),
 				sshutils.AuthMethods{NoClient: true},
 				sshutils.SetInsecureSkipHostValidation(),
 			)
@@ -1556,7 +2050,7 @@ func TestIdentityChecker(t *testing.T) {
 			t.Cleanup(func() { sshServer.Close() })
 			require.NoError(t, sshServer.Start())
 
-			identity, err := GenerateIdentity(authServer, IdentityID{
+			identity, err := GenerateIdentity(authServer, state.IdentityID{
 				Role:     types.RoleNode,
 				HostUUID: uuid.New().String(),
 				NodeName: "node-1",
@@ -1592,5 +2086,188 @@ func TestInitCreatesCertsIfMissing(t *testing.T) {
 		cert, err := auth.GetCertAuthorities(ctx, caType, false)
 		require.NoError(t, err)
 		require.Len(t, cert, 1)
+	}
+}
+
+func TestTeleportProcessAuthVersionUpgradeCheck(t *testing.T) {
+	lib.SetInsecureDevMode(true)
+	defer lib.SetInsecureDevMode(false)
+
+	tests := []struct {
+		name            string
+		initialVersion  string
+		expectedVersion string
+		expectError     bool
+		skipCheck       bool
+	}{
+		{
+			name:            "first-launch",
+			initialVersion:  "",
+			expectedVersion: teleport.Version,
+			expectError:     false,
+		},
+		{
+			name:            "old-version-upgrade",
+			initialVersion:  fmt.Sprintf("%d.0.0", teleport.SemVersion.Major-1),
+			expectedVersion: teleport.Version,
+			expectError:     false,
+		},
+		{
+			name:            "major-upgrade-fail",
+			initialVersion:  fmt.Sprintf("%d.0.0", teleport.SemVersion.Major-2),
+			expectedVersion: fmt.Sprintf("%d.0.0", teleport.SemVersion.Major-2),
+			expectError:     true,
+		},
+		{
+			name:            "major-upgrade-with-dev-skip-check",
+			initialVersion:  fmt.Sprintf("%d.0.0", teleport.SemVersion.Major-2),
+			expectedVersion: fmt.Sprintf("%d.0.0", teleport.SemVersion.Major-2),
+			expectError:     false,
+			skipCheck:       true,
+		},
+		{
+			name:            "major-downgrade-fail",
+			initialVersion:  fmt.Sprintf("%d.0.0", teleport.SemVersion.Major+2),
+			expectedVersion: fmt.Sprintf("%d.0.0", teleport.SemVersion.Major+2),
+			expectError:     true,
+		},
+		{
+			name:            "major-downgrade-with-dev-skip-check",
+			initialVersion:  fmt.Sprintf("%d.0.0", teleport.SemVersion.Major+2),
+			expectedVersion: fmt.Sprintf("%d.0.0", teleport.SemVersion.Major+2),
+			expectError:     false,
+			skipCheck:       true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			authCfg := setupConfig(t)
+
+			if test.initialVersion != "" {
+				err := authCfg.VersionStorage.WriteTeleportVersion(ctx, semver.New(test.initialVersion))
+				require.NoError(t, err)
+			}
+			if test.skipCheck {
+				t.Setenv(skipVersionUpgradeCheckEnv, "yes")
+			}
+
+			_, err := Init(ctx, authCfg)
+			if test.expectError {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+
+			lastKnownVersion, err := authCfg.VersionStorage.GetTeleportVersion(ctx)
+			require.NoError(t, err)
+			require.Equal(t, test.expectedVersion, lastKnownVersion.String())
+		})
+	}
+}
+
+type mockDatabaseObjectImportRules struct {
+	services.DatabaseObjectImportRules
+	listRules []*dbobjectimportrulev1.DatabaseObjectImportRule
+	created   *dbobjectimportrulev1.DatabaseObjectImportRule
+	upserted  *dbobjectimportrulev1.DatabaseObjectImportRule
+}
+
+func (m *mockDatabaseObjectImportRules) ListDatabaseObjectImportRules(context.Context, int, string) ([]*dbobjectimportrulev1.DatabaseObjectImportRule, string, error) {
+	return m.listRules, "", nil
+}
+func (m *mockDatabaseObjectImportRules) CreateDatabaseObjectImportRule(ctx context.Context, rule *dbobjectimportrulev1.DatabaseObjectImportRule) (*dbobjectimportrulev1.DatabaseObjectImportRule, error) {
+	m.created = rule
+	return rule, nil
+}
+func (m *mockDatabaseObjectImportRules) UpsertDatabaseObjectImportRule(ctx context.Context, rule *dbobjectimportrulev1.DatabaseObjectImportRule) (*dbobjectimportrulev1.DatabaseObjectImportRule, error) {
+	m.upserted = rule
+	return rule, nil
+}
+
+func Test_createPresetDatabaseObjectImportRule(t *testing.T) {
+	presetRule := databaseobjectimportrule.NewPresetImportAllObjectsRule()
+	require.NotNil(t, presetRule)
+
+	customRule, err := databaseobjectimportrule.NewDatabaseObjectImportRule("dev_rule", &dbobjectimportrulev1.DatabaseObjectImportRuleSpec{
+		Priority:       100,
+		DatabaseLabels: label.FromMap(map[string][]string{"env": {"dev"}}),
+		Mappings: []*dbobjectimportrulev1.DatabaseObjectImportRuleMapping{{
+			Match: &dbobjectimportrulev1.DatabaseObjectImportMatch{
+				TableNames: []string{"*"},
+			},
+			AddLabels: map[string]string{
+				"env": "dev",
+			},
+			Scope: &dbobjectimportrulev1.DatabaseObjectImportScope{
+				SchemaNames: []string{"public"},
+			},
+		}},
+	})
+	require.NoError(t, err)
+
+	oldPresetRule, err := databaseobjectimportrule.NewDatabaseObjectImportRule("import_all_objects", &dbobjectimportrulev1.DatabaseObjectImportRuleSpec{
+		DatabaseLabels: label.FromMap(map[string][]string{"*": {"*"}}),
+		Mappings: []*dbobjectimportrulev1.DatabaseObjectImportRuleMapping{
+			{
+				Match:     &dbobjectimportrulev1.DatabaseObjectImportMatch{TableNames: []string{"*"}},
+				AddLabels: map[string]string{"kind": "table"},
+			},
+			{
+				Match:     &dbobjectimportrulev1.DatabaseObjectImportMatch{ViewNames: []string{"*"}},
+				AddLabels: map[string]string{"kind": "view"},
+			},
+			{
+				Match:     &dbobjectimportrulev1.DatabaseObjectImportMatch{ProcedureNames: []string{"*"}},
+				AddLabels: map[string]string{"kind": "procedure"},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	tests := []struct {
+		name          string
+		existingRules []*dbobjectimportrulev1.DatabaseObjectImportRule
+		expectCreate  *dbobjectimportrulev1.DatabaseObjectImportRule
+		expectUpsert  *dbobjectimportrulev1.DatabaseObjectImportRule
+	}{
+		{
+			name:         "create preset in new cluster",
+			expectCreate: presetRule,
+		},
+		{
+			name:          "no action with custom rule",
+			existingRules: []*dbobjectimportrulev1.DatabaseObjectImportRule{customRule},
+		},
+		{
+			name:          "no action with old preset and custom rule",
+			existingRules: []*dbobjectimportrulev1.DatabaseObjectImportRule{oldPresetRule, customRule},
+		},
+		{
+			name:          "no action with preset rule",
+			existingRules: []*dbobjectimportrulev1.DatabaseObjectImportRule{presetRule},
+		},
+		{
+			name:          "migrate old preset to new",
+			existingRules: []*dbobjectimportrulev1.DatabaseObjectImportRule{oldPresetRule},
+			expectUpsert:  presetRule,
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			m := &mockDatabaseObjectImportRules{
+				listRules: test.existingRules,
+			}
+
+			err := createPresetDatabaseObjectImportRule(context.Background(), m)
+			require.NoError(t, err)
+			require.True(t, proto.Equal(test.expectCreate, m.created))
+			require.True(t, proto.Equal(test.expectUpsert, m.upserted))
+		})
 	}
 }

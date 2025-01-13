@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package gcp
 
@@ -18,6 +22,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -26,8 +31,8 @@ import (
 	"github.com/googleapis/gax-go/v2"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	"github.com/sirupsen/logrus"
 
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/utils/gcp"
 	"github.com/gravitational/teleport/lib/cloud"
 	"github.com/gravitational/teleport/lib/defaults"
@@ -63,8 +68,8 @@ var _ cloudClientGCP = (*cloudClientGCPImpl[iamCredentialsClient])(nil)
 type HandlerConfig struct {
 	// RoundTripper is the underlying transport given to an oxy Forwarder.
 	RoundTripper http.RoundTripper
-	// Log is the Logger.
-	Log utils.FieldLoggerWithWriter
+	// Log is a logger for the handler.
+	Log *slog.Logger
 	// Clock is used to override time in tests.
 	Clock clockwork.Clock
 	// cloudClientGCP holds a reference to GCP IAM client. Normally set in CheckAndSetDefaults, it is overridden in tests.
@@ -84,7 +89,7 @@ func (s *HandlerConfig) CheckAndSetDefaults() error {
 		s.Clock = clockwork.NewRealClock()
 	}
 	if s.Log == nil {
-		s.Log = logrus.WithField(trace.Component, "gcp:fwd")
+		s.Log = slog.With(teleport.ComponentKey, "gcp:fwd")
 	}
 	if s.cloudClientGCP == nil {
 		clients, err := cloud.NewClients()
@@ -144,6 +149,9 @@ func newGCPHandler(ctx context.Context, config HandlerConfig) (*handler, error) 
 
 // RoundTrip handles incoming requests and forwards them to the proper API.
 func (s *handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.Body != nil {
+		req.Body = utils.MaxBytesReader(w, req.Body, teleport.MaxHTTPRequestSize)
+	}
 	if err := s.serveHTTP(w, req); err != nil {
 		s.formatForwardResponseError(w, req, err)
 		return
@@ -156,7 +164,10 @@ func (s *handler) serveHTTP(w http.ResponseWriter, req *http.Request) error {
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	s.Log.Debugf("Processing request, sessionId = %q, gcpServiceAccount = %q", sessionCtx.Identity.RouteToApp.SessionID, sessionCtx.Identity.RouteToApp.GCPServiceAccount)
+	s.Log.DebugContext(req.Context(), "Processing request",
+		"session_id", sessionCtx.Identity.RouteToApp.SessionID,
+		"gcp_service_account", sessionCtx.Identity.RouteToApp.GCPServiceAccount,
+	)
 
 	fwdRequest, err := s.prepareForwardRequest(req, sessionCtx)
 	if err != nil {
@@ -168,13 +179,13 @@ func (s *handler) serveHTTP(w http.ResponseWriter, req *http.Request) error {
 
 	if err := sessionCtx.Audit.OnRequest(req.Context(), sessionCtx, fwdRequest, status, nil); err != nil {
 		// log but don't return the error, because we already handed off request/response handling to the oxy forwarder.
-		s.Log.WithError(err).Warn("Failed to emit audit event.")
+		s.Log.WarnContext(req.Context(), "Failed to emit audit event.", "error", err)
 	}
 	return nil
 }
 
 func (s *handler) formatForwardResponseError(rw http.ResponseWriter, r *http.Request, err error) {
-	s.Log.WithError(err).Debugf("Failed to process request.")
+	s.Log.DebugContext(r.Context(), "Failed to process request.", "error", err)
 	common.SetTeleportAPIErrorHeader(rw, err)
 
 	// Convert trace error type to HTTP and write response.
@@ -216,7 +227,7 @@ func (s *handler) prepareForwardRequest(r *http.Request, sessionCtx *common.Sess
 func (s *handler) replaceAuthHeaders(r *http.Request, sessionCtx *common.SessionContext, reqCopy *http.Request) error {
 	auth := reqCopy.Header.Get("Authorization")
 	if auth == "" {
-		s.Log.Debugf("No Authorization header present, skipping replacement.")
+		s.Log.DebugContext(r.Context(), "No Authorization header present, skipping replacement.")
 		return nil
 	}
 

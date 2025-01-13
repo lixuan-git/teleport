@@ -1,38 +1,76 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React from 'react';
-
-import { wait } from 'shared/utils/wait';
-
-import { MockWorkspaceContextProvider } from 'teleterm/ui/fixtures/MockWorkspaceContextProvider';
-import { makeRootCluster } from 'teleterm/services/tshd/testHelpers';
-import { MockAppContext } from 'teleterm/ui/fixtures/mocks';
-import { MockAppContextProvider } from 'teleterm/ui/fixtures/MockAppContextProvider';
-
-import { createMockConfigService } from 'teleterm/services/config/fixtures/mocks';
+import { useEffect, useLayoutEffect, useRef } from 'react';
 
 import { AgentProcessState } from 'teleterm/mainProcess/types';
+import { makeRootCluster } from 'teleterm/services/tshd/testHelpers';
+import { ResourcesContextProvider } from 'teleterm/ui/DocumentCluster/resourcesContext';
+import { MockAppContextProvider } from 'teleterm/ui/fixtures/MockAppContextProvider';
+import { MockAppContext } from 'teleterm/ui/fixtures/mocks';
+import { MockWorkspaceContextProvider } from 'teleterm/ui/fixtures/MockWorkspaceContextProvider';
 
-import { NavigationMenu } from './NavigationMenu';
 import { ConnectMyComputerContextProvider } from './connectMyComputerContext';
+import { NavigationMenu } from './NavigationMenu';
 
 export default {
   title: 'Teleterm/ConnectMyComputer/NavigationMenu',
 };
+
+export function AgenNotConfigured() {
+  return (
+    <ShowState
+      agentProcessState={{ status: 'not-started' }}
+      isAgentConfigFileCreated={async () => {
+        return false;
+      }}
+    />
+  );
+}
+
+export function AgentConfiguredButNotStarted() {
+  return <ShowState agentProcessState={{ status: 'not-started' }} />;
+}
+
+export function AgentStarting() {
+  const abortControllerRef = useRef(new AbortController());
+
+  useEffect(() => {
+    return () => {
+      abortControllerRef.current.abort();
+    };
+  }, []);
+
+  const appContext = new MockAppContext({ appVersion: '17.0.0' });
+
+  appContext.connectMyComputerService.downloadAgent = () =>
+    new Promise((resolve, reject) => {
+      abortControllerRef.current.signal.addEventListener('abort', () => reject);
+    });
+
+  return (
+    <ShowState
+      appContext={appContext}
+      agentProcessState={{ status: 'not-started' }}
+      autoStart={true}
+    />
+  );
+}
 
 export function AgentRunning() {
   return <ShowState agentProcessState={{ status: 'running' }} />;
@@ -76,25 +114,24 @@ export function AgentExitedUnsuccessfully() {
   );
 }
 
-export function AgentSetupNotDone() {
-  return (
-    <ShowState
-      agentProcessState={{ status: 'not-started' }}
-      isAgentConfigFileCreated={async () => {
-        return false;
-      }}
-    />
-  );
-}
-
 export function LoadingAgentConfigFile() {
+  const abortControllerRef = useRef(new AbortController());
+
+  useEffect(() => {
+    return () => {
+      abortControllerRef.current.abort();
+    };
+  }, []);
+
+  const getPromiseRejectedOnUnmount = () =>
+    new Promise<boolean>((resolve, reject) => {
+      abortControllerRef.current.signal.addEventListener('abort', () => reject);
+    });
+
   return (
     <ShowState
       agentProcessState={{ status: 'not-started' }}
-      isAgentConfigFileCreated={async () => {
-        await wait(60_000);
-        return true;
-      }}
+      isAgentConfigFileCreated={getPromiseRejectedOnUnmount}
     />
   );
 }
@@ -113,18 +150,18 @@ export function FailedToLoadAgentConfigFile() {
 function ShowState({
   isAgentConfigFileCreated = async () => true,
   agentProcessState,
+  appContext = new MockAppContext(),
+  autoStart = false,
 }: {
   agentProcessState: AgentProcessState;
   isAgentConfigFileCreated?: () => Promise<boolean>;
+  appContext?: MockAppContext;
+  autoStart?: boolean;
 }) {
   const cluster = makeRootCluster({
-    features: { isUsageBasedBilling: true, advancedAccessWorkflows: false },
+    proxyVersion: '17.0.0',
   });
-  const appContext = new MockAppContext();
   appContext.clustersService.state.clusters.set(cluster.uri, cluster);
-  appContext.configService = createMockConfigService({
-    'feature.connectMyComputer': true,
-  });
   appContext.workspacesService.setState(draftState => {
     draftState.rootClusterUri = cluster.uri;
     draftState.workspaces[cluster.uri] = {
@@ -139,12 +176,29 @@ function ShowState({
   appContext.connectMyComputerService.isAgentConfigFileCreated =
     isAgentConfigFileCreated;
 
+  if (autoStart) {
+    appContext.workspacesService.setConnectMyComputerAutoStart(
+      cluster.uri,
+      true
+    );
+  }
+
+  useLayoutEffect(() => {
+    (
+      document.querySelector(
+        '[data-testid=connect-my-computer-icon]'
+      ) as HTMLButtonElement
+    )?.click();
+  });
+
   return (
     <MockAppContextProvider appContext={appContext}>
       <MockWorkspaceContextProvider rootClusterUri={cluster.uri}>
-        <ConnectMyComputerContextProvider rootClusterUri={cluster.uri}>
-          <NavigationMenu />
-        </ConnectMyComputerContextProvider>
+        <ResourcesContextProvider>
+          <ConnectMyComputerContextProvider rootClusterUri={cluster.uri}>
+            <NavigationMenu />
+          </ConnectMyComputerContextProvider>
+        </ResourcesContextProvider>
       </MockWorkspaceContextProvider>
     </MockAppContextProvider>
   );

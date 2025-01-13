@@ -1,65 +1,85 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import { encodeUrlQueryParams } from './encodeUrlQueryParams';
+import {
+  encodeUrlQueryParams,
+  EncodeUrlQueryParamsProps,
+} from './encodeUrlQueryParams';
 
-test.each([
+const testCases: {
+  title: string;
+  args: EncodeUrlQueryParamsProps;
+  expected: string;
+}[] = [
   {
     title: 'No query params',
-    args: ['/foo', '', null, null, false],
-    expected: '/foo',
+    args: { pathname: '/foo' },
+    expected: '/foo?pinnedOnly=false',
   },
   {
     title: 'Search string',
-    args: ['/test', 'something', null, null, false],
-    expected: '/test?search=something',
+    args: { pathname: '/test', searchString: 'something' },
+    expected: '/test?search=something&pinnedOnly=false',
   },
   {
     title: 'Search string, encoded',
-    args: ['/test', 'a$b$c', null, null, false],
-    expected: '/test?search=a%24b%24c',
+    args: { pathname: '/test', searchString: 'a$b$c' },
+    expected: '/test?search=a%24b%24c&pinnedOnly=false',
   },
   {
     title: 'Advanced search',
-    args: ['/test', 'foo=="bar"', null, null, true],
-    expected: '/test?query=foo%3D%3D%22bar%22',
+    args: {
+      pathname: '/test',
+      searchString: 'foo=="bar"',
+      isAdvancedSearch: true,
+    },
+    expected: '/test?query=foo%3D%3D%22bar%22&pinnedOnly=false',
   },
   {
     title: 'Search and sort',
-    args: ['/test', 'foobar', { fieldName: 'name', dir: 'ASC' }, null, false],
-    expected: '/test?search=foobar&sort=name%3Aasc',
+    args: {
+      pathname: '/test',
+      searchString: 'foobar',
+      sort: { fieldName: 'name', dir: 'ASC' },
+    },
+    expected: '/test?search=foobar&sort=name%3Aasc&pinnedOnly=false',
   },
   {
     title: 'Sort only',
-    args: ['/test', '', { fieldName: 'name', dir: 'ASC' }, null, false],
-    expected: '/test?sort=name%3Aasc',
+    args: {
+      pathname: '/test',
+      sort: { fieldName: 'name', dir: 'ASC' },
+    },
+    expected: '/test?sort=name%3Aasc&pinnedOnly=false',
   },
   {
     title: 'Search, sort, and filter by kind',
-    args: [
-      '/test',
-      'foo',
-      { fieldName: 'name', dir: 'DESC' },
-      ['db', 'node'],
-      false,
-    ],
-    expected: '/test?search=foo&sort=name%3Adesc&kinds=db&kinds=node',
+    args: {
+      pathname: '/test',
+      searchString: 'foo',
+      sort: { fieldName: 'name', dir: 'DESC' },
+      kinds: ['db', 'node'],
+    },
+    expected:
+      '/test?search=foo&sort=name%3Adesc&pinnedOnly=false&kinds=db&kinds=node',
   },
-])('$title', ({ args, expected }) => {
-  expect(
-    encodeUrlQueryParams(...(args as Parameters<typeof encodeUrlQueryParams>))
-  ).toBe(expected);
+];
+
+test.each(testCases)('$title', ({ args, expected }) => {
+  expect(encodeUrlQueryParams(args)).toBe(expected);
 });

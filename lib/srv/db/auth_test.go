@@ -1,43 +1,44 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package db
 
 import (
 	"context"
-	"crypto/x509"
-	"crypto/x509/pkix"
+	"crypto/tls"
+	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/elasticache"
+	"github.com/aws/aws-sdk-go/service/memorydb"
 	"github.com/gravitational/trace"
-	"github.com/jonboulle/clockwork"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/oauth2"
 
-	"github.com/gravitational/teleport/api/client/proto"
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/auth"
-	"github.com/gravitational/teleport/lib/auth/testauthority"
+	"github.com/gravitational/teleport/api/utils/keys"
 	"github.com/gravitational/teleport/lib/cloud/mocks"
 	"github.com/gravitational/teleport/lib/defaults"
+	"github.com/gravitational/teleport/lib/fixtures"
 	"github.com/gravitational/teleport/lib/srv/db/common"
-	"github.com/gravitational/teleport/lib/tlsca"
 )
 
 // TestAuthTokens verifies that proper IAM auth tokens are used when connecting
@@ -64,6 +65,10 @@ func TestAuthTokens(t *testing.T) {
 		withAzureRedis("redis-azure-incorrect-token", "qwe123"),
 		withElastiCacheRedis("redis-elasticache-correct-token", elastiCacheRedisToken, "7.0.0"),
 		withElastiCacheRedis("redis-elasticache-incorrect-token", "qwe123", "7.0.0"),
+		withMemoryDBRedis("redis-memorydb-correct-token", memorydbToken, "7.0"),
+		withMemoryDBRedis("redis-memorydb-incorrect-token", "qwe123", "7.0"),
+		withSpanner("spanner-correct-token", cloudSpannerAuthToken),
+		withSpanner("spanner-incorrect-token", "xyz123"),
 	}
 	databases := make([]types.Database, 0, len(withDBs))
 	for _, withDB := range withDBs {
@@ -75,9 +80,16 @@ func TestAuthTokens(t *testing.T) {
 		Authentication: &elasticache.Authentication{Type: aws.String("iam")},
 	}
 	ecMock.AddMockUser(elastiCacheIAMUser, nil)
+	memorydbMock := &mocks.MemoryDBMock{}
+	memorydbIAMUser := &memorydb.User{
+		Name:           aws.String("default"),
+		Authentication: &memorydb.Authentication{Type: aws.String("iam")},
+	}
+	memorydbMock.AddMockUser(memorydbIAMUser, nil)
 	testCtx.server = testCtx.setupDatabaseServer(ctx, t, agentParams{
 		Databases:   databases,
 		ElastiCache: ecMock,
+		MemoryDB:    memorydbMock,
 	})
 	go testCtx.startHandlingConnections()
 
@@ -169,6 +181,29 @@ func TestAuthTokens(t *testing.T) {
 			// Make sure we print a user-friendly IAM auth error.
 			err: "Make sure that IAM auth is enabled",
 		},
+		{
+			desc:     "correct MemoryDB auth token",
+			service:  "redis-memorydb-correct-token",
+			protocol: defaults.ProtocolRedis,
+		},
+		{
+			desc:     "incorrect MemoryDB auth token",
+			service:  "redis-memorydb-incorrect-token",
+			protocol: defaults.ProtocolRedis,
+			// Make sure we print a user-friendly IAM auth error.
+			err: "Make sure that IAM auth is enabled",
+		},
+		{
+			desc:     "correct Spanner auth token",
+			service:  "spanner-correct-token",
+			protocol: defaults.ProtocolSpanner,
+		},
+		{
+			desc:     "incorrect Spanner auth token",
+			service:  "spanner-incorrect-token",
+			protocol: defaults.ProtocolSpanner,
+			err:      "invalid RPC auth token",
+		},
 	}
 
 	for _, test := range tests {
@@ -201,6 +236,23 @@ func TestAuthTokens(t *testing.T) {
 					require.NoError(t, err)
 					require.NoError(t, conn.Close())
 				}
+			case defaults.ProtocolSpanner:
+				clt, localProxy, err := testCtx.spannerClient(ctx, "alice", test.service, "admin", "somedb")
+				// Teleport doesn't actually try to fetch a token until an RPC
+				// is received, so it shouldn't fail after connecting.
+				require.NoError(t, err)
+				t.Cleanup(func() {
+					// Disconnect.
+					clt.Close()
+					_ = localProxy.Close()
+				})
+				_, err = pingSpanner(ctx, clt, 123)
+				if test.err != "" {
+					require.Error(t, err)
+					require.Contains(t, err.Error(), test.err)
+				} else {
+					require.NoError(t, err)
+				}
 			default:
 				t.Fatalf("unrecognized database protocol in test: %q", test.protocol)
 			}
@@ -212,9 +264,9 @@ func TestAuthTokens(t *testing.T) {
 type testAuth struct {
 	// Auth is the wrapped "real" auth that handles everything except for
 	// cloud auth tokens generation.
-	common.Auth
-	// FieldLogger is used for logging.
-	logrus.FieldLogger
+	realAuth common.Auth
+	// Logger is used for logging.
+	*slog.Logger
 }
 
 func newTestAuth(ac common.AuthConfig) (*testAuth, error) {
@@ -223,10 +275,12 @@ func newTestAuth(ac common.AuthConfig) (*testAuth, error) {
 		return nil, trace.Wrap(err)
 	}
 	return &testAuth{
-		Auth:        auth,
-		FieldLogger: logrus.WithField(trace.Component, "auth:test"),
+		realAuth: auth,
+		Logger:   slog.With(teleport.ComponentKey, "auth:test"),
 	}, nil
 }
+
+var _ common.Auth = (*testAuth)(nil)
 
 const (
 	// rdsAuthToken is a mock RDS IAM auth token.
@@ -239,12 +293,16 @@ const (
 	cloudSQLAuthToken = "cloudsql-auth-token"
 	// cloudSQLPassword is a mock Cloud SQL user password.
 	cloudSQLPassword = "cloudsql-password"
+	// cloudSpannerAuthToken is a mock Cloud Spanner IAM auth token.
+	cloudSpannerAuthToken = "cloud-spanner-auth-token"
 	// azureAccessToken is a mock Azure access token.
 	azureAccessToken = "azure-access-token"
 	// azureRedisToken is a mock Azure Redis token.
 	azureRedisToken = "azure-redis-token"
 	// elastiCacheRedisToken is a mock ElastiCache Redis token.
 	elastiCacheRedisToken = "elasticache-redis-token"
+	// memorydbToken is a mock MemoryDB auth token.
+	memorydbToken = "memorydb-token"
 	// atlasAuthUser is a mock Mongo Atlas IAM auth user.
 	atlasAuthUser = "arn:aws:iam::111111111111:role/alice"
 	// atlasAuthToken is a mock Mongo Atlas IAM auth token.
@@ -253,142 +311,109 @@ const (
 	atlasAuthSessionToken = "atlas-session-token"
 )
 
-// GetRDSAuthToken generates RDS/Aurora auth token.
-func (a *testAuth) GetRDSAuthToken(ctx context.Context, sessionCtx *common.Session) (string, error) {
-	a.Infof("Generating RDS auth token for %v.", sessionCtx)
+type fakeTokenSource struct {
+	*slog.Logger
+
+	token string
+	exp   time.Time
+}
+
+func (f *fakeTokenSource) Token() (*oauth2.Token, error) {
+	f.InfoContext(context.Background(), "Generating Cloud Spanner auth token source")
+	return &oauth2.Token{
+		Expiry:      f.exp,
+		AccessToken: f.token,
+	}, nil
+}
+
+func (a *testAuth) GetRDSAuthToken(ctx context.Context, database types.Database, databaseUser string) (string, error) {
+	a.InfoContext(ctx, "Generating RDS auth token.",
+		"database", database,
+		"database_user", databaseUser,
+	)
 	return rdsAuthToken, nil
 }
 
-// GetRedshiftAuthToken generates Redshift auth token.
-func (a *testAuth) GetRedshiftAuthToken(ctx context.Context, sessionCtx *common.Session) (string, string, error) {
-	a.Infof("Generating Redshift auth token for %v.", sessionCtx)
+func (a *testAuth) GetRedshiftAuthToken(ctx context.Context, database types.Database, databaseUser string, databaseName string) (string, string, error) {
+	a.InfoContext(ctx, "Generating Redshift auth token",
+		"database", database,
+		"database_user", databaseUser,
+		"database_name", databaseName,
+	)
 	return redshiftAuthUser, redshiftAuthToken, nil
 }
 
-func (a *testAuth) GetRedshiftServerlessAuthToken(ctx context.Context, sessionCtx *common.Session) (string, string, error) {
+func (a *testAuth) GetRedshiftServerlessAuthToken(ctx context.Context, database types.Database, databaseUser string, databaseName string) (string, string, error) {
 	return "", "", trace.NotImplemented("GetRedshiftServerlessAuthToken is not implemented")
 }
 
-func (a *testAuth) GetElastiCacheRedisToken(ctx context.Context, sessionCtx *common.Session) (string, error) {
+func (a *testAuth) GetElastiCacheRedisToken(ctx context.Context, database types.Database, databaseUser string) (string, error) {
 	return elastiCacheRedisToken, nil
 }
 
-// GetCloudSQLAuthToken generates Cloud SQL auth token.
-func (a *testAuth) GetCloudSQLAuthToken(ctx context.Context, sessionCtx *common.Session) (string, error) {
-	a.Infof("Generating Cloud SQL auth token for %v.", sessionCtx)
+func (a *testAuth) GetMemoryDBToken(ctx context.Context, database types.Database, databaseUser string) (string, error) {
+	return memorydbToken, nil
+}
+
+func (a *testAuth) GetCloudSQLAuthToken(ctx context.Context, databaseUser string) (string, error) {
+	a.InfoContext(ctx, "Generating Cloud SQL auth token", "database_user", databaseUser)
 	return cloudSQLAuthToken, nil
 }
 
-// GetCloudSQLPassword generates Cloud SQL user password.
-func (a *testAuth) GetCloudSQLPassword(ctx context.Context, sessionCtx *common.Session) (string, error) {
-	a.Infof("Generating Cloud SQL user password %v.", sessionCtx)
+func (a *testAuth) GetSpannerTokenSource(ctx context.Context, databaseUser string) (oauth2.TokenSource, error) {
+	return &fakeTokenSource{
+		token:  cloudSpannerAuthToken,
+		Logger: a.Logger.With("database_user", databaseUser),
+	}, nil
+}
+
+func (a *testAuth) GetCloudSQLPassword(ctx context.Context, database types.Database, databaseUser string) (string, error) {
+	a.InfoContext(ctx, "Generating Cloud SQL password",
+		"database", database,
+		"database_user", databaseUser,
+	)
 	return cloudSQLPassword, nil
 }
 
-// GetAzureAccessToken generates Azure access token.
-func (a *testAuth) GetAzureAccessToken(ctx context.Context, sessionCtx *common.Session) (string, error) {
-	a.Infof("Generating Azure access token for %v.", sessionCtx)
+func (a *testAuth) GetAzureAccessToken(ctx context.Context) (string, error) {
+	a.InfoContext(ctx, "Generating Azure access token")
 	return azureAccessToken, nil
 }
 
-// GetAzureCacheForRedisToken retrieves auth token for Azure Cache for Redis.
-func (a *testAuth) GetAzureCacheForRedisToken(ctx context.Context, sessionCtx *common.Session) (string, error) {
-	a.Infof("Generating Azure Redis token for %v.", sessionCtx)
+func (a *testAuth) GetAzureCacheForRedisToken(ctx context.Context, database types.Database) (string, error) {
+	a.InfoContext(ctx, "Generating Azure Redis token", "database", database)
 	return azureRedisToken, nil
 }
 
-// GetAWSIAMCreds returns the AWS IAM credentials, including access key, secret
-// access key and session token.
-func (a *testAuth) GetAWSIAMCreds(ctx context.Context, sessionCtx *common.Session) (string, string, string, error) {
-	a.Infof("Generating AWS IAM credentials for %v.", sessionCtx)
+func (a *testAuth) GetTLSConfig(ctx context.Context, expiry time.Time, database types.Database, databaseUser string) (*tls.Config, error) {
+	return a.realAuth.GetTLSConfig(ctx, expiry, database, databaseUser)
+}
+
+func (a *testAuth) GetAuthPreference(ctx context.Context) (types.AuthPreference, error) {
+	return a.realAuth.GetAuthPreference(ctx)
+}
+
+func (a *testAuth) GetAzureIdentityResourceID(ctx context.Context, identityName string) (string, error) {
+	return a.realAuth.GetAzureIdentityResourceID(ctx, identityName)
+}
+
+func (a *testAuth) GetAWSIAMCreds(ctx context.Context, database types.Database, databaseUser string) (string, string, string, error) {
+	a.InfoContext(ctx, "Generating AWS IAM credentials",
+		"database", database,
+		"database_user", databaseUser,
+	)
 	return atlasAuthUser, atlasAuthToken, atlasAuthSessionToken, nil
 }
 
-func TestDBCertSigning(t *testing.T) {
-	authServer, err := auth.NewTestAuthServer(auth.TestAuthServerConfig{
-		Clock:       clockwork.NewFakeClockAt(time.Now()),
-		ClusterName: "local.me",
-		Dir:         t.TempDir(),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, authServer.Close()) })
+func (a *testAuth) GenerateDatabaseClientKey(ctx context.Context) (*keys.PrivateKey, error) {
+	key, err := keys.ParsePrivateKey(fixtures.PEMBytes["rsa"])
+	return key, trace.Wrap(err)
+}
 
-	ctx := context.Background()
-
-	privateKey, err := testauthority.New().GeneratePrivateKey()
-	require.NoError(t, err)
-
-	csr, err := tlsca.GenerateCertificateRequestPEM(pkix.Name{
-		CommonName: "localhost",
-	}, privateKey)
-	require.NoError(t, err)
-
-	// Set rotation to init phase. New CA will be generated.
-	// DB service should still use old key to sign certificates.
-	// tctl should use new key to sign certificates.
-	err = authServer.AuthServer.RotateCertAuthority(ctx, auth.RotateRequest{
-		Type:        types.DatabaseCA,
-		TargetPhase: types.RotationPhaseInit,
-		Mode:        types.RotationModeManual,
-	})
-	require.NoError(t, err)
-
-	dbCAs, err := authServer.AuthServer.GetCertAuthorities(ctx, types.DatabaseCA, false)
-	require.NoError(t, err)
-	require.Len(t, dbCAs, 1)
-	require.NotNil(t, dbCAs[0].GetActiveKeys().TLS)
-	require.NotNil(t, dbCAs[0].GetAdditionalTrustedKeys().TLS)
-
-	tests := []struct {
-		name      string
-		requester proto.DatabaseCertRequest_Requester
-		getCertFn func(dbCAs []types.CertAuthority) []byte
-	}{
-		{
-			name:      "sign from DB service",
-			requester: proto.DatabaseCertRequest_UNSPECIFIED, // default behavior
-			getCertFn: func(dbCAs []types.CertAuthority) []byte {
-				return dbCAs[0].GetActiveKeys().TLS[0].Cert
-			},
-		},
-		{
-			name:      "sign from tctl",
-			requester: proto.DatabaseCertRequest_TCTL,
-			getCertFn: func(dbCAs []types.CertAuthority) []byte {
-				return dbCAs[0].GetAdditionalTrustedKeys().TLS[0].Cert
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			certResp, err := authServer.AuthServer.GenerateDatabaseCert(ctx, &proto.DatabaseCertRequest{
-				CSR:           csr,
-				ServerName:    "localhost",
-				TTL:           proto.Duration(time.Hour),
-				RequesterName: tt.requester,
-			})
-			require.NoError(t, err)
-			require.NotNil(t, certResp.Cert)
-			require.Len(t, certResp.CACerts, 2)
-
-			dbCert, err := tlsca.ParseCertificatePEM(certResp.Cert)
-			require.NoError(t, err)
-
-			certPool := x509.NewCertPool()
-			ok := certPool.AppendCertsFromPEM(tt.getCertFn(dbCAs))
-			require.True(t, ok)
-
-			opts := x509.VerifyOptions{
-				Roots: certPool,
-			}
-
-			// Verify if the generated certificate can be verified with the correct CA.
-			_, err = dbCert.Verify(opts)
-			require.NoError(t, err)
-		})
+func (a *testAuth) WithLogger(getUpdatedLogger func(*slog.Logger) *slog.Logger) common.Auth {
+	return &testAuth{
+		realAuth: a.realAuth,
+		Logger:   a.Logger,
 	}
 }
 

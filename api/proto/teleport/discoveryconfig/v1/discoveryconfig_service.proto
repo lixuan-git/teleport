@@ -39,11 +39,17 @@ service DiscoveryConfigService {
   // UpdateDiscoveryConfig updates an existing DiscoveryConfig resource.
   rpc UpdateDiscoveryConfig(UpdateDiscoveryConfigRequest) returns (DiscoveryConfig);
 
+  // UpsertDiscoveryConfig creates or updates a DiscoveryConfig resource.
+  rpc UpsertDiscoveryConfig(UpsertDiscoveryConfigRequest) returns (DiscoveryConfig);
+
   // DeleteDiscoveryConfig removes the specified DiscoveryConfig resource.
   rpc DeleteDiscoveryConfig(DeleteDiscoveryConfigRequest) returns (google.protobuf.Empty);
 
   // DeleteAllDiscoveryConfigs removes all DiscoveryConfigs.
   rpc DeleteAllDiscoveryConfigs(DeleteAllDiscoveryConfigsRequest) returns (google.protobuf.Empty);
+
+  // UpdateDiscoveryConfigStatus updates an existing DiscoveryConfig resource status object.
+  rpc UpdateDiscoveryConfigStatus(UpdateDiscoveryConfigStatusRequest) returns (DiscoveryConfig);
 }
 
 // ListDiscoveryConfigsRequest is a request for a paginated list of DiscoveryConfigs.
@@ -83,6 +89,12 @@ message UpdateDiscoveryConfigRequest {
   DiscoveryConfig discovery_config = 1;
 }
 
+// UpsertDiscoveryConfigRequest is the request to upsert the provided DiscoveryConfig.
+message UpsertDiscoveryConfigRequest {
+  // DiscoveryConfig is the DiscoveryConfig to be upserted.
+  DiscoveryConfig discovery_config = 1;
+}
+
 // DeleteDiscoveryConfigRequest is a request for deleting a specific DiscoveryConfig resource.
 message DeleteDiscoveryConfigRequest {
   // Name is the name of the DiscoveryConfig to be deleted.
@@ -91,3 +103,12 @@ message DeleteDiscoveryConfigRequest {
 
 // DeleteAllDiscoveryConfigsRequest is the request for deleting all DiscoveryConfigs.
 message DeleteAllDiscoveryConfigsRequest {}
+
+// UpdateDiscoveryConfigStatusRequest is the request to update the status field of the provided
+// Discovery Config.
+message UpdateDiscoveryConfigStatusRequest {
+  // Name is the name of the DiscoveryConfig to receive the status update.
+  string name = 1;
+  // status is the status payload to be persisted.
+  DiscoveryConfigStatus status = 2;
+}

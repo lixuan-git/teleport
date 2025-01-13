@@ -1,32 +1,37 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package srv
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport/lib/utils"
 	"github.com/gravitational/teleport/lib/utils/host"
@@ -46,6 +51,16 @@ type HostSudoersProvisioningBackend struct {
 
 // newHostUsersBackend initializes a new OS specific HostUsersBackend
 func newHostUsersBackend() (HostUsersBackend, error) {
+	var missing []string
+	for _, requiredBin := range []string{"usermod", "useradd", "getent", "groupadd", "visudo", "chage"} {
+		if _, err := exec.LookPath(requiredBin); err != nil {
+			missing = append(missing, requiredBin)
+		}
+	}
+	if len(missing) != 0 {
+		return nil, trace.NotFound("missing required binaries: %s", strings.Join(missing, ","))
+	}
+
 	return &HostUsersProvisioningBackend{}, nil
 }
 
@@ -59,7 +74,16 @@ func newHostSudoersBackend(uuid string) (HostSudoersBackend, error) {
 
 // Lookup implements host user information lookup
 func (*HostUsersProvisioningBackend) Lookup(username string) (*user.User, error) {
-	return user.Lookup(username)
+	usr, err := user.Lookup(username)
+	if err != nil {
+		if !errors.Is(err, user.UnknownUserError(username)) && strings.Contains(err.Error(), "no such file or directory") {
+			return nil, trace.Wrap(err, "looking up user %q, sources configured for passwd in host's /etc/nsswitch.conf may be misconfigured", username)
+		}
+
+		return nil, trace.Wrap(err)
+	}
+
+	return usr, nil
 }
 
 // UserGIDs returns the list of group IDs for a user
@@ -77,6 +101,12 @@ func (*HostUsersProvisioningBackend) LookupGroupByID(gid string) (*user.Group, e
 	return user.LookupGroupId(gid)
 }
 
+// SetUserGroups sets a user's groups, replacing their existing groups.
+func (*HostUsersProvisioningBackend) SetUserGroups(name string, groups []string) error {
+	_, err := host.SetUserGroups(name, groups)
+	return trace.Wrap(err)
+}
+
 // GetAllUsers returns a full list of users present on a system
 func (*HostUsersProvisioningBackend) GetAllUsers() ([]string, error) {
 	users, _, err := host.GetAllUsers()
@@ -90,12 +120,8 @@ func (*HostUsersProvisioningBackend) CreateGroup(name string, gid string) error 
 }
 
 // CreateUser creates a user on a host
-func (*HostUsersProvisioningBackend) CreateUser(name string, groups []string, uid, gid string) error {
-	home, err := readDefaultHome(name)
-	if err != nil {
-		return trace.Wrap(err)
-	}
-	_, err = host.UserAdd(name, groups, home, uid, gid)
+func (*HostUsersProvisioningBackend) CreateUser(name string, groups []string, opts host.UserOpts) error {
+	_, err := host.UserAdd(name, groups, opts)
 	return trace.Wrap(err)
 }
 
@@ -161,9 +187,10 @@ func (u *HostSudoersProvisioningBackend) RemoveSudoersFile(username string) erro
 	fileUsername := sanitizeSudoersName(username)
 	sudoersFilePath := filepath.Join(u.SudoersPath, fmt.Sprintf("teleport-%s-%s", u.HostUUID, fileUsername))
 	if _, err := os.Stat(sudoersFilePath); os.IsNotExist(err) {
-		log.Debugf("User %q, did not have sudoers file as it did not exist at path %q",
-			username,
-			sudoersFilePath)
+		slog.DebugContext(context.Background(), "No sudoers file present to remove",
+			"user", username,
+			"sudoers_path", sudoersFilePath,
+		)
 		return nil
 	}
 	return trace.Wrap(os.Remove(sudoersFilePath))
@@ -196,23 +223,23 @@ func readDefaultKey(key string, defaultValue string) (string, error) {
 	return defaultValue, nil
 }
 
-// readDefaultHome reads /etc/default/useradd for the HOME key,
+// GetDefaultHomeDirectory reads /etc/default/useradd for the HOME key,
 // defaulting to "/home" and join it with the user for the user
 // home directory
-func readDefaultHome(user string) (string, error) {
+func (u *HostUsersProvisioningBackend) GetDefaultHomeDirectory(user string) (string, error) {
 	const defaultHome = "/home"
 	home, err := readDefaultKey("HOME", defaultHome)
 	return filepath.Join(home, user), trace.Wrap(err)
 }
 
-// readDefaultHome reads /etc/default/useradd for the SKEL key, defaulting to "/etc/skel"
+// readDefaultSkel reads /etc/default/useradd for the SKEL key, defaulting to "/etc/skel"
 func readDefaultSkel() (string, error) {
 	const defaultSkel = "/etc/skel"
 	skel, err := readDefaultKey("SKEL", defaultSkel)
 	return skel, trace.Wrap(err)
 }
 
-func (u *HostUsersProvisioningBackend) CreateHomeDirectory(user string, uidS, gidS string) error {
+func (u *HostUsersProvisioningBackend) CreateHomeDirectory(userHome, uidS, gidS string) error {
 	uid, err := strconv.Atoi(uidS)
 	if err != nil {
 		return trace.Wrap(err)
@@ -222,16 +249,8 @@ func (u *HostUsersProvisioningBackend) CreateHomeDirectory(user string, uidS, gi
 		return trace.Wrap(err)
 	}
 
-	userHome, err := readDefaultHome(user)
-	if err != nil {
-		return trace.Wrap(err)
-	}
-
 	err = os.Mkdir(userHome, 0o700)
 	if err != nil {
-		if os.IsExist(err) {
-			return nil
-		}
 		return trace.Wrap(err)
 	}
 
@@ -265,4 +284,9 @@ func (u *HostUsersProvisioningBackend) CreateHomeDirectory(user string, uidS, gi
 	}
 
 	return nil
+}
+
+func (u *HostUsersProvisioningBackend) RemoveExpirations(username string) error {
+	_, err := host.RemoveUserExpirations(username)
+	return trace.Wrap(err)
 }

@@ -1,20 +1,22 @@
 /**
- * Copyright 2020 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React from 'react';
+import { MemoryRouter } from 'react-router';
 
 import { Users } from './Users';
 
@@ -29,11 +31,27 @@ export const Processing = () => {
     isSuccess: false,
     message: '',
   };
-  return <Users {...sample} attempt={attempt} />;
+  return (
+    <MemoryRouter>
+      <Users {...sample} attempt={attempt} />
+    </MemoryRouter>
+  );
 };
 
 export const Loaded = () => {
-  return <Users {...sample} />;
+  return (
+    <MemoryRouter>
+      <Users {...sample} />
+    </MemoryRouter>
+  );
+};
+
+export const UsersNotEqualMauNotice = () => {
+  return (
+    <MemoryRouter>
+      <Users {...sample} showMauInfo={true} />
+    </MemoryRouter>
+  );
 };
 
 export const Failed = () => {
@@ -43,7 +61,11 @@ export const Failed = () => {
     isSuccess: false,
     message: 'some error message',
   };
-  return <Users {...sample} attempt={attempt} />;
+  return (
+    <MemoryRouter>
+      <Users {...sample} attempt={attempt} />
+    </MemoryRouter>
+  );
 };
 
 const users = [
@@ -83,6 +105,13 @@ const users = [
     authType: 'teleport local user',
     isLocal: true,
   },
+  {
+    name: 'bot-little-robot',
+    roles: ['bot-little-robot'],
+    authType: 'teleport local user',
+    isLocal: true,
+    isBot: true,
+  },
 ];
 
 const roles = ['admin', 'testrole'];
@@ -95,18 +124,36 @@ const sample = {
     message: '',
   },
   users: users,
-  roles: roles,
+  fetchRoles: async (input: string) => roles.filter(r => r.includes(input)),
   operation: {
     type: 'none',
     user: null,
   } as any,
+  inviteCollaboratorsOpen: false,
+  emailPasswordResetOpen: false,
   onStartCreate: () => null,
   onStartDelete: () => null,
   onStartEdit: () => null,
   onStartReset: () => null,
+  onStartInviteCollaborators: () => null,
+  onStartEmailResetPassword: () => null,
   onClose: () => null,
   onCreate: () => null,
   onDelete: () => null,
   onUpdate: () => null,
   onReset: () => null,
+  onInviteCollaboratorsClose: () => null,
+  InviteCollaborators: null,
+  onEmailPasswordResetClose: () => null,
+  EmailPasswordReset: null,
+  showMauInfo: false,
+  onDismissUsersMauNotice: () => null,
+  canEditUsers: true,
+  usersAcl: {
+    read: true,
+    edit: false,
+    remove: true,
+    list: true,
+    create: true,
+  },
 };

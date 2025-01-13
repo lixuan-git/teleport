@@ -1,34 +1,36 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package reversetunnel
 
 import (
 	"context"
+	"log/slog"
 	"strings"
 
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
 
 	apidefaults "github.com/gravitational/teleport/api/defaults"
 	tracessh "github.com/gravitational/teleport/api/observability/tracing/ssh"
 	"github.com/gravitational/teleport/api/types"
 	apisshutils "github.com/gravitational/teleport/api/utils/sshutils"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/sshutils"
 	"github.com/gravitational/teleport/lib/utils"
 	"github.com/gravitational/teleport/lib/utils/proxy"
@@ -48,12 +50,12 @@ func isProxyAlreadyClaimed(err error) bool {
 
 // agentDialer dials an ssh server on behalf of an agent.
 type agentDialer struct {
-	client      auth.AccessCache
+	client      authclient.AccessCache
 	username    string
 	authMethods []ssh.AuthMethod
 	fips        bool
 	options     []proxy.DialerOptionFunc
-	log         logrus.FieldLogger
+	logger      *slog.Logger
 	isClaimed   func(principals ...string) bool
 }
 
@@ -63,7 +65,7 @@ func (d *agentDialer) DialContext(ctx context.Context, addr utils.NetAddr) (SSHC
 	dialer := proxy.DialerFromEnvironment(addr.Addr, d.options...)
 	pconn, err := dialer.DialTimeout(ctx, addr.AddrNetwork, addr.Addr, apidefaults.DefaultIOTimeout)
 	if err != nil {
-		d.log.WithError(err).Debugf("Failed to dial %s.", addr.Addr)
+		d.logger.DebugContext(ctx, "Failed to dial", "error", err, "target_addr", addr.Addr)
 		return nil, trace.Wrap(err)
 	}
 
@@ -73,7 +75,7 @@ func (d *agentDialer) DialContext(ctx context.Context, addr utils.NetAddr) (SSHC
 			GetHostCheckers: d.hostCheckerFunc(ctx),
 			OnCheckCert: func(c *ssh.Certificate) error {
 				if d.isClaimed != nil && d.isClaimed(c.ValidPrincipals...) {
-					d.log.Debugf("Aborting SSH handshake because the proxy %q is already claimed by some other agent.", c.ValidPrincipals[0])
+					d.logger.DebugContext(ctx, "Aborting SSH handshake because the proxy is already claimed by some other agent.", "proxy_id", c.ValidPrincipals[0])
 					// the error message must end with
 					// [proxyAlreadyClaimedError] to be recognized by
 					// [isProxyAlreadyClaimed]
@@ -86,7 +88,7 @@ func (d *agentDialer) DialContext(ctx context.Context, addr utils.NetAddr) (SSHC
 			FIPS: d.fips,
 		})
 	if err != nil {
-		d.log.Debugf("Failed to create host key callback for %v: %v.", addr.Addr, err)
+		d.logger.DebugContext(ctx, "Failed to create host key callback", "target_addr", addr.Addr, "error", err)
 		return nil, trace.Wrap(err)
 	}
 

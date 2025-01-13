@@ -1,18 +1,20 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package alpnproxy
 
@@ -22,6 +24,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"errors"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync"
@@ -30,7 +33,6 @@ import (
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	"github.com/sirupsen/logrus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -38,6 +40,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes/scheme"
 
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/utils/keys"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/srv/alpnproxy/common"
@@ -49,6 +52,10 @@ import (
 // returning error to the client, indicating that local kube proxy requires user input. It should be short to
 // bring user's attention to the local proxy sooner. It doesn't abort cert reissuing itself.
 const certReissueClientWait = time.Second * 3
+
+// certReissueClientWaitHeadless is used when proxy works in headless mode - since user works in reexeced shell,
+// we give them longer time to perform the headless login flow.
+const certReissueClientWaitHeadless = defaults.HeadlessLoginTimeout
 
 // KubeClientCerts is a map of Kubernetes client certs.
 type KubeClientCerts map[string]tls.Certificate
@@ -69,11 +76,13 @@ type KubeMiddleware struct {
 	// certReissuer is used to reissue a client certificate for a Kubernetes cluster if existing cert expired.
 	certReissuer KubeCertReissuer
 	// Clock specifies the time provider. Will be used to override the time anchor
-	// for TLS certificate verification.
-	// Defaults to real clock if unspecified
+	// for TLS certificate verification. Defaults to real clock if unspecified.
 	clock clockwork.Clock
+	// headless controls whether proxy is working in headless login mode.
+	headless bool
 
-	logger logrus.FieldLogger
+	logger       *slog.Logger
+	closeContext context.Context
 
 	// isCertReissuingRunning is used to only ever have one concurrent cert reissuing session requiring user input.
 	isCertReissuingRunning atomic.Bool
@@ -83,13 +92,24 @@ type KubeMiddleware struct {
 	certs KubeClientCerts
 }
 
+type KubeMiddlewareConfig struct {
+	Certs        KubeClientCerts
+	CertReissuer KubeCertReissuer
+	Headless     bool
+	Clock        clockwork.Clock
+	Logger       *slog.Logger
+	CloseContext context.Context
+}
+
 // NewKubeMiddleware creates a new KubeMiddleware.
-func NewKubeMiddleware(certs KubeClientCerts, certReissuer KubeCertReissuer, clock clockwork.Clock, logger logrus.FieldLogger) LocalProxyHTTPMiddleware {
+func NewKubeMiddleware(cfg KubeMiddlewareConfig) LocalProxyHTTPMiddleware {
 	return &KubeMiddleware{
-		certs:        certs,
-		certReissuer: certReissuer,
-		clock:        clock,
-		logger:       logger,
+		certs:        cfg.Certs,
+		certReissuer: cfg.CertReissuer,
+		headless:     cfg.Headless,
+		clock:        cfg.Clock,
+		logger:       cfg.Logger,
+		closeContext: cfg.CloseContext,
 	}
 }
 
@@ -102,7 +122,10 @@ func (m *KubeMiddleware) CheckAndSetDefaults() error {
 		m.clock = clockwork.NewRealClock()
 	}
 	if m.logger == nil {
-		m.logger = logrus.WithField(trace.Component, "local_proxy_kube")
+		m.logger = slog.With(teleport.ComponentKey, "local_proxy_kube")
+	}
+	if m.closeContext == nil {
+		return trace.BadParameter("missing close context")
 	}
 	return nil
 }
@@ -117,12 +140,12 @@ func initKubeCodecs() serializer.CodecFactory {
 	return serializer.NewCodecFactory(kubeScheme)
 }
 
-func writeKubeError(rw http.ResponseWriter, kubeError *apierrors.StatusError, logger logrus.FieldLogger) {
+func writeKubeError(ctx context.Context, rw http.ResponseWriter, kubeError *apierrors.StatusError, logger *slog.Logger) {
 	kubeCodecs := initKubeCodecs()
 	status := kubeError.Status()
 	errorBytes, err := runtime.Encode(kubeCodecs.LegacyCodec(), &status)
 	if err != nil {
-		logger.Warnf("Failed to encode Kube status error: %v.", err)
+		logger.WarnContext(ctx, "Failed to encode Kube status error", "error", err)
 		trace.WriteError(rw, trace.Wrap(kubeError))
 	}
 
@@ -130,7 +153,7 @@ func writeKubeError(rw http.ResponseWriter, kubeError *apierrors.StatusError, lo
 	rw.WriteHeader(int(status.Code))
 
 	if _, err := rw.Write(errorBytes); err != nil {
-		logger.Warnf("Failed to write Kube error: %v.", err)
+		logger.WarnContext(ctx, "Failed to write Kube error", "error", err)
 	}
 }
 
@@ -147,7 +170,7 @@ func (m *KubeMiddleware) HandleRequest(rw http.ResponseWriter, req *http.Request
 	if err != nil {
 		// If user input is required we return an error that will try to get user attention to the local proxy
 		if errors.Is(err, ErrUserInputRequired) {
-			writeKubeError(rw, &apierrors.StatusError{
+			writeKubeError(req.Context(), rw, &apierrors.StatusError{
 				ErrStatus: metav1.Status{
 					TypeMeta: metav1.TypeMeta{
 						Kind:       "Status",
@@ -161,7 +184,7 @@ func (m *KubeMiddleware) HandleRequest(rw http.ResponseWriter, req *http.Request
 			}, m.logger)
 			return true
 		}
-		m.logger.WithError(err).Warnf("Failed to reissue certificate for server %v", req.TLS.ServerName)
+		m.logger.WarnContext(req.Context(), "Failed to reissue certificate for server", "server", req.TLS.ServerName)
 		trace.WriteError(rw, trace.Wrap(err))
 		return true
 	}
@@ -206,6 +229,10 @@ func (m *KubeMiddleware) reissueCertIfExpired(ctx context.Context, cert tls.Cert
 		return nil
 	}
 
+	if m.certReissuer == nil {
+		return trace.BadParameter("can't reissue expired proxy certificate - reissuer is not available")
+	}
+
 	// If certificate has expired we try to reissue it.
 	identity, err := tlsca.FromSubject(x509Cert.Subject, x509Cert.NotAfter)
 	if err != nil {
@@ -219,7 +246,12 @@ func (m *KubeMiddleware) reissueCertIfExpired(ctx context.Context, cert tls.Cert
 	if m.isCertReissuingRunning.CompareAndSwap(false, true) {
 		go func() {
 			defer m.isCertReissuingRunning.Store(false)
-			newCert, err := m.certReissuer(context.Background(), identity.TeleportCluster, identity.KubernetesCluster)
+
+			cluster := identity.TeleportCluster
+			if identity.RouteToCluster != "" {
+				cluster = identity.RouteToCluster
+			}
+			newCert, err := m.certReissuer(m.closeContext, cluster, identity.KubernetesCluster)
 			if err == nil {
 				m.certsMu.Lock()
 				m.certs[serverName] = newCert
@@ -231,8 +263,13 @@ func (m *KubeMiddleware) reissueCertIfExpired(ctx context.Context, cert tls.Cert
 		return trace.Wrap(ErrUserInputRequired)
 	}
 
+	reissueClientWait := certReissueClientWait
+	if m.headless {
+		reissueClientWait = certReissueClientWaitHeadless
+	}
+
 	select {
-	case <-time.After(certReissueClientWait):
+	case <-time.After(reissueClientWait):
 		return trace.Wrap(ErrUserInputRequired)
 	case err := <-errCh:
 		return trace.Wrap(err)

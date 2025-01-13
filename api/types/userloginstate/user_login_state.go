@@ -41,6 +41,12 @@ type UserLoginState struct {
 
 // Spec is the specification for the user login state.
 type Spec struct {
+	// OriginalRoles is the list of the original roles from the user login state.
+	OriginalRoles []string `json:"original_roles" yaml:"original_roles"`
+
+	// OriginalTraits is the list of the original traits from the user login state.
+	OriginalTraits trait.Traits `json:"original_traits" yaml:"original_traits"`
+
 	// Roles is the list of roles attached to the user login state.
 	Roles []string `json:"roles" yaml:"roles"`
 
@@ -49,6 +55,18 @@ type Spec struct {
 
 	// UserType is the type of user that this state represents.
 	UserType types.UserType `json:"user_type" yaml:"user_type"`
+
+	// GitHubIdentity is user's attached GitHub identity
+	GitHubIdentity *ExternalIdentity `json:"github_identity,omitempty" yaml:"github_identity"`
+}
+
+// ExternalIdentity defines an external identity attached to this user state.
+type ExternalIdentity struct {
+	// UserId is the unique identifier of the external identity such as GitHub
+	// user ID.
+	UserID string
+	// Username is the username of the external identity.
+	Username string
 }
 
 // New creates a new user login state.
@@ -81,6 +99,16 @@ func (u *UserLoginState) CheckAndSetDefaults() error {
 	return nil
 }
 
+// GetOriginalRoles returns the original roles that the user login state was derived from.
+func (u *UserLoginState) GetOriginalRoles() []string {
+	return u.Spec.OriginalRoles
+}
+
+// GetOriginalTraits returns the original traits that the user login state was derived from.
+func (u *UserLoginState) GetOriginalTraits() map[string][]string {
+	return u.Spec.OriginalTraits
+}
+
 // GetRoles returns the roles attached to the user login state.
 func (u *UserLoginState) GetRoles() []string {
 	return u.Spec.Roles
@@ -102,13 +130,19 @@ func (u *UserLoginState) IsBot() bool {
 	return ok
 }
 
-// BotGenerationLabel returns the bot generation label.
-func (u *UserLoginState) BotGenerationLabel() string {
-	return u.GetMetadata().Labels[types.BotGenerationLabel]
-}
-
 // GetMetadata returns metadata. This is specifically for conforming to the Resource interface,
 // and should be removed when possible.
 func (u *UserLoginState) GetMetadata() types.Metadata {
 	return legacy.FromHeaderMetadata(u.Metadata)
+}
+
+// GetGithubIdentities returns a list of connected Github identities
+func (u *UserLoginState) GetGithubIdentities() []types.ExternalIdentity {
+	if u.Spec.GitHubIdentity == nil {
+		return nil
+	}
+	return []types.ExternalIdentity{{
+		UserID:   u.Spec.GitHubIdentity.UserID,
+		Username: u.Spec.GitHubIdentity.Username,
+	}}
 }

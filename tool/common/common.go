@@ -1,18 +1,20 @@
 /*
-Copyright 2016-2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package common
 
@@ -21,18 +23,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"sort"
 	"strings"
 
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/constants"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/lib/asciitable"
+	libevents "github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/utils"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
 // ExitCodeError wraps an exit code as an error.
@@ -53,29 +57,40 @@ type SessionsCollection struct {
 
 // WriteText writes the session collection as text to the provided io.Writer.
 func (e *SessionsCollection) WriteText(w io.Writer) error {
-	t := asciitable.MakeTable([]string{"ID", "Type", "Participants", "Hostname", "Timestamp"})
+	t := asciitable.MakeTable([]string{"ID", "Type", "Participants", "Target", "Timestamp"})
 	for _, event := range e.SessionEvents {
-		var id, typ, participants, hostname, timestamp string
+		var id, typ, participants, target, timestamp string
 
 		switch session := event.(type) {
 		case *events.SessionEnd:
 			id = session.GetSessionID()
 			typ = session.Protocol
 			participants = strings.Join(session.Participants, ", ")
-			hostname = session.ServerAddr
 			timestamp = session.GetTime().Format(constants.HumanDateFormatSeconds)
+
+			target = session.ServerHostname
+			if typ == libevents.EventProtocolKube {
+				target = session.KubernetesCluster
+			}
+
 		case *events.WindowsDesktopSessionEnd:
 			id = session.GetSessionID()
 			typ = "windows"
 			participants = strings.Join(session.Participants, ", ")
-			hostname = session.DesktopName
+			target = session.DesktopName
+			timestamp = session.GetTime().Format(constants.HumanDateFormatSeconds)
+		case *events.DatabaseSessionEnd:
+			id = session.GetSessionID()
+			typ = session.DatabaseProtocol
+			participants = session.GetUser()
+			target = session.DatabaseName
 			timestamp = session.GetTime().Format(constants.HumanDateFormatSeconds)
 		default:
-			log.Warn(trace.BadParameter("unsupported event type: expected SessionEnd or WindowsDesktopSessionEnd: got: %T", event))
+			slog.WarnContext(context.Background(), "unsupported event type: expected SessionEnd, WindowsDesktopSessionEnd or DatabaseSessionEnd", "event_type", logutils.TypeAttr(event))
 			continue
 		}
 
-		t.AddRow([]string{id, typ, participants, hostname, timestamp})
+		t.AddRow([]string{id, typ, participants, target, timestamp})
 	}
 	_, err := t.AsBuffer().WriteTo(w)
 	return trace.Wrap(err)

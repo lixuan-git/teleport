@@ -1,16 +1,20 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package watcherjob
 
@@ -116,7 +120,8 @@ func NewMockEventsProcess(ctx context.Context, t *testing.T, config Config, fn E
 	}
 	t.Cleanup(func() {
 		process.Terminate()
-		assert.NoError(t, process.Shutdown(ctx))
+		err := process.Shutdown(ctx)
+		assert.ErrorContains(t, err, context.Canceled.Error(), "if a non-nil error is returned, it should be canceled context")
 		process.Close()
 	})
 	var err error
@@ -127,6 +132,11 @@ func NewMockEventsProcess(ctx context.Context, t *testing.T, config Config, fn E
 	process.Events.Fire(types.Event{Type: types.OpInit})
 
 	return &process
+}
+
+// WaitReady waits for the job to be ready.
+func (process *MockEventsProcess) WaitReady(ctx context.Context) (bool, error) {
+	return process.eventsJob.WaitReady(ctx)
 }
 
 // Shutdown sends a termination signal and waits for process completion.
@@ -176,4 +186,33 @@ func (countdown *Countdown) Wait(ctx context.Context) error {
 	case <-ctx.Done():
 		return trace.Wrap(ctx.Err())
 	}
+}
+
+// NewMockEventsProcessWithConfirmedWatchJobs creates a new mock process that passes confirmed watch kinds back.
+func NewMockEventsProcessWithConfirmedWatchJobs(ctx context.Context, t *testing.T, config Config, fn EventFunc, watchInitFunc WatchInitFunc) *MockEventsProcess {
+	t.Helper()
+	process := MockEventsProcess{
+		Process: lib.NewProcess(ctx),
+	}
+	t.Cleanup(func() {
+		process.Terminate()
+		err := process.Shutdown(ctx)
+		assert.ErrorContains(t, err, context.Canceled.Error(), "if a non-nil error is returned, it should be canceled context")
+		process.Close()
+	})
+	var err error
+
+	process.eventsJob, err = NewJobWithConfirmedWatchKinds(&process.Events, config, fn, watchInitFunc)
+	require.NoError(t, err)
+	process.SpawnCriticalJob(process.eventsJob)
+	require.NoError(t, process.Events.WaitSomeWatchers(ctx))
+	process.Events.Fire(types.Event{
+		Type: types.OpInit,
+		Resource: &types.WatchStatusV1{
+			Spec: types.WatchStatusSpecV1{
+				Kinds: config.Watch.Kinds,
+			},
+		}})
+
+	return &process
 }

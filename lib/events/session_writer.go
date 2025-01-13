@@ -1,24 +1,27 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package events
 
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,8 +29,8 @@ import (
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	logrus "github.com/sirupsen/logrus"
 
+	"github.com/gravitational/teleport"
 	apievents "github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/api/utils/retryutils"
 	"github.com/gravitational/teleport/lib/session"
@@ -46,11 +49,9 @@ func NewSessionWriter(cfg SessionWriterConfig) (*SessionWriter, error) {
 
 	ctx, cancel := context.WithCancel(cfg.Context)
 	writer := &SessionWriter{
-		cfg:    cfg,
-		stream: stream,
-		log: logrus.WithFields(logrus.Fields{
-			trace.Component: cfg.Component,
-		}),
+		cfg:      cfg,
+		stream:   stream,
+		log:      slog.With(teleport.ComponentKey, cfg.Component),
 		cancel:   cancel,
 		closeCtx: ctx,
 		eventsCh: make(chan apievents.PreparedSessionEvent),
@@ -158,7 +159,7 @@ func bytesToSessionPrintEvents(b []byte) []apievents.AuditEvent {
 type SessionWriter struct {
 	mtx        sync.Mutex
 	cfg        SessionWriterConfig
-	log        *logrus.Entry
+	log        *slog.Logger
 	buffer     []apievents.PreparedSessionEvent
 	eventsCh   chan apievents.PreparedSessionEvent
 	lastStatus *apievents.StreamStatus
@@ -218,10 +219,10 @@ func (a *SessionWriter) Write(data []byte) (int, error) {
 	for _, event := range events {
 		event, err := a.cfg.Preparer.PrepareSessionEvent(event)
 		if err != nil {
-			a.log.WithError(err).Errorf("failed to setup %T event", event)
+			a.log.ErrorContext(a.closeCtx, "failed to setup event", "error", err, "event", event.GetAuditEvent().GetType())
 		}
 		if err := a.RecordEvent(a.cfg.Context, event); err != nil {
-			a.log.WithError(err).Errorf("failed to emit %T event", event)
+			a.log.ErrorContext(a.closeCtx, "failed to emit event", "error", err, "event", event.GetAuditEvent().GetType())
 			return 0, trace.Wrap(err)
 		}
 	}
@@ -344,7 +345,7 @@ func (a *SessionWriter) RecordEvent(ctx context.Context, pe apievents.PreparedSe
 		return nil
 	case <-t.C:
 		if setBackoff := a.maybeSetBackoff(a.cfg.Clock.Now().UTC().Add(a.cfg.BackoffDuration)); setBackoff {
-			a.log.Errorf("Audit write timed out after %v. Will be losing events for the next %v.", a.cfg.BackoffTimeout, a.cfg.BackoffDuration)
+			a.log.ErrorContext(ctx, "Audit write timed out. Will be losing events while applying backogg.", "timeout", a.cfg.BackoffTimeout, "backoff_duration", a.cfg.BackoffDuration)
 		}
 		a.lostEvents.Add(1)
 		return nil
@@ -385,12 +386,14 @@ func (a *SessionWriter) Close(ctx context.Context) error {
 	<-a.doneCh
 	stats := a.Stats()
 	if stats.LostEvents != 0 {
-		a.log.Errorf("Session has lost %v out of %v audit events because of disk or network issues. "+
-			"Check disk and network on this server.", stats.LostEvents, stats.AcceptedEvents)
+		a.log.ErrorContext(ctx, "Session has lost audit events because of disk or network issues. Check disk and network on this server.",
+			"lost_events", stats.LostEvents,
+			"accepted_events", stats.AcceptedEvents,
+		)
 	}
 	if float64(stats.SlowWrites)/float64(stats.AcceptedEvents) > 0.15 {
-		a.log.Debugf("Session has encountered %v slow writes out of %v. Check disk and network on this server.",
-			stats.SlowWrites, stats.AcceptedEvents)
+		a.log.DebugContext(ctx, "Session has encountered slow writes. Check disk and network on this server.",
+			"slow_writes", stats.SlowWrites, "events_written", stats.AcceptedEvents)
 	}
 	return nil
 }
@@ -432,27 +435,32 @@ func (a *SessionWriter) processEvents() {
 			err := a.stream.RecordEvent(a.cfg.Context, event)
 			if err != nil {
 				if IsPermanentEmitError(err) {
-					a.log.WithError(err).WithField("event", event).Warning("Failed to emit audit event due to permanent emit audit event error. Event will be omitted.")
+					a.log.WarnContext(a.cfg.Context, "Failed to emit audit event due to permanent emit audit event error. Event will be omitted.", "error", err, "event", event)
 					continue
 				}
 
 				if isUnrecoverableError(err) {
-					a.log.WithError(err).Debug("Failed to emit audit event.")
+					a.log.DebugContext(a.cfg.Context, "Failed to emit audit event.", "error", err)
 					return
 				}
 
-				a.log.WithError(err).Debug("Failed to emit audit event, attempting to recover stream.")
+				a.log.DebugContext(a.cfg.Context, "Failed to emit audit event, attempting to recover stream.", "error", err)
 				start := time.Now()
 				if err := a.recoverStream(); err != nil {
-					a.log.WithError(err).Warningf("Failed to recover stream.")
+					a.log.WarnContext(a.cfg.Context, "Failed to recover stream.", "error", err)
 					return
 				}
-				a.log.Debugf("Recovered stream in %v.", time.Since(start))
+				a.log.DebugContext(a.cfg.Context, "Recovered stream", "duration", time.Since(start))
 			}
 		case <-a.stream.Done():
-			a.log.Debugf("Stream was closed by the server, attempting to recover.")
+			if a.closeCtx.Err() != nil {
+				// don't attempt recovery if we're closing
+				return
+			}
+			a.log.DebugContext(a.cfg.Context, "Stream was closed by the server, attempting to recover.")
 			if err := a.recoverStream(); err != nil {
-				a.log.WithError(err).Warningf("Failed to recover stream.")
+				a.log.WarnContext(a.cfg.Context, "Failed to recover stream.", "error", err)
+
 				return
 			}
 		case <-a.closeCtx.Done():
@@ -506,7 +514,7 @@ func (a *SessionWriter) recoverStream() error {
 			return trace.Wrap(err)
 		}
 	}
-	a.log.Debugf("Replayed buffer of %v events to stream in %v", len(a.buffer), time.Since(start))
+	a.log.DebugContext(a.cfg.Context, "Replayed buffer events to stream", "replayed_events", len(a.buffer), "replay_duration", time.Since(start))
 	return nil
 }
 
@@ -514,7 +522,7 @@ func (a *SessionWriter) closeStream(stream apievents.Stream) {
 	ctx, cancel := context.WithTimeout(a.cfg.Context, NetworkRetryDuration)
 	defer cancel()
 	if err := stream.Close(ctx); err != nil {
-		a.log.WithError(err).Debug("Failed to close stream.")
+		a.log.DebugContext(ctx, "Failed to close stream.")
 	}
 }
 
@@ -525,7 +533,7 @@ func (a *SessionWriter) completeStream(stream apievents.Stream) {
 	ctx, cancel := context.WithTimeout(context.Background(), NetworkBackoffDuration)
 	defer cancel()
 	if err := stream.Complete(ctx); err != nil {
-		a.log.WithError(err).Warning("Failed to complete stream.")
+		a.log.WarnContext(ctx, "Failed to complete stream.", "error", err)
 	}
 }
 
@@ -558,15 +566,19 @@ func (a *SessionWriter) tryResumeStream() (apievents.Stream, error) {
 			// sent by the server after create.
 			select {
 			case status := <-resumedStream.Status():
-				a.log.Debugf("Resumed %v stream on %v attempt in %v, upload %v.",
-					streamType, i+1, time.Since(start), status.UploadID)
+				a.log.DebugContext(a.closeCtx, "Resumed audit stream",
+					"stream", streamType,
+					"attempt", i+1,
+					"duration", time.Since(start),
+					"upload_id", status.UploadID,
+				)
 				return resumedStream, nil
 			case <-retry.After():
 				err := resumedStream.Close(a.closeCtx)
 				if err != nil {
-					a.log.WithError(err).Debug("Timed out waiting for stream status update, will retry.")
+					a.log.DebugContext(a.closeCtx, "Timed out waiting for stream status update, will retry.", "error", err)
 				} else {
-					a.log.Debug("Timed out waiting for stream status update, will retry.")
+					a.log.DebugContext(a.closeCtx, "Timed out waiting for stream status update, will retry.")
 				}
 			case <-a.cfg.Context.Done():
 				return nil, trace.ConnectionProblem(a.closeCtx.Err(), "operation has been canceled")
@@ -579,7 +591,7 @@ func (a *SessionWriter) tryResumeStream() (apievents.Stream, error) {
 
 		select {
 		case <-retry.After():
-			a.log.WithError(err).Debug("Retrying to resume stream after backoff.")
+			a.log.DebugContext(a.closeCtx, "Retrying to resume stream after backoff.", "error", err)
 		case <-a.closeCtx.Done():
 			return nil, trace.ConnectionProblem(a.closeCtx.Err(), "operation has been canceled")
 		}
@@ -602,7 +614,7 @@ func (a *SessionWriter) updateStatus(status apievents.StreamStatus) {
 	if lastIndex > 0 {
 		before := len(a.buffer)
 		a.buffer = a.buffer[lastIndex+1:]
-		a.log.Debugf("Removed %v saved events, current buffer size: %v.", before-len(a.buffer), len(a.buffer))
+		a.log.DebugContext(a.closeCtx, "Removed saved events", "removed", before-len(a.buffer), "remaining", len(a.buffer))
 	}
 }
 

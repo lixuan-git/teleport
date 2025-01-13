@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package mongodb
 
@@ -31,6 +33,7 @@ import (
 	"github.com/gravitational/teleport/lib/srv/db/common/role"
 	"github.com/gravitational/teleport/lib/srv/db/mongodb/protocol"
 	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/lib/utils/log"
 )
 
 // NewEngine create new MongoDB engine.
@@ -53,6 +56,8 @@ type Engine struct {
 	clientConn net.Conn
 	// maxMessageSize is the max message size.
 	maxMessageSize uint32
+	// serverConnected specifies whether server connection has been created.
+	serverConnected bool
 }
 
 // InitializeConnection initializes the client connection.
@@ -81,16 +86,32 @@ func (e *Engine) HandleConnection(ctx context.Context, sessionCtx *common.Sessio
 	if err != nil {
 		return trace.Wrap(err, "error authorizing database access")
 	}
+	// Automatically create the database user if needed.
+	cancelAutoUserLease, err := e.GetUserProvisioner(e).Activate(ctx, sessionCtx)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	defer func() {
+		err := e.GetUserProvisioner(e).Teardown(ctx, sessionCtx)
+		if err != nil {
+			e.Log.ErrorContext(ctx, "Failed to deactivate the user.", "error", err)
+		}
+	}()
 	// Establish connection to the MongoDB server.
 	serverConn, closeFn, err := e.connect(ctx, sessionCtx)
 	if err != nil {
+		cancelAutoUserLease()
 		return trace.Wrap(err, "error connecting to the database")
 	}
 	defer closeFn()
 
+	// Release the auto-users semaphore now that we've successfully connected.
+	cancelAutoUserLease()
+
 	e.Audit.OnSessionStart(e.Context, sessionCtx, nil)
 	defer e.Audit.OnSessionEnd(e.Context, sessionCtx)
 
+	e.serverConnected = true
 	observe()
 
 	msgFromClient := common.GetMessagesFromClientMetric(sessionCtx.Database)
@@ -176,7 +197,7 @@ func (e *Engine) processHandshakeResponse(ctx context.Context, respMessage proto
 	// OP_REPLY is used on legacy handshake messages (deprecated on MongoDB 5.0)
 	case *protocol.MessageOpReply:
 		if len(resp.Documents) == 0 {
-			e.Log.Warn("Empty MongoDB handshake response.")
+			e.Log.WarnContext(ctx, "Empty MongoDB handshake response.")
 			return
 		}
 
@@ -186,7 +207,7 @@ func (e *Engine) processHandshakeResponse(ctx context.Context, respMessage proto
 	case *protocol.MessageOpMsg:
 		rawMessage = bson.Raw(resp.BodySection.Document)
 	default:
-		e.Log.Warn("Unabled to process MongoDB handshake response. Unexpected message type %T", respMessage)
+		e.Log.WarnContext(ctx, "Unable to process MongoDB handshake response. Unexpected message type.", "message_type", log.TypeAttr(respMessage))
 		return
 	}
 
@@ -203,19 +224,29 @@ func (e *Engine) processHandshakeResponse(ctx context.Context, respMessage proto
 // authorizeConnection does authorization check for MongoDB connection about
 // to be established.
 func (e *Engine) authorizeConnection(ctx context.Context, sessionCtx *common.Session) error {
+	if err := sessionCtx.CheckUsernameForAutoUserProvisioning(); err != nil {
+		return trace.Wrap(err)
+	}
+
 	authPref, err := e.Auth.GetAuthPreference(ctx)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
 	state := sessionCtx.GetAccessState(authPref)
-	// Only the username is checked upon initial connection. MongoDB sends
-	// database name with each protocol message (for query, update, etc.)
-	// so it is checked when we receive a message from client.
+	dbRoleMatchers := role.GetDatabaseRoleMatchers(role.RoleMatchersConfig{
+		Database:     sessionCtx.Database,
+		DatabaseUser: sessionCtx.DatabaseUser,
+		// Only the username is checked upon initial connection. MongoDB sends
+		// database name with each protocol message (for query, update, etc.) so it
+		// is checked when we receive a message from client.
+		DisableDatabaseNameMatcher: true,
+		AutoCreateUser:             sessionCtx.AutoCreateUserMode.IsEnabled(),
+	})
 	err = sessionCtx.Checker.CheckAccess(
 		sessionCtx.Database,
 		state,
-		services.NewDatabaseUserMatcher(sessionCtx.Database, sessionCtx.DatabaseUser),
+		dbRoleMatchers...,
 	)
 	if err != nil {
 		e.Audit.OnSessionStart(e.Context, sessionCtx, err)
@@ -260,18 +291,53 @@ func (e *Engine) checkClientMessage(sessionCtx *common.Session, message protocol
 	case "authenticate", "saslStart", "saslContinue", "logout":
 		return trace.AccessDenied("access denied")
 	}
+
 	// Otherwise authorize the command against allowed databases.
-	return sessionCtx.Checker.CheckAccess(sessionCtx.Database,
+	return sessionCtx.Checker.CheckAccess(
+		sessionCtx.Database,
 		services.AccessState{MFAVerified: true},
-		role.DatabaseRoleMatchers(
-			sessionCtx.Database,
-			sessionCtx.DatabaseUser,
-			database)...)
+		role.GetDatabaseRoleMatchers(role.RoleMatchersConfig{
+			Database:       sessionCtx.Database,
+			DatabaseUser:   sessionCtx.DatabaseUser,
+			DatabaseName:   database,
+			AutoCreateUser: sessionCtx.AutoCreateUserMode.IsEnabled(),
+		})...,
+	)
 }
 
+func (e *Engine) waitForAnyClientMessage(clientConn net.Conn) protocol.Message {
+	clientMessage, err := protocol.ReadMessage(clientConn, e.maxMessageSize)
+	if err != nil {
+		e.Log.WarnContext(e.Context, "Failed to read a message for reply.", "error", err)
+	}
+	return clientMessage
+}
+
+// replyError sends the error to client. It is currently assumed that this
+// function will only be called when HandleConnection terminates.
 func (e *Engine) replyError(clientConn net.Conn, replyTo protocol.Message, err error) {
+	// If an error happens during server connection, wait for a client message
+	// before replying to ensure the client can interpret the reply.
+	// The first message is usually the isMaster hello message.
+	if replyTo == nil && !e.serverConnected {
+		waitChan := make(chan protocol.Message, 1)
+		go func() {
+			waitChan <- e.waitForAnyClientMessage(clientConn)
+		}()
+
+		select {
+		case clientMessage := <-waitChan:
+			replyTo = clientMessage
+		case <-e.Clock.After(common.DefaultMongoDBServerSelectionTimeout):
+			e.Log.WarnContext(e.Context, "Timed out waiting for client message to reply err.", "error", err)
+			// Make sure the connection is closed so waitForAnyClientMessage
+			// doesn't get stuck.
+			defer clientConn.Close()
+		}
+	}
+
 	errSend := protocol.ReplyError(clientConn, replyTo, err)
 	if errSend != nil {
-		e.Log.WithError(errSend).Errorf("Failed to send error message to MongoDB client: %v.", err)
+		e.Log.ErrorContext(e.Context, "Failed to send error message to MongoDB client.", "send_error", errSend, "orig_error", err)
 	}
 }

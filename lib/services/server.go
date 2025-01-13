@@ -1,37 +1,37 @@
 /*
-Copyright 2015-2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
 import (
 	"encoding/json"
 	"fmt"
-	"net"
+	"maps"
+	"slices"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	ec2Types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/google/go-cmp/cmp"
-	"github.com/google/uuid"
 	"github.com/gravitational/trace"
 
 	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/api/types/wrappers"
 	apiutils "github.com/gravitational/teleport/api/utils"
-	libaws "github.com/gravitational/teleport/lib/cloud/aws"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/utils"
 )
@@ -43,9 +43,6 @@ const (
 	OnlyTimestampsDifferent = iota
 	// Different means that some fields are different
 	Different = iota
-
-	// defaultSSHPort is the default port for the OpenSSH Service.
-	defaultSSHPort = "22"
 )
 
 // CompareServers compares two provided servers.
@@ -102,11 +99,10 @@ func compareServers(a, b types.Server) int {
 	if len(a.GetPublicAddrs()) != len(b.GetPublicAddrs()) {
 		return Different
 	}
-	for i := range a.GetPublicAddrs() {
-		if a.GetPublicAddrs()[i] != b.GetPublicAddrs()[i] {
-			return Different
-		}
+	if !slices.Equal(a.GetPublicAddrs(), b.GetPublicAddrs()) {
+		return Different
 	}
+
 	r := a.GetRotation()
 	if !r.Matches(b.GetRotation()) {
 		return Different
@@ -114,17 +110,25 @@ func compareServers(a, b types.Server) int {
 	if a.GetUseTunnel() != b.GetUseTunnel() {
 		return Different
 	}
-	if !utils.StringMapsEqual(a.GetStaticLabels(), b.GetStaticLabels()) {
+	if !maps.Equal(a.GetStaticLabels(), b.GetStaticLabels()) {
 		return Different
 	}
-	if !cmp.Equal(a.GetCmdLabels(), b.GetCmdLabels()) {
+
+	if !maps.EqualFunc(a.GetCmdLabels(), b.GetCmdLabels(), func(label types.CommandLabel, label2 types.CommandLabel) bool {
+		return slices.Equal(label.GetCommand(), label2.GetCommand()) &&
+			label.GetPeriod() == label2.GetPeriod() &&
+			label.GetResult() == label2.GetResult()
+	}) {
 		return Different
 	}
 	if a.GetTeleportVersion() != b.GetTeleportVersion() {
 		return Different
 	}
 
-	if !cmp.Equal(a.GetProxyIDs(), b.GetProxyIDs()) {
+	if !slices.Equal(a.GetProxyIDs(), b.GetProxyIDs()) {
+		return Different
+	}
+	if !cmp.Equal(a.GetGitHub(), b.GetGitHub()) {
 		return Different
 	}
 	// OnlyTimestampsDifferent check must be after all Different checks.
@@ -154,7 +158,7 @@ func compareApplicationServers(a, b types.AppServer) int {
 	if !cmp.Equal(a.GetApp(), b.GetApp()) {
 		return Different
 	}
-	if !cmp.Equal(a.GetProxyIDs(), b.GetProxyIDs()) {
+	if !slices.Equal(a.GetProxyIDs(), b.GetProxyIDs()) {
 		return Different
 	}
 	// OnlyTimestampsDifferent check must be after all Different checks.
@@ -174,7 +178,14 @@ func compareDatabaseServices(a, b types.DatabaseService) int {
 	if a.GetNamespace() != b.GetNamespace() {
 		return Different
 	}
-	if !cmp.Equal(a.GetResourceMatchers(), b.GetResourceMatchers()) {
+	if !slices.EqualFunc(a.GetResourceMatchers(), b.GetResourceMatchers(),
+		func(matcher *types.DatabaseResourceMatcher, matcher2 *types.DatabaseResourceMatcher) bool {
+			return matcher.AWS.AssumeRoleARN == matcher2.AWS.AssumeRoleARN &&
+				maps.EqualFunc(matcher.Labels.ToProto().Values, matcher2.Labels.ToProto().Values,
+					func(values wrappers.StringValues, values2 wrappers.StringValues) bool {
+						return slices.Equal(values.Values, values2.Values)
+					})
+		}) {
 		return Different
 	}
 	if !a.Expiry().Equal(b.Expiry()) {
@@ -203,7 +214,7 @@ func compareKubernetesServers(a, b types.KubeServer) int {
 	if !cmp.Equal(a.GetCluster(), b.GetCluster()) {
 		return Different
 	}
-	if !cmp.Equal(a.GetProxyIDs(), b.GetProxyIDs()) {
+	if !slices.Equal(a.GetProxyIDs(), b.GetProxyIDs()) {
 		return Different
 	}
 	// OnlyTimestampsDifferent check must be after all Different checks.
@@ -233,7 +244,7 @@ func compareDatabaseServers(a, b types.DatabaseServer) int {
 	if !cmp.Equal(a.GetDatabase(), b.GetDatabase()) {
 		return Different
 	}
-	if !cmp.Equal(a.GetProxyIDs(), b.GetProxyIDs()) {
+	if !slices.Equal(a.GetProxyIDs(), b.GetProxyIDs()) {
 		return Different
 	}
 	// OnlyTimestampsDifferent check must be after all Different checks.
@@ -256,7 +267,7 @@ func compareWindowsDesktopServices(a, b types.WindowsDesktopService) int {
 	if a.GetTeleportVersion() != b.GetTeleportVersion() {
 		return Different
 	}
-	if !cmp.Equal(a.GetProxyIDs(), b.GetProxyIDs()) {
+	if !slices.Equal(a.GetProxyIDs(), b.GetProxyIDs()) {
 		return Different
 	}
 	// OnlyTimestampsDifferent check must be after all Different checks.
@@ -360,8 +371,8 @@ func UnmarshalServer(bytes []byte, kind string, opts ...MarshalOption) (types.Se
 	if err := s.CheckAndSetDefaults(); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	if cfg.ID != 0 {
-		s.SetResourceID(cfg.ID)
+	if cfg.Revision != "" {
+		s.SetRevision(cfg.Revision)
 	}
 	if !cfg.Expires.IsZero() {
 		s.SetExpiry(cfg.Expires)
@@ -378,10 +389,6 @@ func UnmarshalServer(bytes []byte, kind string, opts ...MarshalOption) (types.Se
 
 // MarshalServer marshals the Server resource to JSON.
 func MarshalServer(server types.Server, opts ...MarshalOption) ([]byte, error) {
-	if err := server.CheckAndSetDefaults(); err != nil {
-		return nil, trace.Wrap(err)
-	}
-
 	cfg, err := CollectOptions(opts)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -389,14 +396,11 @@ func MarshalServer(server types.Server, opts ...MarshalOption) ([]byte, error) {
 
 	switch server := server.(type) {
 	case *types.ServerV2:
-		if !cfg.PreserveResourceID {
-			// avoid modifying the original object
-			// to prevent unexpected data races
-			copy := *server
-			copy.SetResourceID(0)
-			server = &copy
+		if err := server.CheckAndSetDefaults(); err != nil {
+			return nil, trace.Wrap(err)
 		}
-		return utils.FastMarshal(server)
+
+		return utils.FastMarshal(maybeResetProtoRevision(cfg.PreserveRevision, server))
 	default:
 		return nil, trace.BadParameter("unrecognized server version %T", server)
 	}
@@ -434,44 +438,11 @@ func NodeHasMissedKeepAlives(s types.Server) bool {
 	return serverExpiry.Before(time.Now().Add(apidefaults.ServerAnnounceTTL - (apidefaults.ServerKeepAliveTTL() * 2)))
 }
 
-// NewAWSNodeFromEC2Instance creates a Node resource from an EC2 Instance.
-// It has a pre-populated spec which contains info that is not available in the ec2.Instance object.
-func NewAWSNodeFromEC2Instance(instance ec2Types.Instance, awsCloudMetadata *types.AWSInfo) (types.Server, error) {
-	labels := libaws.TagsToLabels(instance.Tags)
-	if labels == nil {
-		labels = make(map[string]string)
+// EqualFromBool is a helper function that converts a boolean value to an integer
+// value that represents the equality status.
+func EqualFromBool(b bool) int {
+	if !b {
+		return Different
 	}
-	libaws.AddMetadataLabels(labels, awsCloudMetadata.AccountID, awsCloudMetadata.Region)
-
-	instanceID := aws.ToString(instance.InstanceId)
-	labels[types.AWSInstanceIDLabel] = instanceID
-
-	awsCloudMetadata.InstanceID = instanceID
-	awsCloudMetadata.VPCID = aws.ToString(instance.VpcId)
-	awsCloudMetadata.SubnetID = aws.ToString(instance.SubnetId)
-
-	if aws.ToString(instance.PrivateIpAddress) == "" {
-		return nil, trace.BadParameter("private ip address is required from ec2 instance")
-	}
-	// Address requires the Port.
-	// We use the default port for the OpenSSH daemon.
-	addr := net.JoinHostPort(aws.ToString(instance.PrivateIpAddress), defaultSSHPort)
-
-	server, err := types.NewNode(
-		uuid.NewString(),
-		types.SubKindOpenSSHEICENode,
-		types.ServerSpecV2{
-			Hostname: aws.ToString(instance.PrivateDnsName),
-			Addr:     addr,
-			CloudMetadata: &types.CloudMetadata{
-				AWS: awsCloudMetadata,
-			},
-		},
-		labels,
-	)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	return server, nil
+	return Equal
 }

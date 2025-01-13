@@ -1,18 +1,20 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package puttyhosts
 
@@ -202,8 +204,10 @@ func TestFormatHostCAPublicKeysForRegistry(t *testing.T) {
 		{
 			inputMap: map[string][]string{
 				"teleport.example.com": {
-					`AAAAB3NzaC1yc2EAAAADAQABAAABAQDNbSbDa+bAjeH6wQPMfcUoyKHOTOwBRc1Lr+5Vy6aHOz+lWsovldH0r4mGFv2mLyWmqax18YVWG/YY+5um9y19SxlIHcAZI/uqnV7lAOhVkni87CGZ+Noww512dlrtczYZDc4735mSYxcSYQyRZywwXOfSqA0Euc6P2a0e03hcdROeJxx50xQcDw/wjreot5swiVHOvOGIIauekPswP58Z+F4goIFaFk5i5gDDBfX4mvtFV5AOkYQlk4hzmwJZ2JpphUQ33YbwhDrEPat2/mLf1tUk6aY8qHFqE9g5bjFjuLQxeva3Y5in49Zt+pg701TbBwS+R8wbuQqDM8b7VgEV`,
-					`AAAAB3NzaC1yc2EAAAADAQABAAABAQDm0PWl5llSpFArdHkXv8xXgsO9qEAbjvIAjMaoUbr79d03pBlmCCU7Zm3X9NkiLL7om2KLSE7AA0oQI+S+VgrDX17S327uj8M3hNZkfkbKGvzY5NS17DubpEEuAoF1r8Of7GKMbAmQ9d8dF8iNkREaJ+FT8g2JmGtRwmQGf8c0v2FCdz7SbChE9nUxk4Q8f1Qjhx8Pgjga/ntqkB+JpwATVvCxkd/ld0yzh9T0l90dV1TYYwnmWVpQzes1nbotQoMK8vUO20dWBEMWVMxXXp/P4OaztYGLmGJ9YP9upxq8IoSUdef7URUuJZGPWEyCQ0Mk6GRYJHvlX5cNOSHxYDBt`,
+					`AAAAB3NzaC1yc2EAAAADAQABAAABAQDNbSbDa+bAjeH6wQPMfcUoyKHOTOwBRc1Lr+5Vy6aHOz+lWsovldH0r4mGFv2mLyWmqax18YVWG/YY+5um9y19SxlIHcAZI/uqnV7lAOhVkni87CGZ+Noww512dlrtczYZDc4735mSYxcSYQyRZywwXOfSqA0Euc6P2a0e03hcdROeJxx50xQcDw/wjreot5swiVHOvOGIIauekPswP58Z+F4goIFaFk5i5gDDBfX4mvtFV5AOkYQlk4hzmwJZ2JpphUQ33YbwhDrEPat2/mLf1tUk6aY8qHFqE9g5bjFjuLQxeva3Y5in49Zt+pg701TbBwS+R8wbuQqDM8b7VgEV`, // RSA
+					`AAAAB3NzaC1yc2EAAAADAQABAAABAQDm0PWl5llSpFArdHkXv8xXgsO9qEAbjvIAjMaoUbr79d03pBlmCCU7Zm3X9NkiLL7om2KLSE7AA0oQI+S+VgrDX17S327uj8M3hNZkfkbKGvzY5NS17DubpEEuAoF1r8Of7GKMbAmQ9d8dF8iNkREaJ+FT8g2JmGtRwmQGf8c0v2FCdz7SbChE9nUxk4Q8f1Qjhx8Pgjga/ntqkB+JpwATVvCxkd/ld0yzh9T0l90dV1TYYwnmWVpQzes1nbotQoMK8vUO20dWBEMWVMxXXp/P4OaztYGLmGJ9YP9upxq8IoSUdef7URUuJZGPWEyCQ0Mk6GRYJHvlX5cNOSHxYDBt`, // RSA
+					`AAAAC3NzaC1lZDI1NTE5AAAAICj/inr+V2oDyH39iESDof/jM4XcPzUZOVZ/Bm79CVGi`,                                                                         // Ed25519
+					`AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBJp4V4vuk5BjiOXKhls02lsw61OZFhZ9Ya188inproU5FmaUhjYnjEvsGPLeMYu3o2AQ4/gsV6MW2H1bNnr5SvY=`, // ECDSA
 				},
 			},
 			hostname: "test-hostname.example.com",
@@ -217,6 +221,16 @@ func TestFormatHostCAPublicKeysForRegistry(t *testing.T) {
 					HostCAPublicKeyForRegistry{
 						KeyName:   "TeleportHostCA-teleport.example.com-1",
 						PublicKey: "AAAAB3NzaC1yc2EAAAADAQABAAABAQDm0PWl5llSpFArdHkXv8xXgsO9qEAbjvIAjMaoUbr79d03pBlmCCU7Zm3X9NkiLL7om2KLSE7AA0oQI+S+VgrDX17S327uj8M3hNZkfkbKGvzY5NS17DubpEEuAoF1r8Of7GKMbAmQ9d8dF8iNkREaJ+FT8g2JmGtRwmQGf8c0v2FCdz7SbChE9nUxk4Q8f1Qjhx8Pgjga/ntqkB+JpwATVvCxkd/ld0yzh9T0l90dV1TYYwnmWVpQzes1nbotQoMK8vUO20dWBEMWVMxXXp/P4OaztYGLmGJ9YP9upxq8IoSUdef7URUuJZGPWEyCQ0Mk6GRYJHvlX5cNOSHxYDBt",
+						Hostname:  "test-hostname.example.com",
+					},
+					HostCAPublicKeyForRegistry{
+						KeyName:   "TeleportHostCA-teleport.example.com-2",
+						PublicKey: "AAAAC3NzaC1lZDI1NTE5AAAAICj/inr+V2oDyH39iESDof/jM4XcPzUZOVZ/Bm79CVGi",
+						Hostname:  "test-hostname.example.com",
+					},
+					HostCAPublicKeyForRegistry{
+						KeyName:   "TeleportHostCA-teleport.example.com-3",
+						PublicKey: "AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBJp4V4vuk5BjiOXKhls02lsw61OZFhZ9Ya188inproU5FmaUhjYnjEvsGPLeMYu3o2AQ4/gsV6MW2H1bNnr5SvY=",
 						Hostname:  "test-hostname.example.com",
 					},
 				},
@@ -265,6 +279,10 @@ func TestNaivelyValidateHostname(t *testing.T) {
 			shouldPass: true,
 		},
 		{
+			hostname:   "test",
+			shouldPass: true,
+		},
+		{
 			hostname:   "testhost-withdashes.example.com",
 			shouldPass: true,
 		},
@@ -296,12 +314,221 @@ func TestNaivelyValidateHostname(t *testing.T) {
 			hostname:   "consecutive..dots",
 			shouldPass: false,
 		},
+		{
+			hostname:   "host:22",
+			shouldPass: false,
+		},
+		{
+			hostname:   "host with spaces",
+			shouldPass: false,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.hostname, func(t *testing.T) {
 			testResult := NaivelyValidateHostname(tt.hostname)
 			require.Equal(t, tt.shouldPass, testResult)
+		})
+	}
+}
+
+func TestCheckAndSplitValidityKey(t *testing.T) {
+	t.Parallel()
+
+	var tests = []struct {
+		name          string
+		input         string
+		desiredOutput []string
+		checkErr      require.ErrorAssertionFunc
+	}{
+		{
+			name:          "Should pass with an empty input string",
+			input:         "",
+			desiredOutput: []string(nil),
+			checkErr:      require.NoError,
+		},
+		{
+			name:  "Should pass with two wildcards",
+			input: "*.foo.example.com || *.bar.example.com",
+			desiredOutput: []string{
+				"*.foo.example.com",
+				"*.bar.example.com",
+			},
+			checkErr: require.NoError,
+		},
+		{
+			name:          "Should pass with a single string and no delimiter",
+			input:         "test",
+			desiredOutput: []string{"test"},
+			checkErr:      require.NoError,
+		},
+		{
+			name:  "Should pass with wildcard, single string and regular hostname",
+			input: "*.example.com || test || teleport.test.com",
+			desiredOutput: []string{
+				"*.example.com",
+				"test",
+				"teleport.test.com",
+			},
+			checkErr: require.NoError,
+		},
+		{
+			name:  "Should pass with mixed usage",
+			input: "*.example.com || test || teleport.test.com || longstring || *.wow.com",
+			desiredOutput: []string{
+				"*.example.com",
+				"test",
+				"teleport.test.com",
+				"longstring",
+				"*.wow.com",
+			},
+			checkErr: require.NoError,
+		},
+		{
+			name:  "Should pass with trailing space",
+			input: "*.example.com || lol.example.com || test.teleport.com ",
+			desiredOutput: []string{
+				"*.example.com",
+				"lol.example.com",
+				"test.teleport.com",
+			},
+			checkErr: require.NoError,
+		},
+		{
+			name:  "Should pass with preceding space",
+			input: " *.example.com || lol.example.com",
+			desiredOutput: []string{
+				"*.example.com",
+				"lol.example.com",
+			},
+			checkErr: require.NoError,
+		},
+		{
+			name:  "Should pass with random spacing",
+			input: " *.example.com  ||   lol.example.com",
+			desiredOutput: []string{
+				"*.example.com",
+				"lol.example.com",
+			},
+			checkErr: require.NoError,
+		},
+		{
+			name:  "Should pass with extra space in the middle",
+			input: " *.example.com ||  lol.example.com || test.teleport.com",
+			desiredOutput: []string{
+				"*.example.com",
+				"lol.example.com",
+				"test.teleport.com",
+			},
+			checkErr: require.NoError,
+		},
+		{
+			name:     "Should error if colons are used",
+			input:    "*.example.com && port:22",
+			checkErr: require.Error,
+		},
+		{
+			name:     "Should fail if negation is used",
+			input:    "*.example.com && ! *.extrasecure.example.com",
+			checkErr: require.Error,
+		},
+		{
+			name:     "Should fail if parentheses are used",
+			input:    "(*.foo.example.com || *.bar.example.com)",
+			checkErr: require.Error,
+		},
+		{
+			name:     "Should fail if parentheses and port are used",
+			input:    "(*.foo.example.com || *.bar.example.com) && port:0-1023",
+			checkErr: require.Error,
+		},
+		{
+			name:     "Should fail with multiple parentheses and port",
+			input:    "(*.foo.example.com || *.bar.example.com || *.qux.example.com) && port:0-1023",
+			checkErr: require.Error,
+		},
+		{
+			name:     "Should fail with multiple parentheses, port and trailing hostname",
+			input:    "((*.foo.example.com || *.bar.example.com || *.qux.example.com) && port:0-1023) || teleport.example.com",
+			checkErr: require.Error,
+		},
+		{
+			name:     "Should fail with multiple parentheses, port and two trailing hostnames",
+			input:    "((*.example.com || lol.example.com && port:22) && port:1024) || test.teleport.com || teleport.test.com",
+			checkErr: require.Error,
+		},
+		{
+			name:     "Should fail if single pipe delimiter is used",
+			input:    "*.example.com || lol.example.com | test.teleport.com",
+			checkErr: require.Error,
+		},
+		{
+			name:     "Should fail if single ampersand delimiter is used",
+			input:    "*.example.com & lol.example.com || test.teleport.com",
+			checkErr: require.Error,
+		},
+		{
+			name:     "Should fail if boolean AND is used",
+			input:    "*.example.com && lol.example.com || test.teleport.com",
+			checkErr: require.Error,
+		},
+		{
+			name:     "Should fail with misplaced pipe delimiter",
+			input:    "*.example.com || lol.example.com || | test.teleport.com",
+			checkErr: require.Error,
+		},
+		{
+			name:     "Should fail with empty final field",
+			input:    "*.example.com || lol.example.com || | test.teleport.com || ",
+			checkErr: require.Error,
+		},
+		{
+			name:     "Should fail with double delimiter and empty field",
+			input:    "*.example.com || lol.example.com || || test.teleport.com",
+			checkErr: require.Error,
+		},
+		{
+			name:     "Should fail with triple delimiter and empty field",
+			input:    "*.example.com || lol.example.com || || || test.teleport.com",
+			checkErr: require.Error,
+		},
+		{
+			name:     "Should fail with pipe character in hostname",
+			input:    "*.example.com || lol.example.com || test.|teleport.com",
+			checkErr: require.Error,
+		},
+		{
+			name:     "Should fail with negation character around hostname",
+			input:    "*.example.com || lol.example.com || !test.teleport.com",
+			checkErr: require.Error,
+		},
+		{
+			name:     "Should fail with a non-hostname",
+			input:    "*.example.com || lol.example.com || test.teleport.com || \"\"",
+			checkErr: require.Error,
+		},
+		{
+			name:     "Should fail with a single trailing dot",
+			input:    "*.example.com || lol.example.com || .",
+			checkErr: require.Error,
+		},
+		{
+			name:     "Should error with single wildcard symbol",
+			input:    "*",
+			checkErr: require.Error,
+		},
+		{
+			name:     "Should error if multiple single wildcard symbols are present",
+			input:    "* || *",
+			checkErr: require.Error,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			testResult, err := CheckAndSplitValidityKey(tt.input, "TeleportHostCA-testcluster.example.com")
+			tt.checkErr(t, err)
+			require.Equal(t, tt.desiredOutput, testResult)
 		})
 	}
 }

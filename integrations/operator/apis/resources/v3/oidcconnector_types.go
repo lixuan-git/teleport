@@ -1,24 +1,27 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package v3
 
 import (
 	"encoding/json"
 
+	"github.com/gravitational/trace"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/gravitational/teleport/api/types"
@@ -32,15 +35,6 @@ func init() {
 // TeleportOIDCConnectorSpec defines the desired state of TeleportOIDCConnector
 type TeleportOIDCConnectorSpec types.OIDCConnectorSpecV3
 
-// TeleportOIDCConnectorStatus defines the observed state of TeleportOIDCConnector
-type TeleportOIDCConnectorStatus struct {
-	// Conditions represent the latest available observations of an object's state
-	// +optional
-	Conditions []metav1.Condition `json:"conditions,omitempty"`
-	// +optional
-	TeleportResourceID int64 `json:"teleportResourceID,omitempty"`
-}
-
 //+kubebuilder:object:root=true
 //+kubebuilder:subresource:status
 
@@ -49,8 +43,8 @@ type TeleportOIDCConnector struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   TeleportOIDCConnectorSpec   `json:"spec,omitempty"`
-	Status TeleportOIDCConnectorStatus `json:"status,omitempty"`
+	Spec   TeleportOIDCConnectorSpec `json:"spec,omitempty"`
+	Status resources.Status          `json:"status,omitempty"`
 }
 
 //+kubebuilder:object:root=true
@@ -75,6 +69,8 @@ func (c TeleportOIDCConnector) ToTeleport() types.OIDCConnector {
 	}
 }
 
+// StatusConditions returns a pointer to Status.Conditions slice. This is used
+// by the teleport resource controller to report conditions back to on resource.
 func (c *TeleportOIDCConnector) StatusConditions() *[]metav1.Condition {
 	return &c.Status.Conditions
 }
@@ -102,14 +98,49 @@ func (spec *TeleportOIDCConnectorSpec) DeepCopyInto(out *TeleportOIDCConnectorSp
 	}
 }
 
+// Custom json.Marshaller and json.Unmarshaler are here to cope with inconsistencies between our CRD and go types.
+// They are invoked when the kubernetes client converts the unstructured object into a typed resource.
+// We have two inconsistencies:
+// - the utils.Strings typr that marshals inconsistently: single elements are strings, multiple elements are lists
+// - the max_age setting which is an embedded pointer to another single-value message, which breaks JSON parsing
+
 // MarshalJSON serializes a spec into a JSON string
 func (spec TeleportOIDCConnectorSpec) MarshalJSON() ([]byte, error) {
 	type Alias TeleportOIDCConnectorSpec
+
+	var maxAge types.Duration
+	if spec.MaxAge != nil {
+		maxAge = spec.MaxAge.Value
+	}
+
 	return json.Marshal(&struct {
-		RedirectURLs []string `json:"redirect_url"`
+		RedirectURLs []string       `json:"redirect_url,omitempty"`
+		MaxAge       types.Duration `json:"max_age,omitempty"`
 		Alias
 	}{
 		RedirectURLs: spec.RedirectURLs,
+		MaxAge:       maxAge,
 		Alias:        (Alias)(spec),
 	})
+}
+
+// UnmarshalJSON serializes a JSON string into a spec. This override is required to deal with the
+// MaxAge field which is special case because it' an object embedded into the spec.
+func (spec *TeleportOIDCConnectorSpec) UnmarshalJSON(data []byte) error {
+	*spec = *new(TeleportOIDCConnectorSpec)
+	type Alias TeleportOIDCConnectorSpec
+
+	temp := &struct {
+		MaxAge types.Duration `json:"max_age"`
+		*Alias
+	}{
+		Alias: (*Alias)(spec),
+	}
+	if err := json.Unmarshal(data, &temp); err != nil {
+		return trace.Wrap(err, "unmarshalling custom teleport oidc connector spec")
+	}
+	if temp.MaxAge != 0 {
+		spec.MaxAge = &types.MaxAge{Value: temp.MaxAge}
+	}
+	return nil
 }

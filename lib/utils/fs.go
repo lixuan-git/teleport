@@ -1,18 +1,20 @@
 /*
-Copyright 2015 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package utils
 
@@ -201,6 +203,16 @@ func FSTryWriteLock(filePath string) (unlock func() error, err error) {
 	return fileLock.Unlock, nil
 }
 
+// FSWriteLock tries to grab write lock and block if lock is already acquired by someone else.
+func FSWriteLock(filePath string) (unlock func() error, err error) {
+	fileLock := flock.New(getPlatformLockFilePath(filePath))
+	if err := fileLock.Lock(); err != nil {
+		return nil, trace.ConvertSystemError(err)
+	}
+
+	return fileLock.Unlock, nil
+}
+
 // FSTryWriteLockTimeout tries to grab write lock, it's doing it until locks is acquired, or timeout is expired,
 // or context is expired.
 func FSTryWriteLockTimeout(ctx context.Context, filePath string, timeout time.Duration) (unlock func() error, err error) {
@@ -214,7 +226,7 @@ func FSTryWriteLockTimeout(ctx context.Context, filePath string, timeout time.Du
 	return fileLock.Unlock, nil
 }
 
-// FSTryReadLock tries to grab write lock, returns ErrUnsuccessfulLockTry
+// FSTryReadLock tries to grab shared lock, returns ErrUnsuccessfulLockTry
 // if lock is already acquired by someone else
 func FSTryReadLock(filePath string) (unlock func() error, err error) {
 	fileLock := flock.New(getPlatformLockFilePath(filePath))
@@ -224,6 +236,16 @@ func FSTryReadLock(filePath string) (unlock func() error, err error) {
 	}
 	if !locked {
 		return nil, trace.Retry(ErrUnsuccessfulLockTry, "")
+	}
+
+	return fileLock.Unlock, nil
+}
+
+// FSReadLock tries to grab shared lock and block if lock is already acquired by someone else.
+func FSReadLock(filePath string) (unlock func() error, err error) {
+	fileLock := flock.New(getPlatformLockFilePath(filePath))
+	if err := fileLock.RLock(); err != nil {
+		return nil, trace.ConvertSystemError(err)
 	}
 
 	return fileLock.Unlock, nil
@@ -243,7 +265,7 @@ func FSTryReadLockTimeout(ctx context.Context, filePath string, timeout time.Dur
 }
 
 // RemoveAllSecure is similar to [os.RemoveAll] but leverages [RemoveSecure] to delete files so that they are
-// overwritten.  This helps guard against hardware attacks on magnetic disks.
+// overwritten. This helps guard against hardware attacks on magnetic disks.
 func RemoveAllSecure(path string) error {
 	if path == "" {
 		// match behavior from os.RemoveAll
@@ -323,7 +345,10 @@ func removeSecure(filePath string, fi os.FileInfo) error {
 				}
 			}
 		}
-		return trace.ConvertSystemError(os.Remove(filePath))
+		// The file should be closed before removing it on Windows.
+		closeErr := trace.ConvertSystemError(f.Close())
+		removeErr := trace.ConvertSystemError(os.Remove(filePath))
+		return trace.NewAggregate(closeErr, removeErr)
 	} else {
 		removeErr := os.Remove(filePath)
 		if f != nil {
@@ -369,19 +394,32 @@ func RemoveFileIfExist(filePath string) error {
 }
 
 func RecursiveChown(dir string, uid, gid int) error {
-	if err := os.Chown(dir, uid, gid); err != nil {
-		return trace.Wrap(err)
-	}
-	return trace.Wrap(filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+	// First, walk the directory to gather a list of files and directories to update before we open up to modifications
+	var pathsToUpdate []string
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return trace.Wrap(err)
 		}
-		err = os.Chown(path, uid, gid)
-		if os.IsNotExist(err) { // empty symlinks cause an error here
-			return nil
-		}
+		pathsToUpdate = append(pathsToUpdate, path)
+		return nil
+	})
+	if err != nil {
 		return trace.Wrap(err)
-	}))
+	}
+
+	// filepath.WalkDir is documented to walk the paths in lexical order, iterating
+	// in the reverse order ensures that files are always Lchowned before their parent directory
+	for i := len(pathsToUpdate) - 1; i >= 0; i-- {
+		path := pathsToUpdate[i]
+		if err := os.Lchown(path, uid, gid); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				// Unexpected condition where file was removed after discovery.
+				continue
+			}
+			return trace.Wrap(err)
+		}
+	}
+	return nil
 }
 
 func CopyFile(src, dest string, perm os.FileMode) error {

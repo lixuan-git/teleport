@@ -1,42 +1,50 @@
-/*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 import { useEffect, useRef } from 'react';
+
 import { useAsync } from 'shared/hooks/useAsync';
 import { runOnce } from 'shared/utils/highbar';
 
-import { useAppContext } from 'teleterm/ui/appContextProvider';
-import { IAppContext } from 'teleterm/ui/types';
+import Logger from 'teleterm/logger';
+import type { Shell } from 'teleterm/mainProcess/shell';
 import {
+  PtyCommand,
+  PtyProcessCreationStatus,
+  WindowsPty,
+} from 'teleterm/services/pty';
+import * as tshdGateway from 'teleterm/services/tshd/gateway';
+import type * as tsh from 'teleterm/services/tshd/types';
+import { IPtyProcess } from 'teleterm/sharedProcess/ptyHost';
+import { useAppContext } from 'teleterm/ui/appContextProvider';
+import { useWorkspaceContext } from 'teleterm/ui/Documents';
+import { ClustersService } from 'teleterm/ui/services/clusters';
+import { AmbiguousHostnameError } from 'teleterm/ui/services/resources';
+import {
+  canDocChangeShell,
   DocumentsService,
   isDocumentTshNodeWithLoginHost,
 } from 'teleterm/ui/services/workspacesService';
-import { IPtyProcess } from 'teleterm/sharedProcess/ptyHost';
-import { useWorkspaceContext } from 'teleterm/ui/Documents';
-import { routing } from 'teleterm/ui/uri';
-import { PtyCommand, PtyProcessCreationStatus } from 'teleterm/services/pty';
-import { AmbiguousHostnameError } from 'teleterm/ui/services/resources';
-import { retryWithRelogin } from 'teleterm/ui/utils';
-import Logger from 'teleterm/logger';
-import { ClustersService } from 'teleterm/ui/services/clusters';
-import * as tshdGateway from 'teleterm/services/tshd/gateway';
-
 import type * as types from 'teleterm/ui/services/workspacesService';
+import { IAppContext } from 'teleterm/ui/types';
+import { routing } from 'teleterm/ui/uri';
 import type * as uri from 'teleterm/ui/uri';
-import type * as tsh from 'teleterm/services/tshd/types';
+import { retryWithRelogin } from 'teleterm/ui/utils';
 
 export function useDocumentTerminal(doc: types.DocumentTerminal) {
   const logger = useRef(new Logger('useDocumentTerminal'));
@@ -47,12 +55,27 @@ export function useDocumentTerminal(doc: types.DocumentTerminal) {
       documentsService.update(doc.uri, { status: 'connecting' });
     }
 
+    // Add `shellId` before going further.
+    // When a new document is crated, its `shellId` is empty
+    // (setting the default shell would require reading it from ConfigService
+    // in DocumentsService and I wasn't sure about adding more dependencies there).
+    // Because of that, I decided to initialize this property later.
+    // `doc.shellId` is used in here, in `useDocumentTerminal` and in `tabContextMenu`.
+    let docWithDefaultShell: types.DocumentTerminal;
+    if (canDocChangeShell(doc) && !doc.shellId) {
+      docWithDefaultShell = {
+        ...doc,
+        shellId: ctx.configService.get('terminal.shell').value,
+      };
+      documentsService.update(doc.uri, docWithDefaultShell);
+    }
+
     try {
       return await initializePtyProcess(
         ctx,
         logger.current,
         documentsService,
-        doc
+        docWithDefaultShell || doc
       );
     } catch (err) {
       if ('status' in doc) {
@@ -70,7 +93,7 @@ export function useDocumentTerminal(doc: types.DocumentTerminal) {
 
     return () => {
       if (attempt.status === 'success') {
-        attempt.data.ptyProcess.dispose();
+        void attempt.data.ptyProcess.dispose();
       }
     };
     // This cannot be run only mount. If the user has initialized a new PTY process by clicking the
@@ -228,31 +251,47 @@ async function setUpPtyProcess(
     getClusterName()
   );
 
-  const ptyProcess = await createPtyProcess(ctx, cmd);
+  const {
+    process: ptyProcess,
+    windowsPty,
+    shell,
+  } = await createPtyProcess(ctx, cmd);
+  // Update the document with the shell that was resolved.
+  // This may be a different shell than the one passed as `shellId`
+  // (for example, if it is no longer available, the default one will be opened).
+  documentsService.update(doc.uri, { shellId: shell.id });
 
   if (doc.kind === 'doc.terminal_tsh_node') {
-    ctx.usageService.captureProtocolUse(clusterUri, 'ssh', doc.origin);
+    ctx.usageService.captureProtocolUse({
+      uri: clusterUri,
+      protocol: 'ssh',
+      origin: doc.origin,
+      accessThrough: 'proxy_service',
+    });
   }
   if (doc.kind === 'doc.terminal_tsh_kube' || doc.kind === 'doc.gateway_kube') {
-    ctx.usageService.captureProtocolUse(clusterUri, 'kube', doc.origin);
+    ctx.usageService.captureProtocolUse({
+      uri: clusterUri,
+      // Other gateways send one protocol use event per gateway being created, but here we're
+      // sending one event per kube tab being opened. In the context of protocol usage, that is fine
+      // since we now count not protocol _uses_ but protocol _users_.
+      protocol: 'kube',
+      origin: doc.origin,
+      // This will likely need to be adjusted after adding kube support to VNet. VNet is probably
+      // going to send one protocol use event per kube cluster seen, but Connect sends one event per
+      // tab opened.
+      accessThrough: 'local_proxy',
+    });
   }
 
   const openContextMenu = () => ctx.mainProcessClient.openTerminalContextMenu();
 
   const refreshTitle = async () => {
-    // TODO(ravicious): Enable updating cwd in doc.gateway_kube titles by
-    // moving title-updating logic to DocumentsService. The logic behind
-    // updating the title should be encapsulated in a single place, so that
-    // useDocumentTerminal doesn't need to know the details behind the title of
-    // each document kind.
-    if (doc.kind !== 'doc.terminal_shell') {
-      return;
-    }
-
-    const cwd = await ptyProcess.getCwd();
-    documentsService.update(doc.uri, {
-      cwd,
-      title: `${cwd || 'Terminal'} · ${getClusterName()}`,
+    documentsService.refreshPtyTitle(doc.uri, {
+      shell: shell,
+      cwd: await ptyProcess.getCwd(),
+      clusterName: getClusterName(),
+      runtimeSettings: ctx.mainProcessClient.getRuntimeSettings(),
     });
   };
 
@@ -299,14 +338,19 @@ async function setUpPtyProcess(
     ptyProcess,
     refreshTitle,
     openContextMenu,
+    windowsPty,
   };
 }
 
 async function createPtyProcess(
   ctx: IAppContext,
   cmd: PtyCommand
-): Promise<IPtyProcess> {
-  const { process, creationStatus } =
+): Promise<{
+  process: IPtyProcess;
+  windowsPty: WindowsPty;
+  shell: Shell;
+}> {
+  const { process, creationStatus, windowsPty, shell } =
     await ctx.terminalsService.createPtyProcess(cmd);
 
   if (creationStatus === PtyProcessCreationStatus.ResolveShellEnvTimeout) {
@@ -318,7 +362,16 @@ async function createPtyProcess(
     });
   }
 
-  return process;
+  if (
+    cmd.kind === 'pty.shell' &&
+    creationStatus === PtyProcessCreationStatus.ShellNotResolved
+  ) {
+    ctx.notificationsService.notifyWarning({
+      title: `Requested shell "${cmd.shellId}" is not available`,
+    });
+  }
+
+  return { process, windowsPty, shell };
 }
 
 // TODO(ravicious): Instead of creating cmd within useDocumentTerminal, make useDocumentTerminal
@@ -425,6 +478,7 @@ function createCmd(
       clusterName,
       env,
       initMessage,
+      shellId: doc.shellId,
     };
   }
 
@@ -434,5 +488,6 @@ function createCmd(
     proxyHost,
     clusterName,
     cwd: doc.cwd,
+    shellId: doc.shellId,
   };
 }

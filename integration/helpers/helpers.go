@@ -1,23 +1,26 @@
 /*
-Copyright 2018 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package helpers
 
 import (
 	"context"
+	"crypto"
 	"fmt"
 	"net"
 	"os"
@@ -28,6 +31,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/google/uuid"
 	"github.com/gravitational/trace"
 	"github.com/stretchr/testify/assert"
@@ -35,18 +39,22 @@ import (
 	"golang.org/x/crypto/ssh/agent"
 
 	"github.com/gravitational/teleport/api/breaker"
+	apiclient "github.com/gravitational/teleport/api/client"
 	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/constants"
 	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
 	apievents "github.com/gravitational/teleport/api/types/events"
+	"github.com/gravitational/teleport/api/utils/keys"
 	"github.com/gravitational/teleport/api/utils/retryutils"
 	"github.com/gravitational/teleport/lib"
 	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/client"
 	"github.com/gravitational/teleport/lib/client/identityfile"
-	"github.com/gravitational/teleport/lib/cloud"
+	"github.com/gravitational/teleport/lib/cloud/imds"
+	"github.com/gravitational/teleport/lib/cryptosuites"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/multiplexer"
@@ -59,13 +67,14 @@ import (
 
 // CommandOptions controls how the SSH command is built.
 type CommandOptions struct {
-	ForwardAgent bool
-	ForcePTY     bool
-	ControlPath  string
-	SocketPath   string
-	ProxyPort    string
-	NodePort     string
-	Command      string
+	ForwardAgent  bool
+	ForcePTY      bool
+	X11Forwarding bool
+	ControlPath   string
+	SocketPath    string
+	ProxyPort     string
+	NodePort      string
+	Command       string
 }
 
 // ExternalSSHCommand runs an external SSH command (if an external ssh binary
@@ -84,6 +93,10 @@ func ExternalSSHCommand(o CommandOptions) (*exec.Cmd, error) {
 		execArgs = append(execArgs, "-oControlPersist=1s")
 		execArgs = append(execArgs, "-oConnectTimeout=2")
 		execArgs = append(execArgs, fmt.Sprintf("-oControlPath=%v", o.ControlPath))
+	}
+
+	if o.X11Forwarding {
+		execArgs = append(execArgs, "-X")
 	}
 
 	// The -tt flag is used to force PTY allocation. It's often used by
@@ -119,24 +132,20 @@ func ExternalSSHCommand(o CommandOptions) (*exec.Cmd, error) {
 	}
 
 	// Create an exec.Command and tell it where to find the SSH agent.
-	cmd, err := exec.Command(sshpath, execArgs...), nil
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
+	cmd := exec.Command(sshpath, execArgs...)
 	cmd.Env = []string{fmt.Sprintf("SSH_AUTH_SOCK=%v", o.SocketPath)}
 
 	return cmd, nil
 }
 
-// CreateAgent creates a SSH agent with the passed in private key and
-// certificate that can be used in tests. This is useful so tests don't
-// clobber your system agent.
-func CreateAgent(me *user.User, key *client.Key) (*teleagent.AgentServer, string, string, error) {
+// CreateAgent creates a SSH agent with the passed in key ring that can be used
+// in tests. This is useful so tests don't clobber your system agent.
+func CreateAgent(keyRing *client.KeyRing) (*teleagent.AgentServer, string, string, error) {
 	// create a path to the unix socket
 	sockDirName := "int-test"
 	sockName := "agent.sock"
 
-	agentKey, err := key.AsAgentKey()
+	agentKey, err := keyRing.AsAgentKey()
 	if err != nil {
 		return nil, "", "", trace.Wrap(err)
 	}
@@ -156,7 +165,7 @@ func CreateAgent(me *user.User, key *client.Key) (*teleagent.AgentServer, string
 	})
 
 	// start the SSH agent
-	err = teleAgent.ListenUnixSocket(sockDirName, sockName, me)
+	err = teleAgent.ListenUnixSocket(sockDirName, sockName, nil)
 	if err != nil {
 		return nil, "", "", trace.Wrap(err)
 	}
@@ -179,36 +188,27 @@ func CloseAgent(teleAgent *teleagent.AgentServer, socketDirPath string) error {
 	return nil
 }
 
-// GetLocalIP gets the non-loopback IP address of this host.
-func GetLocalIP() (string, error) {
-	addrs, err := net.InterfaceAddrs()
-	if err != nil {
-		return "", trace.Wrap(err)
-	}
-	for _, addr := range addrs {
-		var ip net.IP
-		switch v := addr.(type) {
-		case *net.IPNet:
-			ip = v.IP
-		case *net.IPAddr:
-			ip = v.IP
-		default:
-			continue
-		}
-		if !ip.IsLoopback() && ip.IsPrivate() {
-			return ip.String(), nil
-		}
-	}
-	return "", trace.NotFound("No non-loopback local IP address found")
+func MustCreateUserKeyRing(t *testing.T, tc *TeleInstance, username string, ttl time.Duration) *client.KeyRing {
+	sshKey, tlsKey, err := cryptosuites.GenerateUserSSHAndTLSKey(context.Background(), func(_ context.Context) (types.SignatureAlgorithmSuite, error) {
+		return types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_BALANCED_V1, nil
+	})
+	require.NoError(t, err)
+	return mustCreateUserKeyRingWithKeys(t, tc, username, ttl, sshKey, tlsKey)
 }
 
-func MustCreateUserIdentityFile(t *testing.T, tc *TeleInstance, username string, ttl time.Duration) string {
-	key, err := client.GenerateRSAKey()
+func mustCreateUserKeyRingWithKeys(t *testing.T, tc *TeleInstance, username string, ttl time.Duration, sshKey, tlsKey crypto.Signer) *client.KeyRing {
+	sshPriv, err := keys.NewSoftwarePrivateKey(sshKey)
 	require.NoError(t, err)
-	key.ClusterName = tc.Secrets.SiteName
+	tlsPriv, err := keys.NewSoftwarePrivateKey(tlsKey)
+	require.NoError(t, err)
+	keyRing := client.NewKeyRing(sshPriv, tlsPriv)
+	keyRing.ClusterName = tc.Secrets.SiteName
 
+	tlsPub, err := keys.MarshalPublicKey(tlsKey.Public())
+	require.NoError(t, err)
 	sshCert, tlsCert, err := tc.Process.GetAuthServer().GenerateUserTestCerts(auth.GenerateUserTestCertsRequest{
-		Key:            key.MarshalSSHPublicKey(),
+		SSHPubKey:      keyRing.SSHPrivateKey.MarshalSSHPublicKey(),
+		TLSPubKey:      tlsPub,
 		Username:       username,
 		TTL:            ttl,
 		Compatibility:  constants.CertificateFormatStandard,
@@ -216,17 +216,28 @@ func MustCreateUserIdentityFile(t *testing.T, tc *TeleInstance, username string,
 	})
 	require.NoError(t, err)
 
-	key.Cert = sshCert
-	key.TLSCert = tlsCert
+	keyRing.Cert = sshCert
+	keyRing.TLSCert = tlsCert
 
 	hostCAs, err := tc.Process.GetAuthServer().GetCertAuthorities(context.Background(), types.HostCA, false)
 	require.NoError(t, err)
-	key.TrustedCerts = auth.AuthoritiesToTrustedCerts(hostCAs)
+	keyRing.TrustedCerts = authclient.AuthoritiesToTrustedCerts(hostCAs)
+	return keyRing
+}
+
+func MustCreateUserIdentityFile(t *testing.T, tc *TeleInstance, username string, ttl time.Duration) string {
+	key, err := cryptosuites.GenerateKey(context.Background(), func(_ context.Context) (types.SignatureAlgorithmSuite, error) {
+		return types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_BALANCED_V1, nil
+	}, cryptosuites.UserTLS)
+	require.NoError(t, err)
+	// Identity files must use the same key for SSH and TLS.
+	sshKey, tlsKey := key, key
+	keyRing := mustCreateUserKeyRingWithKeys(t, tc, username, ttl, sshKey, tlsKey)
 
 	idPath := filepath.Join(t.TempDir(), "user_identity")
 	_, err = identityfile.Write(context.Background(), identityfile.WriteConfig{
 		OutputPath: idPath,
-		Key:        key,
+		KeyRing:    keyRing,
 		Format:     identityfile.FormatFile,
 	})
 	require.NoError(t, err)
@@ -251,7 +262,7 @@ func WaitForProxyCount(t *TeleInstance, clusterName string, count int) error {
 }
 
 func WaitForAuditEventTypeWithBackoff(t *testing.T, cli *auth.Server, startTime time.Time, eventType string) []apievents.AuditEvent {
-	max := time.Second
+	max := time.Second * 2
 	timeout := time.After(max)
 	bf, err := retryutils.NewLinear(retryutils.LinearConfig{
 		Step: max / 10,
@@ -350,7 +361,7 @@ func MakeTestServers(t *testing.T) (auth *service.TeleportProcess, proxy *servic
 	// execution of this test.
 	cfg := servicecfg.MakeDefaultConfig()
 	cfg.CircuitBreakerConfig = breaker.NoopBreakerConfig()
-	cfg.InstanceMetadataClient = cloud.NewDisabledIMDSClient()
+	cfg.InstanceMetadataClient = imds.NewDisabledIMDSClient()
 	cfg.Hostname = "localhost"
 	cfg.DataDir = t.TempDir()
 	cfg.SetAuthServerAddress(cfg.Auth.ListenAddr)
@@ -368,7 +379,7 @@ func MakeTestServers(t *testing.T) (auth *service.TeleportProcess, proxy *servic
 	cfg.SSH.Enabled = false
 	cfg.Auth.Enabled = true
 	cfg.Proxy.Enabled = false
-	cfg.Log = utils.NewLoggerForTests()
+	cfg.Logger = utils.NewSlogLoggerForTests()
 
 	auth, err = service.NewTeleport(cfg)
 	require.NoError(t, err)
@@ -391,7 +402,7 @@ func MakeTestServers(t *testing.T) (auth *service.TeleportProcess, proxy *servic
 	// Set up a test proxy service.
 	cfg = servicecfg.MakeDefaultConfig()
 	cfg.CircuitBreakerConfig = breaker.NoopBreakerConfig()
-	cfg.InstanceMetadataClient = cloud.NewDisabledIMDSClient()
+	cfg.InstanceMetadataClient = imds.NewDisabledIMDSClient()
 	cfg.Hostname = "localhost"
 	cfg.DataDir = t.TempDir()
 
@@ -406,7 +417,7 @@ func MakeTestServers(t *testing.T) (auth *service.TeleportProcess, proxy *servic
 		cfg.Proxy.WebAddr,
 	}
 	cfg.Proxy.DisableWebInterface = true
-	cfg.Log = utils.NewLoggerForTests()
+	cfg.Logger = utils.NewSlogLoggerForTests()
 
 	proxy, err = service.NewTeleport(cfg)
 	require.NoError(t, err)
@@ -434,7 +445,7 @@ func MakeTestDatabaseServer(t *testing.T, proxyAddr utils.NetAddr, token string,
 	cfg.Hostname = "localhost"
 	cfg.DataDir = t.TempDir()
 	cfg.CircuitBreakerConfig = breaker.NoopBreakerConfig()
-	cfg.InstanceMetadataClient = cloud.NewDisabledIMDSClient()
+	cfg.InstanceMetadataClient = imds.NewDisabledIMDSClient()
 	cfg.SetAuthServerAddress(proxyAddr)
 	cfg.SetToken(token)
 	cfg.SSH.Enabled = false
@@ -443,7 +454,7 @@ func MakeTestDatabaseServer(t *testing.T, proxyAddr utils.NetAddr, token string,
 	cfg.Databases.Enabled = true
 	cfg.Databases.Databases = dbs
 	cfg.Databases.ResourceMatchers = resMatchers
-	cfg.Log = utils.NewLoggerForTests()
+	cfg.Logger = utils.NewSlogLoggerForTests()
 
 	db, err := service.NewTeleport(cfg)
 	require.NoError(t, err)
@@ -460,6 +471,38 @@ func MakeTestDatabaseServer(t *testing.T, proxyAddr utils.NetAddr, token string,
 	return db
 }
 
+// MakeAgentServer creates SSH agent Service
+// It receives the Proxy Address, a Token (to join the cluster).
+func MakeAgentServer(t *testing.T, cfg *servicecfg.Config, proxyAddr utils.NetAddr, token string) *service.TeleportProcess {
+	// Proxy uses self-signed certificates in tests.
+	lib.SetInsecureDevMode(true)
+
+	cfg.Hostname = "localhost"
+	cfg.DataDir = t.TempDir()
+	cfg.CircuitBreakerConfig = breaker.NoopBreakerConfig()
+	cfg.InstanceMetadataClient = imds.NewDisabledIMDSClient()
+	cfg.SetAuthServerAddress(proxyAddr)
+	cfg.SetToken(token)
+	cfg.SSH.Enabled = true
+	cfg.Auth.Enabled = false
+	cfg.Proxy.Enabled = false
+	cfg.Databases.Enabled = false
+	cfg.Logger = utils.NewSlogLoggerForTests()
+
+	agent, err := service.NewTeleport(cfg)
+	require.NoError(t, err)
+	require.NoError(t, agent.Start())
+
+	t.Cleanup(func() {
+		assert.NoError(t, agent.Close())
+	})
+
+	_, err = agent.WaitForEventTimeout(30*time.Second, service.NodeSSHReady)
+	require.NoError(t, err, "agent server didn't start after 10s")
+
+	return agent
+}
+
 // MustCreateListener creates a tcp listener at 127.0.0.1 with random port.
 func MustCreateListener(t *testing.T) net.Listener {
 	t.Helper()
@@ -473,7 +516,7 @@ func MustCreateListener(t *testing.T) net.Listener {
 	return listener
 }
 
-func FindNodeWithLabel(t *testing.T, ctx context.Context, cl services.ResourceLister, key, value string) func() bool {
+func FindNodeWithLabel(t *testing.T, ctx context.Context, cl apiclient.ListResourcesClient, key, value string) func() bool {
 	t.Helper()
 	return func() bool {
 		servers, err := cl.ListResources(ctx, proto.ListResourcesRequest{
@@ -485,4 +528,22 @@ func FindNodeWithLabel(t *testing.T, ctx context.Context, cl services.ResourceLi
 		assert.NoError(t, err)
 		return len(servers.Resources) >= 1
 	}
+}
+
+// UpsertAuthPrefAndWaitForCache upserts the authentication preference and waits
+// until the auth server's cache contains the new value. This is needed since
+// the cache doesn't always catch up before we need to use the preference value.
+func UpsertAuthPrefAndWaitForCache(
+	t *testing.T, ctx context.Context, srv *auth.Server, pref types.AuthPreference,
+) {
+	_, err := srv.UpsertAuthPreference(ctx, pref)
+	require.NoError(t, err)
+	require.EventuallyWithT(t, func(t *assert.CollectT) {
+		// we need to wait for the in-memory copy of auth pref to be updated, which
+		// takes a bit longer than standard cache propagation.
+		rp, err := srv.GetReadOnlyAuthPreference(ctx)
+		require.NoError(t, err)
+		p := rp.Clone()
+		assert.Empty(t, cmp.Diff(&pref, &p))
+	}, 5*time.Second, 100*time.Millisecond)
 }

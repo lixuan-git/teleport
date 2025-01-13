@@ -1,26 +1,25 @@
-/*
-Copyright 2019 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import { createBrowserHistory } from 'history';
-
+import { createBrowserHistory, type History } from 'history';
 import { matchPath } from 'react-router';
 
 import cfg from 'teleport/config';
-
-import type { History } from 'history';
 
 let _inst: History = null;
 
@@ -51,22 +50,41 @@ const history = {
     window.location.reload();
   },
 
-  goToLogin(rememberLocation = false) {
-    let url = cfg.routes.login;
+  goToLogin({
+    rememberLocation = false,
+    withAccessChangedMessage = false,
+  } = {}) {
+    const params: string[] = [];
+
+    // withAccessChangedMessage determines whether the login page the user is redirected to should include a notice that
+    // they were logged out due to their roles having changed.
+    if (withAccessChangedMessage) {
+      params.push('access_changed');
+    }
+
     if (rememberLocation) {
       const { search, pathname } = _inst.location;
       const knownRoute = this.ensureKnownRoute(pathname);
       const knownRedirect = this.ensureBaseUrl(knownRoute);
       const query = search ? encodeURIComponent(search) : '';
-
-      url = `${url}?redirect_uri=${knownRedirect}${query}`;
+      params.push(`redirect_uri=${knownRedirect}${query}`);
     }
+
+    const queryString = params.join('&');
+    const url = queryString
+      ? `${cfg.routes.login}?${queryString}`
+      : cfg.routes.login;
 
     this._pageRefresh(url);
   },
 
+  // TODO (avatus): make this return a path only if a full URI is present
   getRedirectParam() {
     return getUrlParameter('redirect_uri', this.original().location.search);
+  },
+
+  hasAccessChangedParam() {
+    return hasUrlParameter('access_changed', this.original().location.search);
   },
 
   ensureKnownRoute(route = '') {
@@ -89,7 +107,7 @@ const history = {
   },
 
   getRoutes() {
-    return Object.getOwnPropertyNames(cfg.routes).map(p => cfg.routes[p]);
+    return collectAllValues(cfg.routes);
   },
 
   getLocation() {
@@ -98,13 +116,15 @@ const history = {
 
   _canPush(route: string) {
     const knownRoutes = this.getRoutes();
+    const nonExactRoutes = cfg.getNonExactRoutes();
+
     const { pathname } = new URL(this.ensureBaseUrl(route));
 
     const match = (known: string) =>
       // only match against pathname
       matchPath(pathname, {
         path: known,
-        exact: true,
+        exact: !nonExactRoutes.includes(known),
       });
 
     return knownRoutes.some(match);
@@ -115,10 +135,33 @@ const history = {
   },
 };
 
+interface RouteRecord {
+  [key: string]: string | RouteRecord;
+}
+
+function collectAllValues(record: RouteRecord) {
+  const result: string[] = [];
+
+  for (const key in record) {
+    if (typeof record[key] === 'string') {
+      result.push(record[key]);
+    } else {
+      result.push(...collectAllValues(record[key]));
+    }
+  }
+
+  return result;
+}
+
 export default history;
 
 export function getUrlParameter(name = '', path = '') {
   const params = new URLSearchParams(path);
   const value = params.get(name);
   return value || '';
+}
+
+function hasUrlParameter(name = '', path = '') {
+  const params = new URLSearchParams(path);
+  return params.has(name);
 }

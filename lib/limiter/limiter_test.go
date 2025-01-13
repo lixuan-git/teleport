@@ -1,18 +1,21 @@
 /*
-Copyright 2015 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package limiter
 
 import (
@@ -25,13 +28,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gravitational/oxy/ratelimit"
 	"github.com/gravitational/trace"
-	"github.com/mailgun/timetools"
+	"github.com/jonboulle/clockwork"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/peer"
 
+	"github.com/gravitational/teleport/lib/limiter/internal/ratelimit"
 	"github.com/gravitational/teleport/lib/utils"
 )
 
@@ -40,64 +43,8 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-func TestConnectionsLimiter(t *testing.T) {
-	limiter, err := NewLimiter(
-		Config{
-			MaxConnections: 0,
-		},
-	)
-	require.NoError(t, err)
-
-	for i := 0; i < 10; i++ {
-		require.NoError(t, limiter.AcquireConnection("token1"))
-	}
-	for i := 0; i < 5; i++ {
-		require.NoError(t, limiter.AcquireConnection("token2"))
-	}
-
-	for i := 0; i < 10; i++ {
-		limiter.ReleaseConnection("token1")
-	}
-	for i := 0; i < 5; i++ {
-		limiter.ReleaseConnection("token2")
-	}
-
-	limiter, err = NewLimiter(
-		Config{
-			MaxConnections: 5,
-		},
-	)
-	require.NoError(t, err)
-
-	for i := 0; i < 5; i++ {
-		require.NoError(t, limiter.AcquireConnection("token1"))
-	}
-
-	for i := 0; i < 5; i++ {
-		require.NoError(t, limiter.AcquireConnection("token2"))
-	}
-	for i := 0; i < 5; i++ {
-		require.Error(t, limiter.AcquireConnection("token2"))
-	}
-
-	for i := 0; i < 10; i++ {
-		limiter.ReleaseConnection("token1")
-		require.NoError(t, limiter.AcquireConnection("token1"))
-	}
-
-	for i := 0; i < 5; i++ {
-		limiter.ReleaseConnection("token2")
-	}
-	for i := 0; i < 5; i++ {
-		require.NoError(t, limiter.AcquireConnection("token2"))
-	}
-}
-
 func TestRateLimiter(t *testing.T) {
-	// TODO: this test fails
-	clock := &timetools.FreezedTime{
-		CurrentTime: time.Date(2016, 6, 5, 4, 3, 2, 1, time.UTC),
-	}
+	clock := clockwork.NewFakeClock()
 
 	limiter, err := NewLimiter(
 		Config{
@@ -126,19 +73,19 @@ func TestRateLimiter(t *testing.T) {
 
 	require.Error(t, limiter.RegisterRequest("token1"))
 
-	clock.Sleep(10 * time.Millisecond)
+	clock.Advance(10 * time.Millisecond)
 	for i := 0; i < 10; i++ {
 		require.NoError(t, limiter.RegisterRequest("token1"))
 	}
 	require.Error(t, limiter.RegisterRequest("token1"))
 
-	clock.Sleep(10 * time.Millisecond)
+	clock.Advance(10 * time.Millisecond)
 	for i := 0; i < 10; i++ {
 		require.NoError(t, limiter.RegisterRequest("token1"))
 	}
 	require.Error(t, limiter.RegisterRequest("token1"))
 
-	clock.Sleep(10 * time.Millisecond)
+	clock.Advance(10 * time.Millisecond)
 	// the second rate is full
 	err = nil
 	for i := 0; i < 10; i++ {
@@ -149,7 +96,7 @@ func TestRateLimiter(t *testing.T) {
 	}
 	require.Error(t, err)
 
-	clock.Sleep(10 * time.Millisecond)
+	clock.Advance(10 * time.Millisecond)
 	// Now the second rate has free space
 	require.NoError(t, limiter.RegisterRequest("token1"))
 	err = nil
@@ -163,9 +110,7 @@ func TestRateLimiter(t *testing.T) {
 }
 
 func TestCustomRate(t *testing.T) {
-	clock := &timetools.FreezedTime{
-		CurrentTime: time.Date(2016, 6, 5, 4, 3, 2, 1, time.UTC),
-	}
+	clock := clockwork.NewFakeClock()
 
 	limiter, err := NewLimiter(
 		Config{
@@ -401,10 +346,10 @@ func TestListener(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			limiter, err := NewConnectionsLimiter(test.config)
-			require.NoError(t, err)
+			limiter := NewConnectionsLimiter(test.config.MaxConnections)
 
-			ln := NewListener(test.listener, limiter)
+			ln, err := NewListener(test.listener, limiter)
+			require.NoError(t, err)
 
 			// open connections without closing to enforce limits
 			conns := make([]net.Conn, 0, connLimit)

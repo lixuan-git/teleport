@@ -1,18 +1,20 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package app
 
@@ -20,6 +22,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -27,29 +30,44 @@ import (
 	"sync"
 
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
+	"github.com/jonboulle/clockwork"
 
 	"github.com/gravitational/teleport/api/constants"
 	"github.com/gravitational/teleport/api/types"
 	apiutils "github.com/gravitational/teleport/api/utils"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/api/utils/keys"
+	"github.com/gravitational/teleport/lib/auth/authclient"
+	"github.com/gravitational/teleport/lib/authz"
 	"github.com/gravitational/teleport/lib/defaults"
+	"github.com/gravitational/teleport/lib/jwt"
 	"github.com/gravitational/teleport/lib/reversetunnelclient"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/tlsca"
 	"github.com/gravitational/teleport/lib/utils"
 )
 
+// ServerHandler implements an interface which can handle a connection
+// (perform a handshake then process).
+type ServerHandler interface {
+	// HandleConnection performs a handshake then process the connection.
+	HandleConnection(conn net.Conn)
+}
+
 // transportConfig is configuration for a rewriting transport.
 type transportConfig struct {
 	proxyClient  reversetunnelclient.Tunnel
-	accessPoint  auth.ReadProxyAccessPoint
+	accessPoint  authclient.ReadProxyAccessPoint
 	cipherSuites []uint16
 	identity     *tlsca.Identity
 	servers      []types.AppServer
 	ws           types.WebSession
 	clusterName  string
-	log          logrus.FieldLogger
+	log          *slog.Logger
+	clock        clockwork.Clock
+
+	// integrationAppHandler is used to handle App proxy requests for Apps that are configured to use an Integration.
+	// Instead of proxying the connection to an AppService, the app is immediately proxied from the Proxy.
+	integrationAppHandler ServerHandler
 }
 
 // Check validates configuration.
@@ -74,6 +92,15 @@ func (c *transportConfig) Check() error {
 	}
 	if c.clusterName == "" {
 		return trace.BadParameter("cluster name missing")
+	}
+	if c.integrationAppHandler == nil {
+		return trace.BadParameter("integration app handler missing")
+	}
+	if c.log == nil {
+		c.log = slog.Default()
+	}
+	if c.clock == nil {
+		c.clock = clockwork.NewRealClock()
 	}
 
 	return nil
@@ -134,6 +161,7 @@ func (t *transport) RoundTrip(r *http.Request) (*http.Response, error) {
 	// cookies are lost and the error handler will not be able to find the
 	// session based on cookies.
 	r = r.Clone(r.Context())
+
 	// Perform any request rewriting needed before forwarding the request.
 	if err := t.rewriteRequest(r); err != nil {
 		return nil, trace.Wrap(err)
@@ -223,13 +251,101 @@ func (t *transport) rewriteRequest(r *http.Request) error {
 		}
 	}
 
+	// If this looks like a Azure CLI request and at least once app server is
+	// an Azure app, parse the JWT cookie using the client's public key and
+	// resign it with the web session private key.
+	if HasClientCert(r) && t.c.identity.RouteToApp.AzureIdentity != "" {
+		for _, server := range t.c.servers {
+			if !server.GetApp().IsAzureCloud() {
+				continue
+			}
+
+			if err := t.resignAzureJWTCookie(r); err != nil {
+				// If we failed to resign the JWT, treat it as a noop. The App
+				// Service should fail to parse the JWT and reject the request,
+				// but rejecting here could cause forward compatibility issues,
+				// if for example we add new types of JWT tokens.
+				t.c.log.DebugContext(r.Context(), "failed to re-sign azure JWT", "error", err)
+			}
+
+			break
+		}
+	}
+
 	return nil
+}
+
+// resignAzureJWTCookie checks the auth header bearer token for a JWT
+// token containing Azure claims signed by the client's private key. If
+// found, the token is resigned using the app session's private key so
+// that the App Service can validate it using the app session's public key.
+func (t *transport) resignAzureJWTCookie(r *http.Request) error {
+	token, err := parseBearerToken(r)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	// Create a new jwt key using the client public key to verify and parse the token.
+	clientJWTKey, err := jwt.New(&jwt.Config{
+		Clock:       t.c.clock,
+		PublicKey:   r.TLS.PeerCertificates[0].PublicKey,
+		ClusterName: types.TeleportAzureMSIEndpoint,
+	})
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	// Create a new jwt key using the web session private key to sign a new token.
+	wsPrivateKey, err := keys.ParsePrivateKey(t.c.ws.GetTLSPriv())
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	wsJWTKey, err := jwt.New(&jwt.Config{
+		Clock:       t.c.clock,
+		PrivateKey:  wsPrivateKey,
+		ClusterName: types.TeleportAzureMSIEndpoint,
+	})
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	claims, err := clientJWTKey.VerifyAzureToken(token)
+	if err != nil {
+		// jwt signed by unknown key.
+		return trace.Wrap(err, "azure jwt signed by unknown key")
+	}
+
+	newToken, err := wsJWTKey.SignAzureToken(*claims)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	r.Header.Set("Authorization", "Bearer "+newToken)
+	return nil
+}
+
+func parseBearerToken(r *http.Request) (string, error) {
+	bearerToken := r.Header.Get("Authorization")
+	if bearerToken == "" {
+		return "", trace.NotFound("auth header not set")
+	}
+
+	bearer, token, found := strings.Cut(bearerToken, " ")
+	if !found || bearer != "Bearer" {
+		return "", trace.BadParameter("unable to parse auth header")
+	}
+
+	return token, nil
 }
 
 // DialContext dials and connect to the application service over the reverse
 // tunnel subsystem.
 func (t *transport) DialContext(ctx context.Context, _, _ string) (conn net.Conn, err error) {
 	t.mu.Lock()
+	if len(t.c.servers) == 0 {
+		defer t.mu.Unlock()
+		return nil, trace.ConnectionProblem(nil, "no application servers remaining to connect")
+	}
 	servers := make([]types.AppServer, len(t.c.servers))
 	copy(servers, t.c.servers)
 	t.mu.Unlock()
@@ -237,9 +353,17 @@ func (t *transport) DialContext(ctx context.Context, _, _ string) (conn net.Conn
 	var i int
 	for ; i < len(servers); i++ {
 		appServer := servers[i]
+
+		appIntegration := appServer.GetApp().GetIntegration()
+		if appIntegration != "" {
+			src, dst := net.Pipe()
+			go t.c.integrationAppHandler.HandleConnection(src)
+			return dst, nil
+		}
+
 		conn, err = dialAppServer(ctx, t.c.proxyClient, t.c.identity.RouteToApp.ClusterName, appServer)
 		if err != nil && isReverseTunnelDownError(err) {
-			t.c.log.Warnf("Failed to connect to application server %q: %v.", appServer, err)
+			t.c.log.WarnContext(ctx, "Failed to connect to application server", "app_server", appServer.GetName(), "error", err)
 			// Continue to the next server if there is an issue
 			// establishing a connection because the tunnel is not
 			// healthy. Reset the error to avoid returning it if
@@ -251,9 +375,19 @@ func (t *transport) DialContext(ctx context.Context, _, _ string) (conn net.Conn
 		break
 	}
 
-	// eliminate any servers from the head of the list that were unreachable
 	t.mu.Lock()
-	t.c.servers = t.c.servers[i:]
+	// Only attempt to tidy up the list of servers if they weren't altered
+	// while the dialing happened. Since the lock is only held initially when
+	// making the servers copy and released during the dials, another dial attempt
+	// may have already happened and modified the list of servers.
+	if len(servers) == len(t.c.servers) {
+		// eliminate any servers from the head of the list that were unreachable
+		if i < len(t.c.servers) {
+			t.c.servers = t.c.servers[i:]
+		} else {
+			t.c.servers = nil
+		}
+	}
 	t.mu.Unlock()
 
 	if conn != nil || err != nil {
@@ -284,7 +418,7 @@ func dialAppServer(ctx context.Context, proxyClient reversetunnelclient.Tunnel, 
 
 	var from net.Addr
 	from = &utils.NetAddr{AddrNetwork: "tcp", Addr: "@web-proxy"}
-	clientSrcAddr, originalDst := utils.ClientAddrFromContext(ctx)
+	clientSrcAddr, originalDst := authz.ClientAddrsFromContext(ctx)
 	if clientSrcAddr != nil {
 		from = clientSrcAddr
 	}
@@ -323,7 +457,7 @@ func configureTLS(c *transportConfig) (*tls.Config, error) {
 
 	// Configure the identity that will be used to connect to the server. This
 	// allows the server to verify the identity of the caller.
-	certificate, err := tls.X509KeyPair(c.ws.GetTLSCert(), c.ws.GetPriv())
+	certificate, err := tls.X509KeyPair(c.ws.GetTLSCert(), c.ws.GetTLSPriv())
 	if err != nil {
 		return nil, trace.Wrap(err, "failed to parse certificate or key")
 	}

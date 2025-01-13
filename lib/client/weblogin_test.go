@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package client_test
 
@@ -28,12 +30,15 @@ import (
 
 	"github.com/jonboulle/clockwork"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/crypto/ssh"
 
 	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/api/utils/keys"
 	wancli "github.com/gravitational/teleport/lib/auth/webauthncli"
 	wantypes "github.com/gravitational/teleport/lib/auth/webauthntypes"
 	"github.com/gravitational/teleport/lib/client"
+	"github.com/gravitational/teleport/lib/cryptosuites"
 )
 
 // TestHostCredentialsHttpFallback tests that HostCredentials requests (/v1/webapi/host/credentials/)
@@ -69,7 +74,7 @@ func TestHostCredentialsHttpFallback(t *testing.T) {
 		// Start an http server (not https) so that the request only succeeds
 		// if the fallback occurs.
 		var handler http.HandlerFunc = func(w http.ResponseWriter, r *http.Request) {
-			if r.RequestURI != "/v1/webapi/host/credentials" {
+			if r.RequestURI != "/webapi/host/credentials" {
 				w.WriteHeader(http.StatusNotFound)
 				return
 			}
@@ -116,7 +121,6 @@ func newServer(handler http.HandlerFunc, loopback bool) (*httptest.Server, error
 
 func TestSSHAgentPasswordlessLogin(t *testing.T) {
 	t.Parallel()
-	silenceLogger(t)
 
 	clock := clockwork.NewFakeClockAt(time.Now())
 	sa := newStandaloneTeleport(t, clock)
@@ -151,7 +155,12 @@ func TestSSHAgentPasswordlessLogin(t *testing.T) {
 
 	tc, err := client.NewClient(cfg)
 	require.NoError(t, err)
-	key, err := client.GenerateRSAKey()
+
+	userKey, err := cryptosuites.GenerateKeyWithAlgorithm(cryptosuites.ECDSAP256)
+	require.NoError(t, err)
+	sshPub, err := ssh.NewPublicKey(userKey.Public())
+	require.NoError(t, err)
+	tlsPub, err := keys.MarshalPublicKey(userKey.Public())
 	require.NoError(t, err)
 
 	// customPromptCalled is a flag to ensure the custom prompt was indeed called
@@ -211,7 +220,8 @@ func TestSSHAgentPasswordlessLogin(t *testing.T) {
 		req := client.SSHLoginPasswordless{
 			SSHLogin: client.SSHLogin{
 				ProxyAddr:         tc.WebProxyAddr,
-				PubKey:            key.MarshalSSHPublicKey(),
+				SSHPubKey:         ssh.MarshalAuthorizedKey(sshPub),
+				TLSPubKey:         tlsPub,
 				TTL:               tc.KeyTTL,
 				Insecure:          tc.InsecureSkipVerify,
 				Compatibility:     tc.CertificateFormat,

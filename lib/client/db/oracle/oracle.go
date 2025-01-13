@@ -1,24 +1,26 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package oracle
 
 import (
 	"bytes"
-	"crypto/x509"
+	"crypto"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -30,6 +32,7 @@ import (
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/constants"
+	"github.com/gravitational/teleport/api/utils/keys"
 	"github.com/gravitational/teleport/lib/client"
 	"github.com/gravitational/teleport/lib/tlsca"
 	"github.com/gravitational/teleport/lib/utils"
@@ -39,8 +42,8 @@ import (
 // wallet.jks   - Java Wallet format used by JDBC Drivers.
 // sqlnet.ora   - Generic Oracle Client Configuration File allowing to specify Wallet Location.
 // tnsnames.ora - Oracle Net Service mapped to connections descriptors.
-func GenerateClientConfiguration(key *client.Key, db tlsca.RouteToDatabase, profile *client.ProfileStatus) error {
-	walletPath := profile.OracleWalletDir(key.ClusterName, db.ServiceName)
+func GenerateClientConfiguration(signer crypto.Signer, db tlsca.RouteToDatabase, profile *client.ProfileStatus, siteName string) error {
+	walletPath := profile.OracleWalletDir(siteName, db.ServiceName)
 	if err := os.MkdirAll(walletPath, teleport.PrivateDirMode); err != nil {
 		return trace.Wrap(err)
 	}
@@ -54,7 +57,7 @@ func GenerateClientConfiguration(key *client.Key, db tlsca.RouteToDatabase, prof
 		return trace.ConvertSystemError(err)
 	}
 
-	jksWalletPath, err := createClientWallet(key, localProxyCAPem, password, walletPath)
+	jksWalletPath, err := createClientWallet(signer, localProxyCAPem, password, walletPath)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -70,8 +73,8 @@ func GenerateClientConfiguration(key *client.Key, db tlsca.RouteToDatabase, prof
 	return nil
 }
 
-func createClientWallet(key *client.Key, certPem []byte, password string, walletPath string) (string, error) {
-	buff, err := createJKSWallet(key.PrivateKeyPEM(), certPem, certPem, password)
+func createClientWallet(signer crypto.Signer, certPem []byte, password string, walletPath string) (string, error) {
+	buff, err := createJKSWallet(signer, certPem, certPem, password)
 	if err != nil {
 		return "", trace.Wrap(err)
 	}
@@ -82,12 +85,8 @@ func createClientWallet(key *client.Key, certPem []byte, password string, wallet
 	return walletFile, nil
 }
 
-func createJKSWallet(keyPEM, certPEM, caPEM []byte, password string) ([]byte, error) {
-	key, err := utils.ParsePrivateKey(keyPEM)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	privateKey, err := x509.MarshalPKCS8PrivateKey(key)
+func createJKSWallet(signer crypto.Signer, certPEM, caPEM []byte, password string) ([]byte, error) {
+	privateKey, err := keys.MarshalSoftwarePrivateKeyPKCS8DER(signer)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}

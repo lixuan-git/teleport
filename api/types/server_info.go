@@ -18,6 +18,7 @@ package types
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/gravitational/trace"
@@ -92,16 +93,6 @@ func (s *ServerInfoV1) GetMetadata() Metadata {
 	return s.Metadata
 }
 
-// GetResourceID returns resource ID
-func (s *ServerInfoV1) GetResourceID() int64 {
-	return s.Metadata.ID
-}
-
-// SetResourceID sets resource ID
-func (s *ServerInfoV1) SetResourceID(id int64) {
-	s.Metadata.ID = id
-}
-
 // GetRevision returns the revision
 func (s *ServerInfoV1) GetRevision() string {
 	return s.Metadata.GetRevision()
@@ -161,22 +152,82 @@ func (s *ServerInfoV1) GetNewLabels() map[string]string {
 // SetNewLabels sets the labels to apply to matched Nodes.
 func (s *ServerInfoV1) SetNewLabels(labels map[string]string) {
 	s.Spec.NewLabels = labels
+	s.fixLabels()
+}
+
+// fixLabels sets the namespace of this ServerInfo's labels to match the
+// matching scheme indicated by the name.
+func (s *ServerInfoV1) fixLabels() {
+	// Determine which prefix the labels need, if any.
+	namePrefix, _, found := strings.Cut(s.GetName(), "-")
+	if !found {
+		return
+	}
+	var labelPrefix string
+	switch namePrefix {
+	case "aws":
+		labelPrefix = "aws/"
+	case "si":
+		labelPrefix = TeleportDynamicLabelPrefix
+	default:
+		return
+	}
+
+	// Replace the prefix on existing labels.
+	for k, v := range s.Spec.NewLabels {
+		prefix, name, _ := strings.Cut(k, "/")
+		if name == "" {
+			name = prefix
+		}
+		delete(s.Spec.NewLabels, k)
+		s.Spec.NewLabels[labelPrefix+name] = v
+	}
 }
 
 func (s *ServerInfoV1) setStaticFields() {
 	s.Kind = KindServerInfo
 	s.Version = V1
+	s.SubKind = SubKindCloudInfo
 }
 
 // CheckAndSetDefaults validates the Resource and sets any empty fields to
 // default values.
 func (s *ServerInfoV1) CheckAndSetDefaults() error {
 	s.setStaticFields()
+	s.fixLabels()
 	return trace.Wrap(s.Metadata.CheckAndSetDefaults())
 }
 
-// GetServerInfoName gets the name of the ServerInfo generated for a discovered
-// EC2 instance with this account ID and instance ID.
-func (a *AWSInfo) GetServerInfoName() string {
-	return fmt.Sprintf("aws-%v-%v", a.AccountID, a.InstanceID)
+// ServerInfoNameFromAWS gets the name of the ServerInfo that matches the node
+// with the given AWS account ID and instance ID.
+func ServerInfoNameFromAWS(accountID, instanceID string) string {
+	return fmt.Sprintf("aws-%v-%v", accountID, instanceID)
+}
+
+// ServerInfoNameFromNodeName gets the name of the ServerInfo that matches the
+// node with the given name.
+func ServerInfoNameFromNodeName(name string) string {
+	return fmt.Sprintf("si-%v", name)
+}
+
+// ServerInfoForServer returns a ServerInfo from a Server
+func ServerInfoForServer(server Server) (ServerInfo, error) {
+	return NewServerInfo(
+		Metadata{
+			Name: serverInfoNameFromServer(server),
+		},
+		ServerInfoSpecV1{},
+	)
+}
+
+// serverInfoNameFromServer returns the ServerInfo name for this Server.
+func serverInfoNameFromServer(s Server) string {
+	awsAccountID := s.GetAWSAccountID()
+	awsInstanceID := s.GetAWSInstanceID()
+
+	if awsAccountID != "" && awsInstanceID != "" {
+		return ServerInfoNameFromAWS(awsAccountID, awsInstanceID)
+	}
+
+	return ServerInfoNameFromNodeName(s.GetName())
 }

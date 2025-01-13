@@ -19,29 +19,18 @@ package client
 import (
 	"context"
 
-	"github.com/gravitational/trace"
-
 	"github.com/gravitational/teleport/api/client/proto"
+	"github.com/gravitational/teleport/api/mfa"
 )
 
-// performMFACeremony retrieves an MFA challenge from the server, prompts the
-// user to answer the challenge, and returns the resulting MFA response.
-func (c *Client) performMFACeremony(ctx context.Context) (*proto.MFAAuthenticateResponse, error) {
-	if c.c.PromptAdminRequestMFA == nil {
-		return nil, trace.BadParameter("missing PromptAdminRequestMFA field, client cannot perform MFA ceremony")
+// PerformMFACeremony retrieves an MFA challenge from the server with the given challenge extensions
+// and prompts the user to answer the challenge with the given promptOpts, and ultimately returning
+// an MFA challenge response for the user.
+func (c *Client) PerformMFACeremony(ctx context.Context, challengeRequest *proto.CreateAuthenticateChallengeRequest, promptOpts ...mfa.PromptOpt) (*proto.MFAAuthenticateResponse, error) {
+	mfaCeremony := &mfa.Ceremony{
+		CreateAuthenticateChallenge: c.CreateAuthenticateChallenge,
+		PromptConstructor:           c.c.MFAPromptConstructor,
+		SSOMFACeremonyConstructor:   c.c.SSOMFACeremonyConstructor,
 	}
-
-	chal, err := c.CreateAuthenticateChallenge(ctx, &proto.CreateAuthenticateChallengeRequest{
-		Request: &proto.CreateAuthenticateChallengeRequest_ContextUser{},
-	})
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	resp, err := c.c.PromptAdminRequestMFA(ctx, chal)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	return resp, nil
+	return mfaCeremony.Run(ctx, challengeRequest, promptOpts...)
 }

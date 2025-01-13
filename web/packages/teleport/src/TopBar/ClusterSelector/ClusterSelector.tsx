@@ -1,30 +1,36 @@
-/*
-Copyright 2019 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React from 'react';
-import { components } from 'react-select';
+import { useState } from 'react';
+import { components, ValueContainerProps } from 'react-select';
 import styled from 'styled-components';
+
 import { Box, Flex, Text } from 'design';
 import { SelectAsync } from 'shared/components/Select';
 
-const ValueContainer = ({ children, ...props }) => (
+const ValueContainer = ({
+  children,
+  ...props
+}: ValueContainerProps<Option>) => (
   <components.ValueContainer {...props}>
     <Flex alignItems="center" color="text.main">
-      <Text typography="h6" fontWeight="regular" mr="2">
-        CLUSTER:
+      <Text typography="body2" mr="2">
+        Cluster:
       </Text>
       {children}
     </Flex>
@@ -38,8 +44,8 @@ export default function ClusterSelector({
   defaultMenuIsOpen = false,
   ...styles
 }) {
-  const [errorMessage, setError] = React.useState(null);
-  const [options, setOptions] = React.useState<Option[]>([]);
+  const [errorMessage, setError] = useState(null);
+  const [options, setOptions] = useState<Option[]>([]);
 
   const selectedOption = {
     value,
@@ -70,6 +76,7 @@ export default function ClusterSelector({
       .then(options => filterOptions(inputValue, options))
       .catch((err: Error) => {
         setError(err.message);
+        return [];
       });
   }
 
@@ -82,7 +89,11 @@ export default function ClusterSelector({
   }
 
   return (
-    <StyledBox {...styles} className="teleport-cluster-selector">
+    <StyledBox
+      {...styles}
+      className="teleport-cluster-selector"
+      data-testid="cluster-selector"
+    >
       <StyledSelectAsync
         components={{ ValueContainer }}
         noOptionsMessage={getNoOptionsMessage}
@@ -94,7 +105,6 @@ export default function ClusterSelector({
         maxMenuHeight={600}
         menuPosition="fixed"
         isSearchable
-        isSimpleValue={false}
         isClearable={false}
         defaultOptions
         cacheOptions

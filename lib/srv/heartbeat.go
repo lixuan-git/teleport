@@ -1,33 +1,35 @@
 /*
-Copyright 2018 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package srv
 
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	log "github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/services"
 )
 
@@ -36,7 +38,6 @@ import (
 type HeartbeatI interface {
 	Run() error
 	Close() error
-	ForceSend(timeout time.Duration) error
 }
 
 // KeepAliveState represents state of the heartbeat
@@ -154,14 +155,17 @@ func NewHeartbeat(cfg HeartbeatConfig) (*Heartbeat, error) {
 		cancelCtx:       ctx,
 		cancel:          cancel,
 		HeartbeatConfig: cfg,
-		Entry: log.WithFields(log.Fields{
-			trace.Component: teleport.Component(cfg.Component, "beat"),
-		}),
-		checkTicker: cfg.Clock.NewTicker(cfg.CheckPeriod),
-		announceC:   make(chan struct{}, 1),
-		sendC:       make(chan struct{}, 1),
+		logger:          slog.With(teleport.ComponentKey, teleport.Component(cfg.Component, "beat")),
+		checkTicker:     cfg.Clock.NewTicker(cfg.CheckPeriod),
+		announceC:       make(chan struct{}, 1),
+		sendC:           make(chan struct{}, 1),
 	}
-	h.Debugf("Starting %v heartbeat with announce period: %v, keep-alive period %v, poll period: %v", cfg.Mode, cfg.KeepAlivePeriod, cfg.AnnouncePeriod, cfg.CheckPeriod)
+	h.logger.DebugContext(ctx, "Starting heartbeat with announce period",
+		"mode", cfg.Mode,
+		"keep_alive_period", cfg.KeepAlivePeriod,
+		"announce_period", cfg.AnnouncePeriod,
+		"check_period", cfg.CheckPeriod,
+	)
 	return h, nil
 }
 
@@ -178,7 +182,7 @@ type HeartbeatConfig struct {
 	// Component is a name of component used in logs
 	Component string
 	// Announcer is used to announce presence
-	Announcer auth.Announcer
+	Announcer authclient.Announcer
 	// GetServerInfo returns server information
 	GetServerInfo GetServerInfoFn
 	// ServerTTL is a server TTL used in announcements
@@ -248,7 +252,7 @@ type Heartbeat struct {
 	HeartbeatConfig
 	cancelCtx context.Context
 	cancel    context.CancelFunc
-	*log.Entry
+	logger    *slog.Logger
 	state     KeepAliveState
 	current   types.Resource
 	keepAlive *types.KeepAlive
@@ -279,15 +283,15 @@ func (h *Heartbeat) Run() error {
 	for {
 		err := h.fetchAndAnnounce()
 		if err != nil {
-			h.Warningf("Heartbeat failed %v.", err)
+			h.logger.WarnContext(h.Context, "Heartbeat failed", "error", err)
 		}
 		h.OnHeartbeat(err)
 		select {
 		case <-h.checkTicker.Chan():
 		case <-h.sendC:
-			h.Debugf("Asked check out of cycle")
+			h.logger.DebugContext(h.Context, "Asked check out of cycle")
 		case <-h.cancelCtx.Done():
-			h.Debugf("Heartbeat exited.")
+			h.logger.DebugContext(h.Context, "Heartbeat exited")
 			return nil
 		}
 	}
@@ -323,7 +327,7 @@ func (h *Heartbeat) reset(state KeepAliveState) {
 	h.keepAlive = nil
 	if h.keepAliver != nil {
 		if err := h.keepAliver.Close(); err != nil {
-			h.Warningf("Failed to close keep aliver: %v", err)
+			h.logger.WarnContext(h.Context, "Failed to close keep aliver", "error", err)
 		}
 		h.keepAliver = nil
 	}
@@ -589,7 +593,7 @@ func (h *Heartbeat) announce() error {
 		case <-h.cancelCtx.Done():
 			return nil
 		case <-timeout.C:
-			h.Warningf("Blocked on keep alive send, going to reset.")
+			h.logger.WarnContext(h.Context, "Blocked on keep alive send, going to reset.")
 			h.reset(HeartbeatStateInit)
 			return trace.ConnectionProblem(nil, "timeout sending keep alive")
 		case h.keepAliver.KeepAlives() <- keepAlive:
@@ -598,7 +602,7 @@ func (h *Heartbeat) announce() error {
 			h.setState(HeartbeatStateKeepAliveWait)
 			return nil
 		case <-h.keepAliver.Done():
-			h.Warningf("Keep alive has failed: %v.", h.keepAliver.Error())
+			h.logger.WarnContext(h.Context, "Keep alive has failed", "error", h.keepAliver.Error())
 			err := h.keepAliver.Error()
 			h.reset(HeartbeatStateInit)
 			return trace.ConnectionProblem(err, "keep alive channel closed")
@@ -626,21 +630,4 @@ func (h *Heartbeat) fetchAndAnnounce() error {
 		return trace.Wrap(err)
 	}
 	return nil
-}
-
-// ForceSend forces send cycle, used in tests, returns
-// nil in case of success, error otherwise
-func (h *Heartbeat) ForceSend(timeout time.Duration) error {
-	timeoutC := time.After(timeout)
-	select {
-	case h.sendC <- struct{}{}:
-	case <-timeoutC:
-		return trace.ConnectionProblem(nil, "timeout waiting for send")
-	}
-	select {
-	case <-h.announceC:
-		return nil
-	case <-timeoutC:
-		return trace.ConnectionProblem(nil, "timeout waiting for announce to be sent")
-	}
 }

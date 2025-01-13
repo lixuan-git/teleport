@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package mongodb
 
@@ -73,7 +75,7 @@ func (e *Engine) connect(ctx context.Context, sessionCtx *common.Session) (drive
 	if err != nil {
 		return nil, nil, trace.Wrap(err)
 	}
-	e.Log.Debugf("Cluster topology: %v, selected server %v.", top, server)
+	e.Log.DebugContext(e.Context, "Connecting to cluster.", "topology", top, "server", server)
 	conn, err := server.Connection(ctx)
 	if err != nil {
 		return nil, nil, trace.Wrap(err)
@@ -81,10 +83,10 @@ func (e *Engine) connect(ctx context.Context, sessionCtx *common.Session) (drive
 
 	closeFn := func() {
 		if err := top.Disconnect(ctx); err != nil {
-			e.Log.WithError(err).Warn("Failed to close topology")
+			e.Log.WarnContext(e.Context, "Failed to close topology", "error", err)
 		}
 		if err := conn.Close(); err != nil {
-			e.Log.WithError(err).Error("Failed to close server connection.")
+			e.Log.ErrorContext(e.Context, "Failed to close server connection.", "error", err)
 		}
 	}
 	return conn, closeFn, nil
@@ -92,15 +94,7 @@ func (e *Engine) connect(ctx context.Context, sessionCtx *common.Session) (drive
 
 // getTopologyOptions constructs topology options for connecting to a MongoDB server.
 func (e *Engine) getTopologyOptions(ctx context.Context, sessionCtx *common.Session) (*topology.Config, description.ServerSelector, error) {
-	clientCfg := options.Client()
-	clientCfg.SetServerSelectionTimeout(common.DefaultMongoDBServerSelectionTimeout)
-	if strings.HasPrefix(sessionCtx.Database.GetURI(), connstring.SchemeMongoDB) ||
-		strings.HasPrefix(sessionCtx.Database.GetURI(), connstring.SchemeMongoDBSRV) {
-		clientCfg.ApplyURI(sessionCtx.Database.GetURI())
-	} else {
-		clientCfg.Hosts = []string{sessionCtx.Database.GetURI()}
-	}
-	err := clientCfg.Validate()
+	clientCfg, err := makeClientOptionsFromDatabaseURI(sessionCtx)
 	if err != nil {
 		return nil, nil, trace.Wrap(err)
 	}
@@ -138,7 +132,7 @@ func (e *Engine) getServerOptions(ctx context.Context, sessionCtx *common.Sessio
 
 // getConnectionOptions constructs connection options for connecting to a MongoDB server.
 func (e *Engine) getConnectionOptions(ctx context.Context, sessionCtx *common.Session, clientCfg *options.ClientOptions) ([]topology.ConnectionOption, error) {
-	tlsConfig, err := e.Auth.GetTLSConfig(ctx, sessionCtx)
+	tlsConfig, err := e.Auth.GetTLSConfig(ctx, sessionCtx.GetExpiry(), sessionCtx.Database, sessionCtx.DatabaseUser)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -169,7 +163,8 @@ func (e *Engine) getConnectionOptions(ctx context.Context, sessionCtx *common.Se
 }
 
 func (e *Engine) getAuthenticator(ctx context.Context, sessionCtx *common.Session) (auth.Authenticator, error) {
-	isAtlasDB := sessionCtx.Database.GetType() == types.DatabaseTypeMongoAtlas
+	dbType := sessionCtx.Database.GetType()
+	isAtlasDB := dbType == types.DatabaseTypeMongoAtlas
 
 	// Currently, the MongoDB Atlas IAM Authentication doesn't work with IAM
 	// users. Here we provide a better error message to the users.
@@ -180,11 +175,13 @@ func (e *Engine) getAuthenticator(ctx context.Context, sessionCtx *common.Sessio
 	switch {
 	case isAtlasDB && awsutils.IsRoleARN(sessionCtx.DatabaseUser):
 		return e.getAWSAuthenticator(ctx, sessionCtx)
+	case dbType == types.DatabaseTypeDocumentDB:
+		// DocumentDB uses the same the IAM authenticator as MongoDB Atlas.
+		return e.getAWSAuthenticator(ctx, sessionCtx)
 	default:
-		e.Log.Debug("Authenticating to database using certificates.")
+		e.Log.DebugContext(e.Context, "Authenticating to database using certificates.")
 		authenticator, err := auth.CreateAuthenticator(auth.MongoDBX509, &auth.Cred{
-			// MongoDB uses full certificate Subject field as a username.
-			Username: "CN=" + sessionCtx.DatabaseUser,
+			Username: x509Username(sessionCtx),
 		})
 		if err != nil {
 			return nil, trace.Wrap(err)
@@ -197,9 +194,9 @@ func (e *Engine) getAuthenticator(ctx context.Context, sessionCtx *common.Sessio
 // getAWSAuthenticator fetches the AWS credentials and initializes the MongoDB
 // authenticator.
 func (e *Engine) getAWSAuthenticator(ctx context.Context, sessionCtx *common.Session) (auth.Authenticator, error) {
-	e.Log.Debug("Authenticating to database using AWS IAM authentication.")
+	e.Log.DebugContext(e.Context, "Authenticating to database using AWS IAM authentication.")
 
-	username, password, sessToken, err := e.Auth.GetAWSIAMCreds(ctx, sessionCtx)
+	username, password, sessToken, err := e.Auth.GetAWSIAMCreds(ctx, sessionCtx.Database, sessionCtx.DatabaseUser)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -217,6 +214,21 @@ func (e *Engine) getAWSAuthenticator(ctx context.Context, sessionCtx *common.Ses
 	}
 
 	return authenticator, nil
+}
+
+func makeClientOptionsFromDatabaseURI(sessionCtx *common.Session) (*options.ClientOptions, error) {
+	clientCfg := options.Client()
+	clientCfg.SetServerSelectionTimeout(common.DefaultMongoDBServerSelectionTimeout)
+	if strings.HasPrefix(sessionCtx.Database.GetURI(), connstring.SchemeMongoDB) ||
+		strings.HasPrefix(sessionCtx.Database.GetURI(), connstring.SchemeMongoDBSRV) {
+		clientCfg.ApplyURI(sessionCtx.Database.GetURI())
+	} else {
+		clientCfg.Hosts = []string{sessionCtx.Database.GetURI()}
+	}
+	if err := clientCfg.Validate(); err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return clientCfg, nil
 }
 
 // getServerSelector returns selector for picking the server to connect to,
@@ -249,4 +261,9 @@ func (h *handshaker) GetHandshakeInformation(context.Context, address.Address, d
 // default auth handshaker.
 func (h *handshaker) FinishHandshake(context.Context, driver.Connection) error {
 	return nil
+}
+
+func x509Username(sessionCtx *common.Session) string {
+	// MongoDB uses full certificate Subject field as a username.
+	return "CN=" + sessionCtx.DatabaseUser
 }

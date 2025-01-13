@@ -1,23 +1,25 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 import { Platform } from 'teleterm/mainProcess/types';
 import {
-  KeyboardShortcutAction,
   ConfigService,
+  KeyboardShortcutAction,
 } from 'teleterm/services/config';
 
 import { getKeyName } from './getKeyName';
@@ -25,6 +27,16 @@ import {
   KeyboardShortcutEvent,
   KeyboardShortcutEventSubscriber,
 } from './types';
+
+/**
+ * These actions are handled outside the keyboard event subscribers,
+ * allow them to pass through (without calling preventDefault and stopPropagation).
+ */
+const EXTERNALLY_HANDLED_ACTIONS = new Set<KeyboardShortcutAction>([
+  'terminalCopy',
+  'terminalPaste',
+  'terminalSearch',
+]);
 
 export class KeyboardShortcutsService {
   private eventsSubscribers = new Set<KeyboardShortcutEventSubscriber>();
@@ -62,6 +74,9 @@ export class KeyboardShortcutsService {
       openConnections: this.configService.get('keymap.openConnections').value,
       openClusters: this.configService.get('keymap.openClusters').value,
       openProfiles: this.configService.get('keymap.openProfiles').value,
+      terminalCopy: this.configService.get('keymap.terminalCopy').value,
+      terminalPaste: this.configService.get('keymap.terminalPaste').value,
+      terminalSearch: this.configService.get('keymap.terminalSearch').value,
     };
     this.acceleratorsToActions = mapAcceleratorsToActions(this.shortcutsConfig);
     this.attachKeydownHandler();
@@ -102,6 +117,10 @@ export class KeyboardShortcutsService {
         return;
       }
 
+      if (EXTERNALLY_HANDLED_ACTIONS.has(shortcutAction)) {
+        return;
+      }
+
       event.preventDefault();
       event.stopPropagation();
       this.notifyEventsSubscribers({ action: shortcutAction });
@@ -112,7 +131,7 @@ export class KeyboardShortcutsService {
     });
   }
 
-  private getShortcutAction(
+  public getShortcutAction(
     event: KeyboardEvent
   ): KeyboardShortcutAction | undefined {
     // If only a modifier is pressed, `code` is this modifier name

@@ -1,18 +1,20 @@
-/*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 /* MIT License
 
@@ -38,7 +40,7 @@ SOFTWARE.
 
 */
 
-import React from 'react';
+import { forwardRef } from 'react';
 
 import { Icon, IconProps } from '../Icon';
 
@@ -48,13 +50,14 @@ THIS FILE IS GENERATED. DO NOT EDIT.
 
 */
 
-export function Devices({ size = 24, color, ...otherProps }: IconProps) {
-  return (
+export const Devices = forwardRef<HTMLSpanElement, IconProps>(
+  ({ size = 24, color, ...otherProps }, ref) => (
     <Icon
       size={size}
       color={color}
       className="icon icon-devices"
       {...otherProps}
+      ref={ref}
     >
       <path d="M18.2069 6.54545C17.7498 6.54545 17.3793 6.91177 17.3793 7.36364C17.3793 7.81551 17.7498 8.18182 18.2069 8.18182H19.8621C20.3191 8.18182 20.6897 7.81551 20.6897 7.36364C20.6897 6.91177 20.3191 6.54545 19.8621 6.54545H18.2069Z" />
       <path
@@ -64,5 +67,5 @@ export function Devices({ size = 24, color, ...otherProps }: IconProps) {
       />
       <path d="M7.44828 16.3636C6.99121 16.3636 6.62069 16.7299 6.62069 17.1818C6.62069 17.6337 6.99121 18 7.44828 18H11.5862C12.0433 18 12.4138 17.6337 12.4138 17.1818C12.4138 16.7299 12.0433 16.3636 11.5862 16.3636H7.44828Z" />
     </Icon>
-  );
-}
+  )
+);

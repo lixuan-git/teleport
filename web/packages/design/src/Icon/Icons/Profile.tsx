@@ -1,18 +1,20 @@
-/*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 /* MIT License
 
@@ -38,7 +40,7 @@ SOFTWARE.
 
 */
 
-import React from 'react';
+import { forwardRef } from 'react';
 
 import { Icon, IconProps } from '../Icon';
 
@@ -48,13 +50,14 @@ THIS FILE IS GENERATED. DO NOT EDIT.
 
 */
 
-export function Profile({ size = 24, color, ...otherProps }: IconProps) {
-  return (
+export const Profile = forwardRef<HTMLSpanElement, IconProps>(
+  ({ size = 24, color, ...otherProps }, ref) => (
     <Icon
       size={size}
       color={color}
       className="icon icon-profile"
       {...otherProps}
+      ref={ref}
     >
       <path d="M13.5 10.5C13.5 10.0858 13.8358 9.75 14.25 9.75H18C18.4142 9.75 18.75 10.0858 18.75 10.5C18.75 10.9142 18.4142 11.25 18 11.25H14.25C13.8358 11.25 13.5 10.9142 13.5 10.5Z" />
       <path d="M13.5 13.5C13.5 13.0858 13.8358 12.75 14.25 12.75H18C18.4142 12.75 18.75 13.0858 18.75 13.5C18.75 13.9142 18.4142 14.25 18 14.25H14.25C13.8358 14.25 13.5 13.9142 13.5 13.5Z" />
@@ -69,5 +72,5 @@ export function Profile({ size = 24, color, ...otherProps }: IconProps) {
         d="M3.75 3.75C2.92157 3.75 2.25 4.42157 2.25 5.25V18.75C2.25 19.5784 2.92157 20.25 3.75 20.25H20.25C21.0784 20.25 21.75 19.5784 21.75 18.75V5.25C21.75 4.42157 21.0784 3.75 20.25 3.75H3.75ZM3.75 5.25H20.25V18.75H3.75V5.25Z"
       />
     </Icon>
-  );
-}
+  )
+);

@@ -1,30 +1,39 @@
-// Copyright 2021 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package webauthn
 
 import (
+	"context"
 	"crypto/x509"
 	"encoding/pem"
+	"log/slog"
+	"slices"
 
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
-	"golang.org/x/exp/slices"
 
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/types"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
+
+var log = logutils.NewPackageLogger(teleport.ComponentKey, "WebAuthn")
 
 // x5cFormats enumerates all attestation formats that supply an attestation
 // chain through the "x5c" field.
@@ -134,13 +143,17 @@ func getChainFromX5C(obj protocol.AttestationObject) ([]*x509.Certificate, error
 
 	// Print out attestation certs if debug is enabled.
 	// This may come in handy for people having trouble with their setups.
-	if log.IsLevelEnabled(log.DebugLevel) {
+	ctx := context.Background()
+	if log.Handler().Enabled(ctx, slog.LevelDebug) {
 		for _, cert := range chain {
 			certPEM := pem.EncodeToMemory(&pem.Block{
 				Type:  "CERTIFICATE",
 				Bytes: cert.Raw,
 			})
-			log.Debugf("WebAuthn: got %q attestation certificate:\n\n%s", obj.Format, certPEM)
+			log.DebugContext(context.Background(), "got attestation certificate",
+				"format", obj.Format,
+				"certificate", string(certPEM),
+			)
 		}
 	}
 

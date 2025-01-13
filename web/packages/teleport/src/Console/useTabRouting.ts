@@ -1,23 +1,29 @@
-/*
-Copyright 2019-2022 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+import { useMemo } from 'react';
+import { useLocation, useParams, useRouteMatch } from 'react-router';
 
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React from 'react';
-import { useRouteMatch, useParams, useLocation } from 'react-router';
-
-import cfg, { UrlSshParams } from 'teleport/config';
+import cfg, {
+  UrlDbConnectParams,
+  UrlKubeExecParams,
+  UrlSshParams,
+} from 'teleport/config';
 import { ParticipantMode } from 'teleport/services/session';
 
 import ConsoleContext from './consoleContext';
@@ -26,13 +32,19 @@ export default function useRouting(ctx: ConsoleContext) {
   const { pathname, search } = useLocation();
   const { clusterId } = useParams<{ clusterId: string }>();
   const sshRouteMatch = useRouteMatch<UrlSshParams>(cfg.routes.consoleConnect);
+  const kubeExecRouteMatch = useRouteMatch<UrlKubeExecParams>(
+    cfg.routes.kubeExec
+  );
   const nodesRouteMatch = useRouteMatch(cfg.routes.consoleNodes);
   const joinSshRouteMatch = useRouteMatch<UrlSshParams>(
     cfg.routes.consoleSession
   );
+  const dbConnectMatch = useRouteMatch<UrlDbConnectParams>(
+    cfg.routes.dbConnect
+  );
 
   // Ensure that each URL has corresponding document
-  React.useMemo(() => {
+  useMemo(() => {
     if (ctx.getActiveDocId(pathname) !== -1) {
       return;
     }
@@ -51,6 +63,10 @@ export default function useRouting(ctx: ConsoleContext) {
       ctx.addSshDocument(joinSshRouteMatch.params);
     } else if (nodesRouteMatch) {
       ctx.addNodeDocument(clusterId);
+    } else if (kubeExecRouteMatch) {
+      ctx.addKubeExecDocument(kubeExecRouteMatch.params);
+    } else if (dbConnectMatch) {
+      ctx.addDbDocument(dbConnectMatch.params);
     }
   }, [ctx, pathname]);
 

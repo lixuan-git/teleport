@@ -17,12 +17,12 @@ limitations under the License.
 package types
 
 import (
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/coreos/go-semver/semver"
 	"github.com/gravitational/trace"
-	"golang.org/x/exp/slices"
 
 	"github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/utils"
@@ -157,6 +157,10 @@ type Instance interface {
 	// upgraders.
 	GetExternalUpgrader() string
 
+	// GetExternalUpgraderVersion gets the reported upgrader version. This value corresponds
+	// to the TELEPORT_EXT_UPGRADER_VERSION env var that is set when agents are configured.
+	GetExternalUpgraderVersion() string
+
 	// SyncLogAndResourceExpiry filters expired entries from the control log and updates
 	// the resource-level expiry. All calculations are performed relative to the value of
 	// the LastSeen field, and the supplied TTL is used only as a default. The actual TTL
@@ -174,6 +178,10 @@ type Instance interface {
 	// AppendControlLog appends entries to the control log. The control log is sorted by time,
 	// so appends do not need to be performed in any particular order.
 	AppendControlLog(entries ...InstanceControlLogEntry)
+
+	// GetLastMeasurement returns information about the system clocks of the auth service and
+	// another instance.
+	GetLastMeasurement() *SystemClockMeasurement
 
 	// Clone performs a deep copy on this instance.
 	Clone() Instance
@@ -274,6 +282,10 @@ func (i *InstanceV1) GetExternalUpgrader() string {
 	return i.Spec.ExternalUpgrader
 }
 
+func (i *InstanceV1) GetExternalUpgraderVersion() string {
+	return i.Spec.ExternalUpgraderVersion
+}
+
 func (i *InstanceV1) GetControlLog() []InstanceControlLogEntry {
 	return i.Spec.ControlLog
 }
@@ -287,8 +299,12 @@ func (i *InstanceV1) AppendControlLog(entries ...InstanceControlLogEntry) {
 		i.Spec.ControlLog[idx].Time = entry.Time.UTC()
 	}
 	slices.SortFunc(i.Spec.ControlLog, func(a, b InstanceControlLogEntry) int {
-		return int(a.Time.UnixNano() - b.Time.UnixNano())
+		return a.Time.Compare(b.Time)
 	})
+}
+
+func (i *InstanceV1) GetLastMeasurement() *SystemClockMeasurement {
+	return i.Spec.LastMeasurement
 }
 
 // expireControlLog removes expired entries from the control log relative to the supplied

@@ -1,18 +1,20 @@
-/*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 /* MIT License
 
@@ -38,7 +40,7 @@ SOFTWARE.
 
 */
 
-import React from 'react';
+import { forwardRef } from 'react';
 
 import { Icon, IconProps } from '../Icon';
 
@@ -48,17 +50,14 @@ THIS FILE IS GENERATED. DO NOT EDIT.
 
 */
 
-export function SlidersVertical({
-  size = 24,
-  color,
-  ...otherProps
-}: IconProps) {
-  return (
+export const SlidersVertical = forwardRef<HTMLSpanElement, IconProps>(
+  ({ size = 24, color, ...otherProps }, ref) => (
     <Icon
       size={size}
       color={color}
       className="icon icon-slidersvertical"
       {...otherProps}
+      ref={ref}
     >
       <path
         fillRule="evenodd"
@@ -76,5 +75,5 @@ export function SlidersVertical({
         d="M21.75 15.75C21.75 17.1479 20.7939 18.3225 19.5 18.6555V20.25C19.5 20.6642 19.1642 21 18.75 21C18.3358 21 18 20.6642 18 20.25V18.6555C16.7061 18.3225 15.75 17.1479 15.75 15.75C15.75 14.3521 16.7061 13.1775 18 12.8445V3.75C18 3.33579 18.3358 3 18.75 3C19.1642 3 19.5 3.33579 19.5 3.75V12.8445C20.7939 13.1775 21.75 14.3521 21.75 15.75ZM17.25 15.75C17.25 14.9216 17.9216 14.25 18.75 14.25C19.5784 14.25 20.25 14.9216 20.25 15.75C20.25 16.5784 19.5784 17.25 18.75 17.25C17.9216 17.25 17.25 16.5784 17.25 15.75Z"
       />
     </Icon>
-  );
-}
+  )
+);

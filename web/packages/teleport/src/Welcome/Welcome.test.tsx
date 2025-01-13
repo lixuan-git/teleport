@@ -1,34 +1,36 @@
-/*
-Copyright 2021-2022 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React from 'react';
-import { MemoryRouter, Route, Router } from 'react-router';
+import { act } from '@testing-library/react';
+import { userEvent, UserEvent } from '@testing-library/user-event';
 import { createMemoryHistory } from 'history';
+import { MemoryRouter, Route, Router } from 'react-router';
+
 import { fireEvent, render, screen, waitFor } from 'design/utils/testing';
 import { Logger } from 'shared/libs/logger';
 
 import cfg from 'teleport/config';
-import history from 'teleport/services/history';
 import auth from 'teleport/services/auth';
-
+import history from 'teleport/services/history';
 import { userEventService } from 'teleport/services/userEvent';
-
 import { NewCredentials } from 'teleport/Welcome/NewCredentials';
 
-import Welcome from './Welcome';
+import { Welcome } from './Welcome';
 
 const invitePath = '/web/invite/5182';
 const inviteContinuePath = '/web/invite/5182/continue';
@@ -36,7 +38,10 @@ const resetPath = '/web/reset/5182';
 const resetContinuePath = '/web/reset/5182/continue';
 
 describe('teleport/components/Welcome', () => {
+  let user: UserEvent;
+
   beforeEach(() => {
+    user = userEvent.setup();
     jest.spyOn(Logger.prototype, 'log').mockImplementation();
     jest.spyOn(auth, 'fetchPasswordToken').mockImplementation(async () => ({
       user: 'sam',
@@ -74,14 +79,14 @@ describe('teleport/components/Welcome', () => {
     expect(auth.fetchPasswordToken).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByText(/get started/i));
-    mockHistory.push(inviteContinuePath);
+    act(() => mockHistory.push(inviteContinuePath));
 
     expect(history.push).toHaveBeenCalledWith(inviteContinuePath);
     await waitFor(() => {
       expect(auth.fetchPasswordToken).toHaveBeenCalled();
     });
 
-    expect(screen.getByText(/confirm password/i)).toBeInTheDocument();
+    expect(await screen.findByText(/confirm password/i)).toBeInTheDocument();
   });
 
   it('should have correct welcome prompt flow for reset', async () => {
@@ -108,14 +113,14 @@ describe('teleport/components/Welcome', () => {
     expect(auth.fetchPasswordToken).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByText(/Continue/i));
-    mockHistory.push(resetContinuePath);
+    act(() => mockHistory.push(resetContinuePath));
 
     await waitFor(() => {
       expect(history.push).toHaveBeenCalledWith(resetContinuePath);
     });
     expect(auth.fetchPasswordToken).toHaveBeenCalled();
 
-    expect(screen.getByText(/submit/i)).toBeInTheDocument();
+    expect(await screen.findByText(/submit/i)).toBeInTheDocument();
   });
 
   it('reset password', async () => {
@@ -130,15 +135,15 @@ describe('teleport/components/Welcome', () => {
     const pwdConfirmField = screen.getByPlaceholderText('Confirm Password');
 
     // fill out input boxes and trigger submit
-    fireEvent.change(pwdField, { target: { value: 'pwd_value' } });
-    fireEvent.change(pwdConfirmField, { target: { value: 'pwd_value' } });
+    fireEvent.change(pwdField, { target: { value: 'pwd_value_123' } });
+    fireEvent.change(pwdConfirmField, { target: { value: 'pwd_value_123' } });
     fireEvent.click(screen.getByRole('button'));
 
     expect(auth.resetPassword).toHaveBeenCalledWith(
       expect.objectContaining({
         req: {
           tokenId: '5182',
-          password: 'pwd_value',
+          password: 'pwd_value_123',
           otpCode: '',
           deviceName: '',
         },
@@ -157,8 +162,8 @@ describe('teleport/components/Welcome', () => {
     // Fill out password.
     const pwdField = await screen.findByPlaceholderText('Password');
     const pwdConfirmField = screen.getByPlaceholderText('Confirm Password');
-    fireEvent.change(pwdField, { target: { value: 'pwd_value' } });
-    fireEvent.change(pwdConfirmField, { target: { value: 'pwd_value' } });
+    fireEvent.change(pwdField, { target: { value: 'pwd_value_123' } });
+    fireEvent.change(pwdConfirmField, { target: { value: 'pwd_value_123' } });
 
     // Go to the next view.
     fireEvent.click(screen.getByText(/next/i));
@@ -172,7 +177,7 @@ describe('teleport/components/Welcome', () => {
       expect.objectContaining({
         req: {
           tokenId: '5182',
-          password: 'pwd_value',
+          password: 'pwd_value_123',
           otpCode: '2222',
           deviceName: 'otp-device',
         },
@@ -183,6 +188,9 @@ describe('teleport/components/Welcome', () => {
   it('reset password with webauthn', async () => {
     jest.spyOn(cfg, 'getAuth2faType').mockImplementation(() => 'webauthn');
     jest
+      .spyOn(auth, 'createNewWebAuthnDevice')
+      .mockResolvedValueOnce({ id: 'dummy', type: 'public-key' });
+    jest
       .spyOn(auth, 'resetPasswordWithWebauthn')
       .mockImplementation(() => new Promise(() => null));
 
@@ -191,20 +199,28 @@ describe('teleport/components/Welcome', () => {
     // Fill out password.
     const pwdField = await screen.findByPlaceholderText('Password');
     const pwdConfirmField = screen.getByPlaceholderText('Confirm Password');
-    fireEvent.change(pwdField, { target: { value: 'pwd_value' } });
-    fireEvent.change(pwdConfirmField, { target: { value: 'pwd_value' } });
+    await user.type(pwdField, 'pwd_value_123');
+    await user.type(pwdConfirmField, 'pwd_value_123');
 
     // Go to the next view.
-    fireEvent.click(screen.getByText(/next/i));
+    await user.click(screen.getByText(/next/i));
+
+    // Create a WebAuthn credential.
+    await user.click(screen.getByText(/create an MFA method/i));
+
+    expect(auth.createNewWebAuthnDevice).toHaveBeenCalledWith({
+      tokenId: '5182',
+      deviceUsage: 'mfa',
+    });
 
     // Trigger submit.
-    fireEvent.click(screen.getByText(/submit/i));
+    await user.click(await screen.findByText(/submit/i));
 
     expect(auth.resetPasswordWithWebauthn).toHaveBeenCalledWith(
       expect.objectContaining({
         req: {
           tokenId: '5182',
-          password: 'pwd_value',
+          password: 'pwd_value_123',
           deviceName: 'webauthn-device',
         },
       })
@@ -216,13 +232,24 @@ describe('teleport/components/Welcome', () => {
       .spyOn(cfg, 'getPrimaryAuthType')
       .mockImplementation(() => 'passwordless');
     jest
+      .spyOn(auth, 'createNewWebAuthnDevice')
+      .mockResolvedValueOnce({ id: 'dummy', type: 'public-key' });
+    jest
       .spyOn(auth, 'resetPasswordWithWebauthn')
       .mockImplementation(() => new Promise(() => null));
 
     renderInvite();
 
+    // Create a WebAuthn credential.
+    await user.click(await screen.findByText(/create a passkey/i));
+
+    expect(auth.createNewWebAuthnDevice).toHaveBeenCalledWith({
+      tokenId: '5182',
+      deviceUsage: 'passwordless',
+    });
+
     // Trigger submit.
-    fireEvent.click(await screen.findByText(/submit/i));
+    await user.click(await screen.findByText(/submit/i));
 
     expect(auth.resetPasswordWithWebauthn).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -275,20 +302,24 @@ describe('teleport/components/Welcome', () => {
     // Fill out password to get to the next screen.
     const pwdField = await screen.findByPlaceholderText('Password');
     const pwdConfirmField = screen.getByPlaceholderText('Confirm Password');
-    fireEvent.change(pwdField, { target: { value: 'pwd_value' } });
-    fireEvent.change(pwdConfirmField, { target: { value: 'pwd_value' } });
+    fireEvent.change(pwdField, { target: { value: 'pwd_value_123' } });
+    fireEvent.change(pwdConfirmField, { target: { value: 'pwd_value_123' } });
     fireEvent.click(screen.getByText(/next/i));
 
     // Default radio selection should be webauthn.
-    expect(screen.getByDisplayValue('webauthn-device')).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        'You can use Touch ID, Face ID, Windows Hello, a hardware device, or an authenticator app as an MFA method.'
+      )
+    ).toBeInTheDocument();
 
     // Switch to otp.
-    fireEvent.click(screen.getByText(/authenticator/i));
+    fireEvent.click(screen.getByRole('radio', { name: /authenticator app/i }));
     expect(screen.getByDisplayValue('otp-device')).toBeInTheDocument();
     expect(screen.getByPlaceholderText('123 456')).toBeInTheDocument();
 
     // Switch to none.
-    fireEvent.click(screen.getByText(/none/i));
+    fireEvent.click(screen.getByRole('radio', { name: /none/i }));
     expect(
       screen.queryByDisplayValue('webauthn-device')
     ).not.toBeInTheDocument();

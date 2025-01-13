@@ -1,38 +1,34 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React from 'react';
+import { PropsWithChildren } from 'react';
+
 import renderHook from 'design/utils/renderHook';
 
-import { useTabShortcuts } from 'teleterm/ui/TabHost/useTabShortcuts';
-import {
-  Document,
-  DocumentCluster,
-  DocumentsService,
-} from 'teleterm/ui/services/workspacesService/documentsService';
+import AppContextProvider from 'teleterm/ui/appContextProvider';
+import { MockAppContext } from 'teleterm/ui/fixtures/mocks';
 import {
   KeyboardShortcutEvent,
   KeyboardShortcutEventSubscriber,
-  KeyboardShortcutsService,
 } from 'teleterm/ui/services/keyboardShortcuts';
-import AppContextProvider from 'teleterm/ui/appContextProvider';
-import { WorkspacesService } from 'teleterm/ui/services/workspacesService';
-import AppContext from 'teleterm/ui/appContext';
-
-import { getEmptyPendingAccessRequest } from '../services/workspacesService/accessRequestsService';
+import { Document } from 'teleterm/ui/services/workspacesService/documentsService';
+import { makeDocumentCluster } from 'teleterm/ui/services/workspacesService/documentsService/testHelpers';
+import { useTabShortcuts } from 'teleterm/ui/TabHost/useTabShortcuts';
 
 function getMockDocuments(): Document[] {
   return [
@@ -59,7 +55,9 @@ function getMockDocuments(): Document[] {
       targetUri: '/clusters/bar/dbs/foobar',
       targetName: 'foobar',
       targetUser: 'foo',
+      targetSubresourceName: undefined,
       origin: 'resource_table',
+      status: '',
     },
     {
       kind: 'doc.gateway',
@@ -69,101 +67,71 @@ function getMockDocuments(): Document[] {
       targetUri: '/clusters/bar/dbs/foobar',
       targetName: 'foobar',
       targetUser: 'bar',
+      targetSubresourceName: undefined,
       origin: 'resource_table',
+      status: '',
     },
-    {
-      kind: 'doc.cluster',
+    makeDocumentCluster({
       uri: '/docs/test_uri_6',
       title: 'Test 6',
-      clusterUri: '/clusters/foo',
-    },
-    {
-      kind: 'doc.cluster',
+    }),
+    makeDocumentCluster({
       uri: '/docs/test_uri_7',
       title: 'Test 7',
-      clusterUri: '/clusters/test_uri',
-    },
-    {
-      kind: 'doc.cluster',
+    }),
+    makeDocumentCluster({
       uri: '/docs/test_uri_8',
       title: 'Test 8',
-      clusterUri: '/clusters/test_uri_8',
-    },
-    {
-      kind: 'doc.cluster',
+    }),
+    makeDocumentCluster({
       uri: '/docs/test_uri_9',
       title: 'Test 9',
-      clusterUri: '/clusters/test_uri_9',
-    },
+    }),
   ];
 }
 
+const rootClusterUri = '/clusters/test_uri';
+
 function getTestSetup({ documents }: { documents: Document[] }) {
+  const appContext = new MockAppContext();
+
   let eventEmitter: KeyboardShortcutEventSubscriber;
-  const keyboardShortcutsService: Partial<KeyboardShortcutsService> = {
-    subscribeToEvents(subscriber: KeyboardShortcutEventSubscriber) {
+  jest
+    .spyOn(appContext.keyboardShortcutsService, 'subscribeToEvents')
+    .mockImplementation((subscriber: KeyboardShortcutEventSubscriber) => {
       eventEmitter = subscriber;
-    },
-    unsubscribeFromEvents() {
+    });
+  jest
+    .spyOn(appContext.keyboardShortcutsService, 'unsubscribeFromEvents')
+    .mockImplementation(() => {
       eventEmitter = null;
-    },
-  };
+    });
 
-  // @ts-expect-error - using mocks
-  const docsService: DocumentsService = {
-    getDocuments(): Document[] {
-      return documents;
-    },
-    getActive() {
-      return documents[0];
-    },
-    close: jest.fn(),
-    open: jest.fn(),
-    add: jest.fn(),
-    closeOthers: jest.fn(),
-    closeToRight: jest.fn(),
-    openNewTerminal: jest.fn(),
-    swapPosition: jest.fn(),
-    duplicatePtyAndActivate: jest.fn(),
-  };
+  appContext.workspacesService.setState(draft => {
+    draft.rootClusterUri = rootClusterUri;
+    draft.workspaces[rootClusterUri] = {
+      documents,
+      location: documents[0]?.uri,
+      localClusterUri: rootClusterUri,
+      accessRequests: undefined,
+    };
+  });
 
-  const workspacesService: Partial<WorkspacesService> = {
-    getActiveWorkspaceDocumentService() {
-      return docsService;
-    },
-    getActiveWorkspace() {
-      return {
-        accessRequests: {
-          assumed: {},
-          isBarCollapsed: false,
-          pending: getEmptyPendingAccessRequest(),
-        },
-        localClusterUri: '/clusters/test_uri',
-        documents: [],
-        location: '/docs/1',
-      };
-    },
-    useState: jest.fn(),
-    state: {
-      workspaces: {},
-      rootClusterUri: '/clusters/test_uri',
-    },
-  };
+  const docsService =
+    appContext.workspacesService.getActiveWorkspaceDocumentService();
 
-  const appContext: AppContext = {
-    // @ts-expect-error - using mocks
-    keyboardShortcutsService,
-    // @ts-expect-error - using mocks
-    workspacesService,
-  };
+  jest.spyOn(docsService, 'open');
+  jest.spyOn(docsService, 'close');
+  jest.spyOn(docsService, 'add');
+
   renderHook(
     () =>
       useTabShortcuts({
         documentsService: docsService,
-        localClusterUri: workspacesService.getActiveWorkspace().localClusterUri,
+        localClusterUri: rootClusterUri,
       }),
     {
-      wrapper: props => (
+      wrapper: (props: PropsWithChildren) => (
         <AppContextProvider value={appContext}>
           {props.children}
         </AppContextProvider>
@@ -174,7 +142,7 @@ function getTestSetup({ documents }: { documents: Document[] }) {
   return {
     emitKeyboardShortcutEvent: eventEmitter,
     docsService,
-    keyboardShortcutsService,
+    keyboardShortcutsService: appContext.keyboardShortcutsService,
   };
 }
 
@@ -226,12 +194,7 @@ test('open new tab', () => {
   const { emitKeyboardShortcutEvent, docsService } = getTestSetup({
     documents: [],
   });
-  const mockedClusterDocument: DocumentCluster = {
-    clusterUri: '/clusters/test',
-    uri: '/docs/test',
-    title: 'Test',
-    kind: 'doc.cluster',
-  };
+  const mockedClusterDocument = makeDocumentCluster();
   docsService.createClusterDocument = () => mockedClusterDocument;
   emitKeyboardShortcutEvent({ action: 'newTab' });
 

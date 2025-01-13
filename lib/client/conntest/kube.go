@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package conntest
 
@@ -32,14 +34,16 @@ import (
 
 	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/api/utils/keys"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/client"
+	"github.com/gravitational/teleport/lib/cryptosuites"
 )
 
 // KubeConnectionTesterConfig defines the config fields for KubeConnectionTester.
 type KubeConnectionTesterConfig struct {
 	// UserClient is an auth client that has a User's identity.
-	UserClient auth.ClientI
+	UserClient authclient.ClientI
 
 	// ProxyHostPort is the proxy to use in the `--proxy` format (host:webPort,sshPort)
 	ProxyHostPort string
@@ -153,13 +157,24 @@ func (s *KubeConnectionTester) TestConnection(ctx context.Context, req TestConne
 // genKubeRestTLSClientConfig creates the Teleport user credentials to access
 // the given Kubernetes cluster name.
 func (s KubeConnectionTester) genKubeRestTLSClientConfig(ctx context.Context, mfaResponse *proto.MFAAuthenticateResponse, connectionDiagnosticID, clusterName, userName string) (rest.TLSClientConfig, error) {
-	key, err := client.GenerateRSAKey()
+	key, err := cryptosuites.GenerateKey(ctx,
+		cryptosuites.GetCurrentSuiteFromAuthPreference(s.cfg.UserClient),
+		cryptosuites.UserTLS)
+	if err != nil {
+		return rest.TLSClientConfig{}, trace.Wrap(err)
+	}
+
+	privateKeyPEM, err := keys.MarshalPrivateKey(key)
+	if err != nil {
+		return rest.TLSClientConfig{}, trace.Wrap(err)
+	}
+	publicKeyPEM, err := keys.MarshalPublicKey(key.Public())
 	if err != nil {
 		return rest.TLSClientConfig{}, trace.Wrap(err)
 	}
 
 	certs, err := s.cfg.UserClient.GenerateUserCerts(ctx, proto.UserCertsRequest{
-		PublicKey:              key.MarshalSSHPublicKey(),
+		TLSPublicKey:           publicKeyPEM,
 		Username:               userName,
 		Expires:                time.Now().Add(time.Minute).UTC(),
 		ConnectionDiagnosticID: connectionDiagnosticID,
@@ -170,8 +185,6 @@ func (s KubeConnectionTester) genKubeRestTLSClientConfig(ctx context.Context, mf
 		return rest.TLSClientConfig{}, trace.Wrap(err)
 	}
 
-	key.TLSCert = certs.TLS
-
 	ca, err := s.cfg.UserClient.GetClusterCACert(ctx)
 	if err != nil {
 		return rest.TLSClientConfig{}, trace.Wrap(err)
@@ -179,8 +192,8 @@ func (s KubeConnectionTester) genKubeRestTLSClientConfig(ctx context.Context, mf
 
 	return rest.TLSClientConfig{
 		CAData:   ca.TLSCA,
-		CertData: key.TLSCert,
-		KeyData:  key.PrivateKeyPEM(),
+		CertData: certs.TLS,
+		KeyData:  privateKeyPEM,
 	}, nil
 }
 

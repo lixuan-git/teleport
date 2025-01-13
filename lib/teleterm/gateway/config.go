@@ -1,31 +1,34 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package gateway
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
+	"log/slog"
 	"net"
 	"runtime"
 
 	"github.com/google/uuid"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	"github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport/api/constants"
 	"github.com/gravitational/teleport/lib/defaults"
@@ -56,13 +59,8 @@ type Config struct {
 	LocalAddress string
 	// Protocol is the gateway protocol
 	Protocol string
-	// CertPath specifies the path to the user certificate that the local proxy
-	// uses to connect to the Teleport Proxy. The path may depend on the type
-	// and the parameters of the gateway.
-	CertPath string
-	// KeyPath specifies the path to the private key of the cert specified in
-	// the CertPath. This is usually the private key of the user profile.
-	KeyPath string
+	// Cert is used by the local proxy to connect to the Teleport proxy.
+	Cert tls.Certificate
 	// Insecure
 	Insecure bool
 	// ClusterName is the Teleport cluster name.
@@ -71,8 +69,8 @@ type Config struct {
 	Username string
 	// WebProxyAddr
 	WebProxyAddr string
-	// Log is a component logger
-	Log *logrus.Entry
+	// Logger is a component logger
+	Logger *slog.Logger
 	// TCPPortAllocator creates listeners on the given ports. This interface lets us avoid occupying
 	// hardcoded ports in tests.
 	TCPPortAllocator TCPPortAllocator
@@ -80,6 +78,8 @@ type Config struct {
 	Clock clockwork.Clock
 	// OnExpiredCert is called when a new downstream connection is accepted by the
 	// gateway but cannot be proxied because the cert used by the gateway has expired.
+	//
+	// Returns a fresh valid cert.
 	//
 	// Handling of the connection is blocked until OnExpiredCert returns.
 	OnExpiredCert OnExpiredCertFunc
@@ -91,16 +91,29 @@ type Config struct {
 	RootClusterCACertPoolFunc alpnproxy.GetClusterCACertPoolFunc
 	// KubeconfigsDir is the directory containing kubeconfigs for kube gateways.
 	KubeconfigsDir string
+	// ClearCertsOnTargetSubresourceNameChange is useful in situations where TargetSubresourceName is
+	// used to generate a cert. In that case, after TargetSubresourceName is changed, the gateway will
+	// clear the cert from the local proxy and the middleware is going to request a new cert on the
+	// next connection.
+	ClearCertsOnTargetSubresourceNameChange bool
 }
 
 // OnExpiredCertFunc is the type of a function that is called when a new downstream connection is
 // accepted by the gateway but cannot be proxied because the cert used by the gateway has expired.
 //
 // Handling of the connection is blocked until the function returns.
-type OnExpiredCertFunc func(context.Context, Gateway) error
+type OnExpiredCertFunc func(context.Context, Gateway) (tls.Certificate, error)
 
 // CheckAndSetDefaults checks and sets the defaults
 func (c *Config) CheckAndSetDefaults() error {
+	if !(c.TargetURI.IsDB() || c.TargetURI.IsKube() || c.TargetURI.IsApp()) {
+		return trace.BadParameter("unsupported gateway target %v", c.TargetURI)
+	}
+
+	if len(c.Cert.Certificate) == 0 {
+		return trace.BadParameter("missing cert")
+	}
+
 	if c.URI.String() == "" {
 		c.URI = uri.NewGatewayURI(uuid.NewString())
 	}
@@ -117,8 +130,8 @@ func (c *Config) CheckAndSetDefaults() error {
 		c.LocalPort = "0"
 	}
 
-	if c.Log == nil {
-		c.Log = logrus.NewEntry(logrus.StandardLogger())
+	if c.Logger == nil {
+		c.Logger = slog.Default()
 	}
 
 	if c.TargetName == "" {
@@ -146,10 +159,10 @@ func (c *Config) CheckAndSetDefaults() error {
 		}
 	}
 
-	c.Log = c.Log.WithFields(logrus.Fields{
-		"resource": c.TargetURI.String(),
-		"gateway":  c.URI.String(),
-	})
+	c.Logger = c.Logger.With(
+		"resource", c.TargetURI.String(),
+		"gateway", c.URI.String(),
+	)
 	return nil
 }
 

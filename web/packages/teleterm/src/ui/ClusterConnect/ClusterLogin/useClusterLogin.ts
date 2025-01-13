@@ -1,88 +1,77 @@
 /**
- * Copyright 2021-2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import { useState, useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
+
 import { useAsync } from 'shared/hooks/useAsync';
 
+import { cloneAbortSignal } from 'teleterm/services/tshd/cloneableClient';
 import { useAppContext } from 'teleterm/ui/appContextProvider';
-import { assertUnreachable } from 'teleterm/ui/utils';
-import { RootClusterUri } from 'teleterm/ui/uri';
-
 import type * as types from 'teleterm/ui/services/clusters/types';
-import type * as tsh from 'teleterm/services/tshd/types';
+import { RootClusterUri } from 'teleterm/ui/uri';
+import { assertUnreachable } from 'teleterm/ui/utils';
 
 export default function useClusterLogin(props: Props) {
   const { onSuccess, clusterUri } = props;
   const { clustersService } = useAppContext();
   const cluster = clustersService.findCluster(clusterUri);
-  const refAbortCtrl = useRef<tsh.TshAbortController>(null);
-  const loggedInUserName = cluster.loggedInUser?.name || null;
+  const refAbortCtrl = useRef<AbortController>(null);
+  const loggedInUserName =
+    props.prefill.username || cluster.loggedInUser?.name || null;
   const [shouldPromptSsoStatus, promptSsoStatus] = useState(false);
-  const [webauthnLogin, setWebauthnLogin] = useState<WebauthnLogin>();
+  const [passwordlessLoginState, setPasswordlessLoginState] =
+    useState<PasswordlessLoginState>();
 
-  const [initAttempt, init] = useAsync(async () => {
-    const authSettings = await clustersService.getAuthSettings(clusterUri);
-
-    if (authSettings.preferredMfa === 'u2f') {
-      throw new Error(`the U2F API for hardware keys is deprecated, \
-        please notify your system administrator to update cluster \
-        settings to use WebAuthn as the second factor protocol.`);
-    }
-
-    return authSettings;
-  });
+  const [initAttempt, init] = useAsync(() =>
+    clustersService.getAuthSettings(clusterUri)
+  );
 
   const [loginAttempt, login, setAttempt] = useAsync(
     (params: types.LoginParams) => {
-      refAbortCtrl.current = clustersService.client.createAbortController();
+      refAbortCtrl.current = new AbortController();
       switch (params.kind) {
         case 'local':
           return clustersService.loginLocal(
             params,
-            refAbortCtrl.current.signal
+            cloneAbortSignal(refAbortCtrl.current.signal)
           );
         case 'passwordless':
           return clustersService.loginPasswordless(
             params,
-            refAbortCtrl.current.signal
+            cloneAbortSignal(refAbortCtrl.current.signal)
           );
         case 'sso':
-          return clustersService.loginSso(params, refAbortCtrl.current.signal);
+          return clustersService.loginSso(
+            params,
+            cloneAbortSignal(refAbortCtrl.current.signal)
+          );
         default:
           assertUnreachable(params);
       }
     }
   );
 
-  const onLoginWithLocal = (
-    username: string,
-    password: string,
-    token: string,
-    secondFactor?: types.Auth2faType
-  ) => {
-    if (secondFactor === 'webauthn') {
-      setWebauthnLogin({ prompt: 'tap' });
-    }
-
+  const onLoginWithLocal = (username: string, password: string) => {
     login({
       kind: 'local',
       clusterUri,
       username,
       password,
-      token,
     });
   };
 
@@ -90,16 +79,16 @@ export default function useClusterLogin(props: Props) {
     login({
       kind: 'passwordless',
       clusterUri,
-      onPromptCallback: (prompt: types.WebauthnLoginPrompt) => {
-        const newLogin: WebauthnLogin = {
+      onPromptCallback: (prompt: types.PasswordlessLoginPrompt) => {
+        const newState: PasswordlessLoginState = {
           prompt: prompt.type,
           processing: false,
         };
 
         if (prompt.type === 'pin') {
-          newLogin.onUserResponse = (pin: string) => {
-            setWebauthnLogin({
-              ...newLogin,
+          newState.onUserResponse = (pin: string) => {
+            setPasswordlessLoginState({
+              ...newState,
               // prevent user from clicking on submit buttons more than once
               processing: true,
             });
@@ -108,12 +97,12 @@ export default function useClusterLogin(props: Props) {
         }
 
         if (prompt.type === 'credential') {
-          newLogin.loginUsernames = prompt.data.credentials.map(
+          newState.loginUsernames = prompt.data.credentials.map(
             c => c.username
           );
-          newLogin.onUserResponse = (index: number) => {
-            setWebauthnLogin({
-              ...newLogin,
+          newState.onUserResponse = (index: number) => {
+            setPasswordlessLoginState({
+              ...newState,
               // prevent user from clicking on multiple usernames
               processing: true,
             });
@@ -121,7 +110,7 @@ export default function useClusterLogin(props: Props) {
           };
         }
 
-        setWebauthnLogin(newLogin);
+        setPasswordlessLoginState(newState);
       },
     });
   };
@@ -157,7 +146,7 @@ export default function useClusterLogin(props: Props) {
 
   useEffect(() => {
     if (loginAttempt.status !== 'processing') {
-      setWebauthnLogin(null);
+      setPasswordlessLoginState(null);
       promptSsoStatus(false);
     }
 
@@ -168,7 +157,7 @@ export default function useClusterLogin(props: Props) {
 
   return {
     shouldPromptSsoStatus,
-    webauthnLogin,
+    passwordlessLoginState,
     title: cluster?.name,
     loggedInUserName,
     onLoginWithLocal,
@@ -178,6 +167,7 @@ export default function useClusterLogin(props: Props) {
     onAbort,
     loginAttempt,
     initAttempt,
+    init,
     clearLoginAttempt,
   };
 }
@@ -188,11 +178,14 @@ export type Props = {
   clusterUri: RootClusterUri;
   onCancel(): void;
   onSuccess?(): void;
+  prefill: { username: string };
 };
 
-export type WebauthnLogin = {
-  prompt: types.WebauthnLoginPrompt['type'];
-  // The below fields are only ever used for passwordless login flow.
+export type PasswordlessLoginState = {
+  /**
+   * prompt describes the current step, or prompt, shown to the user during the passwordless login.
+   */
+  prompt: types.PasswordlessLoginPrompt['type'];
   processing?: boolean;
   loginUsernames?: string[];
   onUserResponse?(val: number | string): void;

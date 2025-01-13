@@ -1,27 +1,30 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package reversetunnelclient
 
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
+	"log/slog"
 	"net"
 
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
 
 	"github.com/gravitational/teleport/api/client"
@@ -48,19 +51,21 @@ type TunnelAuthDialerConfig struct {
 	// ClientConfig is SSH tunnel client config
 	ClientConfig *ssh.ClientConfig
 	// Log is used for logging.
-	Log logrus.FieldLogger
+	Log *slog.Logger
 	// InsecureSkipTLSVerify is whether to skip certificate validation.
 	InsecureSkipTLSVerify bool
-	// ClusterCAs contains cluster CAs.
-	ClusterCAs *x509.CertPool
+	// GetClusterCAs contains cluster CAs.
+	GetClusterCAs client.GetClusterCAsFunc
 }
 
 func (c *TunnelAuthDialerConfig) CheckAndSetDefaults() error {
-	if c.Resolver == nil {
+	switch {
+	case c.Resolver == nil:
 		return trace.BadParameter("missing tunnel address resolver")
-	}
-	if c.ClusterCAs == nil {
-		return trace.BadParameter("missing cluster CAs")
+	case c.GetClusterCAs == nil:
+		return trace.BadParameter("missing cluster CA getter")
+	case c.Log == nil:
+		return trace.BadParameter("missing log")
 	}
 	return nil
 }
@@ -80,7 +85,10 @@ func (t *TunnelAuthDialer) DialContext(ctx context.Context, _, _ string) (net.Co
 
 	addr, mode, err := t.Resolver(ctx)
 	if err != nil {
-		t.Log.Errorf("Failed to resolve tunnel address: %v", err)
+		t.Log.ErrorContext(
+			ctx, "Failed to resolve tunnel address",
+			"error", err,
+		)
 		return nil, trace.Wrap(err)
 	}
 
@@ -95,7 +103,7 @@ func (t *TunnelAuthDialer) DialContext(ctx context.Context, _, _ string) (net.Co
 			},
 			DialTimeout:             t.ClientConfig.Timeout,
 			ALPNConnUpgradeRequired: client.IsALPNConnUpgradeRequired(ctx, addr.Addr, t.InsecureSkipTLSVerify),
-			GetClusterCAs:           client.ClusterCAsFromCertPool(t.ClusterCAs),
+			GetClusterCAs:           t.GetClusterCAs,
 		}))
 	}
 

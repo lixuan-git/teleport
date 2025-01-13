@@ -1,37 +1,45 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React from 'react';
 import userEvent from '@testing-library/user-event';
-import { render, screen, waitFor, act } from 'design/utils/testing';
+
+import { act, render, screen, waitFor } from 'design/utils/testing';
 import { makeSuccessAttempt } from 'shared/hooks/useAsync';
 
 import Logger, { NullService } from 'teleterm/logger';
-import { MockAppContext } from 'teleterm/ui/fixtures/mocks';
+import {
+  makeRetryableError,
+  makeRootCluster,
+} from 'teleterm/services/tshd/testHelpers';
 import { MockAppContextProvider } from 'teleterm/ui/fixtures/MockAppContextProvider';
-import { ResourceSearchError } from 'teleterm/ui/services/resources';
+import { MockAppContext } from 'teleterm/ui/fixtures/mocks';
 import ModalsHost from 'teleterm/ui/ModalsHost';
-import { makeRootCluster } from 'teleterm/services/tshd/testHelpers';
+import { ResourceSearchError } from 'teleterm/ui/services/resources';
+import { ConnectionsContextProvider } from 'teleterm/ui/TopBar/Connections/connectionsContext';
+import { ClusterUri } from 'teleterm/ui/uri';
+import { VnetContextProvider } from 'teleterm/ui/Vnet';
 
+import { SearchAction } from './actions';
 import * as pickers from './pickers/pickers';
 import * as useActionAttempts from './pickers/useActionAttempts';
-import * as useSearch from './useSearch';
-import * as SearchContext from './SearchContext';
-
 import { SearchBarConnected } from './SearchBar';
+import * as SearchContext from './SearchContext';
+import * as useSearch from './useSearch';
 
 beforeAll(() => {
   Logger.init(new NullService());
@@ -41,14 +49,24 @@ beforeEach(() => {
   jest.restoreAllMocks();
 });
 
+const displayResultsAction: SearchAction = {
+  type: 'simple-action',
+  searchResult: {
+    kind: 'display-results',
+    value: '',
+    resourceKinds: [],
+    clusterUri: '/clusters/foo',
+    documentUri: undefined,
+  },
+  perform() {},
+};
+
 it('does not display empty results copy after selecting two filters', () => {
-  const appContext = new MockAppContext();
-  appContext.workspacesService.setState(draft => {
-    draft.rootClusterUri = '/clusters/foo';
-  });
+  const appContext = setUpContext('/clusters/foo');
 
   const mockActionAttempts = {
-    filterActionsAttempt: makeSuccessAttempt([]),
+    displayResultsAction,
+    filterActions: [],
     resourceActionsAttempt: makeSuccessAttempt([]),
     resourceSearchAttempt: makeSuccessAttempt({
       results: [],
@@ -63,14 +81,18 @@ it('does not display empty results copy after selecting two filters', () => {
     ...getMockedSearchContext(),
     filters: [
       { filter: 'cluster', clusterUri: '/clusters/foo' },
-      { filter: 'resource-type', resourceType: 'servers' },
+      { filter: 'resource-type', resourceType: 'node' },
     ],
     inputValue: '',
   }));
 
   render(
     <MockAppContextProvider appContext={appContext}>
-      <SearchBarConnected />
+      <ConnectionsContextProvider>
+        <VnetContextProvider>
+          <SearchBarConnected />
+        </VnetContextProvider>
+      </ConnectionsContextProvider>
     </MockAppContextProvider>
   );
 
@@ -79,13 +101,11 @@ it('does not display empty results copy after selecting two filters', () => {
 });
 
 it('displays empty results copy after providing search query for which there is no results', () => {
-  const appContext = new MockAppContext();
-  appContext.workspacesService.setState(draft => {
-    draft.rootClusterUri = '/clusters/foo';
-  });
+  const appContext = setUpContext('/clusters/foo');
 
   const mockActionAttempts = {
-    filterActionsAttempt: makeSuccessAttempt([]),
+    displayResultsAction,
+    filterActions: [],
     resourceActionsAttempt: makeSuccessAttempt([]),
     resourceSearchAttempt: makeSuccessAttempt({
       results: [],
@@ -102,7 +122,11 @@ it('displays empty results copy after providing search query for which there is 
 
   render(
     <MockAppContextProvider appContext={appContext}>
-      <SearchBarConnected />
+      <ConnectionsContextProvider>
+        <VnetContextProvider>
+          <SearchBarConnected />
+        </VnetContextProvider>
+      </ConnectionsContextProvider>
     </MockAppContextProvider>
   );
 
@@ -111,17 +135,15 @@ it('displays empty results copy after providing search query for which there is 
 });
 
 it('includes offline cluster names in the empty results copy', () => {
-  const appContext = new MockAppContext();
   const cluster = makeRootCluster({ connected: false });
+  const appContext = setUpContext(cluster.uri);
   appContext.clustersService.setState(draftState => {
     draftState.clusters.set(cluster.uri, cluster);
   });
-  appContext.workspacesService.setState(draft => {
-    draft.rootClusterUri = cluster.uri;
-  });
 
   const mockActionAttempts = {
-    filterActionsAttempt: makeSuccessAttempt([]),
+    displayResultsAction,
+    filterActions: [],
     resourceActionsAttempt: makeSuccessAttempt([]),
     resourceSearchAttempt: makeSuccessAttempt({
       results: [],
@@ -138,7 +160,11 @@ it('includes offline cluster names in the empty results copy', () => {
 
   render(
     <MockAppContextProvider appContext={appContext}>
-      <SearchBarConnected />
+      <ConnectionsContextProvider>
+        <VnetContextProvider>
+          <SearchBarConnected />
+        </VnetContextProvider>
+      </ConnectionsContextProvider>
     </MockAppContextProvider>
   );
 
@@ -150,19 +176,16 @@ it('includes offline cluster names in the empty results copy', () => {
 });
 
 it('notifies about resource search errors and allows to display details', () => {
-  const appContext = new MockAppContext();
-  appContext.workspacesService.setState(draft => {
-    draft.rootClusterUri = '/clusters/foo';
-  });
+  const appContext = setUpContext('/clusters/foo');
 
   const resourceSearchError = new ResourceSearchError(
     '/clusters/foo',
-    'server',
     new Error('whoops')
   );
 
   const mockActionAttempts = {
-    filterActionsAttempt: makeSuccessAttempt([]),
+    displayResultsAction,
+    filterActions: [],
     resourceActionsAttempt: makeSuccessAttempt([]),
     resourceSearchAttempt: makeSuccessAttempt({
       results: [],
@@ -185,7 +208,11 @@ it('notifies about resource search errors and allows to display details', () => 
 
   render(
     <MockAppContextProvider appContext={appContext}>
-      <SearchBarConnected />
+      <ConnectionsContextProvider>
+        <VnetContextProvider>
+          <SearchBarConnected />
+        </VnetContextProvider>
+      </ConnectionsContextProvider>
     </MockAppContextProvider>
   );
 
@@ -193,10 +220,10 @@ it('notifies about resource search errors and allows to display details', () => 
   expect(results).toHaveTextContent(
     'Some of the search results are incomplete.'
   );
-  expect(results).toHaveTextContent('Could not fetch servers from foo');
+  expect(results).toHaveTextContent('Could not fetch resources from foo');
   expect(results).not.toHaveTextContent(resourceSearchError.cause['message']);
 
-  screen.getByText('Show details').click();
+  act(() => screen.getByText('Show details').click());
 
   expect(appContext.modalsService.openRegularDialog).toHaveBeenCalledWith(
     expect.objectContaining({
@@ -209,19 +236,16 @@ it('notifies about resource search errors and allows to display details', () => 
 
 it('maintains focus on the search input after closing a resource search error modal', async () => {
   const user = userEvent.setup();
-  const appContext = new MockAppContext();
-  appContext.workspacesService.setState(draft => {
-    draft.rootClusterUri = '/clusters/foo';
-  });
+  const appContext = setUpContext('/clusters/foo');
 
   const resourceSearchError = new ResourceSearchError(
     '/clusters/foo',
-    'server',
     new Error('whoops')
   );
 
   const mockActionAttempts = {
-    filterActionsAttempt: makeSuccessAttempt([]),
+    displayResultsAction,
+    filterActions: [],
     resourceActionsAttempt: makeSuccessAttempt([]),
     resourceSearchAttempt: makeSuccessAttempt({
       results: [],
@@ -235,25 +259,29 @@ it('maintains focus on the search input after closing a resource search error mo
 
   render(
     <MockAppContextProvider appContext={appContext}>
-      <SearchBarConnected />
-      <ModalsHost />
+      <ConnectionsContextProvider>
+        <VnetContextProvider>
+          <SearchBarConnected />
+          <ModalsHost />
+        </VnetContextProvider>
+      </ConnectionsContextProvider>
     </MockAppContextProvider>
   );
 
-  await user.type(screen.getByRole('searchbox'), 'foo');
+  await act(() => user.type(screen.getByRole('searchbox'), 'foo'));
 
   expect(screen.getByRole('menu')).toHaveTextContent(
     'Some of the search results are incomplete.'
   );
-  screen.getByText('Show details').click();
+  act(() => screen.getByText('Show details').click());
 
   const modal = screen.getByTestId('Modal');
   expect(modal).toHaveTextContent('Resource search errors');
   expect(modal).toHaveTextContent('whoops');
 
   // Lose focus on the search input.
-  screen.getByText('Close').focus();
-  screen.getByText('Close').click();
+  act(() => screen.getByText('Close').focus());
+  act(() => screen.getByText('Close').click());
 
   // Need to await this since some state updates in SearchContext are done after the modal closes.
   // Otherwise we'd get a warning about missing `act`.
@@ -271,8 +299,7 @@ it('shows a login modal when a request to a cluster from the current workspace f
   const cluster = makeRootCluster();
   const resourceSearchError = new ResourceSearchError(
     cluster.uri,
-    'server',
-    new Error('ssh: cert has expired')
+    makeRetryableError()
   );
   const resourceSearchResult = {
     results: [],
@@ -284,7 +311,7 @@ it('shows a login modal when a request to a cluster from the current workspace f
     .spyOn(useSearch, 'useResourceSearch')
     .mockImplementation(() => resourceSearch);
 
-  const appContext = new MockAppContext();
+  const appContext = setUpContext(cluster.uri);
   appContext.workspacesService.setState(draft => {
     draft.rootClusterUri = cluster.uri;
   });
@@ -294,21 +321,25 @@ it('shows a login modal when a request to a cluster from the current workspace f
 
   render(
     <MockAppContextProvider appContext={appContext}>
-      <SearchBarConnected />
-      <ModalsHost />
+      <ConnectionsContextProvider>
+        <VnetContextProvider>
+          <SearchBarConnected />
+          <ModalsHost />
+        </VnetContextProvider>
+      </ConnectionsContextProvider>
     </MockAppContextProvider>
   );
 
-  await user.type(screen.getByRole('searchbox'), 'foo');
+  await act(() => user.type(screen.getByRole('searchbox'), 'foo'));
 
   // Verify that the login modal was shown after typing in the search box.
   await waitFor(() => {
     expect(screen.getByTestId('Modal')).toBeInTheDocument();
   });
-  expect(screen.getByTestId('Modal')).toHaveTextContent('Login to');
+  expect(screen.getByTestId('Modal')).toHaveTextContent('Log in to');
 
   // Verify that the search bar stays open after closing the modal.
-  screen.getByLabelText('Close').click();
+  act(() => screen.getByLabelText('Close').click());
   await waitFor(() => {
     expect(screen.queryByTestId('Modal')).not.toBeInTheDocument();
   });
@@ -328,22 +359,23 @@ it('closes on a click on an unfocusable element outside of the search bar', asyn
     .spyOn(useSearch, 'useResourceSearch')
     .mockImplementation(() => resourceSearch);
 
-  const appContext = new MockAppContext();
-  appContext.workspacesService.setState(draft => {
-    draft.rootClusterUri = cluster.uri;
-  });
+  const appContext = setUpContext(cluster.uri);
   appContext.clustersService.setState(draftState => {
     draftState.clusters.set(cluster.uri, cluster);
   });
 
   render(
     <MockAppContextProvider appContext={appContext}>
-      <SearchBarConnected />
-      <p data-testid="unfocusable-element">Lorem ipsum</p>
+      <ConnectionsContextProvider>
+        <VnetContextProvider>
+          <SearchBarConnected />
+          <p data-testid="unfocusable-element">Lorem ipsum</p>
+        </VnetContextProvider>
+      </ConnectionsContextProvider>
     </MockAppContextProvider>
   );
 
-  await user.type(screen.getByRole('searchbox'), 'foo');
+  await act(() => user.type(screen.getByRole('searchbox'), 'foo'));
   expect(screen.getByRole('menu')).toBeInTheDocument();
 
   act(() => {
@@ -373,4 +405,22 @@ const getMockedSearchContext = (): SearchContext.SearchContext => ({
     cleanup: () => {},
   }),
   makeEventListener: cb => cb,
+  advancedSearchEnabled: false,
+  toggleAdvancedSearch: () => {},
 });
+
+const setUpContext = (clusterUri: ClusterUri) => {
+  const appContext = new MockAppContext();
+  appContext.workspacesService.setState(draft => {
+    draft.rootClusterUri = clusterUri;
+    draft.workspaces = {
+      [clusterUri]: {
+        documents: [],
+        location: undefined,
+        localClusterUri: clusterUri,
+        accessRequests: undefined,
+      },
+    };
+  });
+  return appContext;
+};

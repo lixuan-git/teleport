@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package common
 
@@ -22,8 +26,8 @@ import (
 	"github.com/gravitational/trace"
 	"github.com/stretchr/testify/require"
 
+	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/lib/client"
-	"github.com/gravitational/teleport/lib/tlsca"
 )
 
 func Test_getGCPServiceAccountFromFlags(t *testing.T) {
@@ -182,7 +186,7 @@ test-0@other-999999.iam.gserviceaccount.com
 func Test_gcpApp_Config(t *testing.T) {
 	cf := &CLIConf{HomePath: t.TempDir()}
 	profile := &client.ProfileStatus{}
-	route := tlsca.RouteToApp{
+	route := proto.RouteToApp{
 		ClusterName:       "test.teleport.io",
 		Name:              "myapp",
 		GCPServiceAccount: "test@myproject-123456.iam.gserviceaccount.com",
@@ -190,7 +194,10 @@ func Test_gcpApp_Config(t *testing.T) {
 
 	t.Setenv("TELEPORT_GCLOUD_SECRET", "my_secret")
 
-	app, err := newGCPApp(cf, profile, route)
+	app, err := newGCPApp(nil, cf, &appInfo{
+		RouteToApp: route,
+		profile:    profile,
+	})
 	require.NoError(t, err)
 	require.NotNil(t, app)
 

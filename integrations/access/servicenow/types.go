@@ -1,25 +1,25 @@
 /*
-Copyright 2015-2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package servicenow
 
 import (
 	"time"
-
-	"github.com/gravitational/teleport/api/types"
 )
 
 // PluginData is a data associated with access request that we store in Teleport using UpdatePluginData API.
@@ -50,6 +50,10 @@ type Incident struct {
 	IncidentState string `json:"incident_state,omitempty"`
 	// WorkNotes contains comments on the progress of the incident.
 	WorkNotes string `json:"work_notes,omitempty"`
+	// Caller is the user on whose behalf the incident is being created. (Must be an existing servicenow user)
+	Caller string `json:"caller_id,omitempty"`
+	// AssignedTo is the ServiceNow user the incident is assigned.
+	AssignedTo string `json:"assigned_to,omitempty"`
 }
 
 const (
@@ -85,23 +89,43 @@ type RequestData struct {
 	// Resolution is the final resolution of the access request.
 	Resolution Resolution
 	// SystemAnnotations contains key value annotations for the request.
-	SystemAnnotations types.Labels
+	SystemAnnotations map[string][]string
+	// Resources are the resources being requested.
+	Resources []string
+	// SuggestedReviewers are the suggested reviewers for this access request.
+	SuggestedReviewers []string
 }
 
-type onCallResult struct {
+type OnCallResult struct {
 	Result []struct {
 		// UserID is the ID of the on-call user.
 		UserID string `json:"userId"`
 	} `json:"result"`
 }
 
-type userResult struct {
-	Result []struct {
-		// Email is the email address in servicenow of the requested user.
-		Email string `json:"email"`
+type UserResult struct {
+	Result struct {
+		// UserName is the username in servicenow of the requested user.
+		// username chosen over email as identifier as it is guaranteed to be set.
+		UserName string `json:"user_name"`
 	} `json:"result"`
 }
 
-type incidentResult struct {
-	Result Incident `json:"result"`
+type IncidentResult struct {
+	Result struct {
+		// IncidentID is the sys_id of the incident
+		IncidentID string `json:"sys_id,omitempty"`
+		// ShortDescription contains a brief summary of the incident.
+		ShortDescription string `json:"short_description,omitempty"`
+		// Description contains the description of the incident.
+		Description string `json:"description,omitempty"`
+		// CloseCode contains the close code of the incident once it is resolved.
+		CloseCode string `json:"close_code,omitempty"`
+		// CloseNotes contains the closing comments on the incident once it is resolved.
+		CloseNotes string `json:"close_notes,omitempty"`
+		// IncidentState contains the current state the incident is in.
+		IncidentState string `json:"incident_state,omitempty"`
+		// WorkNotes contains comments on the progress of the incident.
+		WorkNotes string `json:"work_notes,omitempty"`
+	} `json:"result"`
 }

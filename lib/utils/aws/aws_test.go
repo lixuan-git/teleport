@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package aws
 
@@ -93,24 +95,28 @@ func TestExtractCredFromAuthHeader(t *testing.T) {
 // TestFilterAWSRoles verifies filtering AWS role ARNs by AWS account ID.
 func TestFilterAWSRoles(t *testing.T) {
 	acc1ARN1 := Role{
-		ARN:     "arn:aws:iam::123456789012:role/EC2FullAccess",
-		Display: "EC2FullAccess",
-		Name:    "EC2FullAccess",
+		ARN:       "arn:aws:iam::123456789012:role/EC2FullAccess",
+		Display:   "EC2FullAccess",
+		Name:      "EC2FullAccess",
+		AccountID: "123456789012",
 	}
 	acc1ARN2 := Role{
-		ARN:     "arn:aws:iam::123456789012:role/EC2ReadOnly",
-		Display: "EC2ReadOnly",
-		Name:    "EC2ReadOnly",
+		ARN:       "arn:aws:iam::123456789012:role/EC2ReadOnly",
+		Display:   "EC2ReadOnly",
+		Name:      "EC2ReadOnly",
+		AccountID: "123456789012",
 	}
 	acc1ARN3 := Role{
-		ARN:     "arn:aws:iam::123456789012:role/path/to/customrole",
-		Display: "customrole",
-		Name:    "path/to/customrole",
+		ARN:       "arn:aws:iam::123456789012:role/path/to/customrole",
+		Display:   "customrole",
+		Name:      "path/to/customrole",
+		AccountID: "123456789012",
 	}
 	acc2ARN1 := Role{
-		ARN:     "arn:aws:iam::210987654321:role/test-role",
-		Display: "test-role",
-		Name:    "test-role",
+		ARN:       "arn:aws:iam::210987654321:role/test-role",
+		Display:   "test-role",
+		Name:      "test-role",
+		AccountID: "210987654321",
 	}
 	invalidARN := Role{
 		ARN: "invalid-arn",
@@ -484,6 +490,36 @@ func TestResourceARN(t *testing.T) {
 			case "policy":
 				require.Equal(t, tt.expected, PolicyARN(tt.partition, tt.accountID, tt.resourceName))
 			}
+		})
+	}
+}
+
+func TestMaybeHashRoleSessionName(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		role     string
+		expected string
+	}{
+		{
+			name:     "role session name not hashed, less than 64 characters",
+			role:     "MyRole",
+			expected: "MyRole",
+		},
+		{
+			name:     "role session name not hashed, exactly 64 characters",
+			role:     "Role123456789012345678901234567890123456789012345678901234567890",
+			expected: "Role123456789012345678901234567890123456789012345678901234567890",
+		},
+		{
+			name:     "role session name hashed, longer than 64 characters",
+			role:     "remote-raimundo.oliveira@abigcompany.com-teleport.abigcompany.com",
+			expected: "remote-raimundo.oliveira@abigcompany.com-telepo-8fe1f87e599b043e",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			actual := MaybeHashRoleSessionName(tt.role)
+			require.Equal(t, tt.expected, actual)
+			require.LessOrEqual(t, len(actual), MaxRoleSessionNameLength)
 		})
 	}
 }

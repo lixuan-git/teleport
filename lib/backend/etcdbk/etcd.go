@@ -1,40 +1,42 @@
 /*
-Copyright 2015-2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 // Package etcdbk implements Etcd powered backend
 package etcdbk
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"errors"
+	"log/slog"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coreos/go-semver/semver"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
 	"github.com/prometheus/client_golang/prometheus"
-	log "github.com/sirupsen/logrus"
 	"go.etcd.io/etcd/api/v3/mvccpb"
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -45,12 +47,19 @@ import (
 	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
 	apiutils "github.com/gravitational/teleport/api/utils"
+	"github.com/gravitational/teleport/api/utils/retryutils"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/observability/metrics"
 	"github.com/gravitational/teleport/lib/tlsca"
 	"github.com/gravitational/teleport/lib/utils"
 	cq "github.com/gravitational/teleport/lib/utils/concurrentqueue"
 )
+
+func init() {
+	backend.MustRegister(GetName(), func(ctx context.Context, p backend.Params) (backend.Backend, error) {
+		return New(ctx, p)
+	})
+}
 
 const (
 	// defaultClientPoolSize is the default number of etcd clients to use
@@ -141,10 +150,10 @@ var (
 )
 
 type EtcdBackend struct {
-	nodes []string
-	*log.Entry
+	nodes       []string
+	logger      *slog.Logger
 	cfg         *Config
-	clients     roundRobin[*clientv3.Client]
+	clients     *utils.RoundRobin[*clientv3.Client]
 	cancelC     chan bool
 	stopC       chan bool
 	clock       clockwork.Clock
@@ -258,20 +267,20 @@ func New(ctx context.Context, params backend.Params, opts ...Option) (*EtcdBacke
 	closeCtx, cancel := context.WithCancel(ctx)
 
 	leaseCache, err := utils.NewFnCache(utils.FnCacheConfig{
-		TTL:             utils.SeventhJitter(time.Minute * 2),
+		TTL:             retryutils.SeventhJitter(time.Minute * 2),
 		Context:         closeCtx,
 		Clock:           options.clock,
 		ReloadOnErr:     true,
-		CleanupInterval: utils.SeventhJitter(time.Minute * 2),
+		CleanupInterval: retryutils.SeventhJitter(time.Minute * 2),
 	})
 	if err != nil {
+		cancel()
 		return nil, trace.Wrap(err)
 	}
 
 	b := &EtcdBackend{
-		Entry:       log.WithFields(log.Fields{trace.Component: GetName()}),
+		logger:      slog.With(teleport.ComponentKey, GetName()),
 		cfg:         cfg,
-		clients:     newRoundRobin[*clientv3.Client](nil), // initialized below in reconnect()
 		nodes:       cfg.Nodes,
 		cancelC:     make(chan bool, 1),
 		stopC:       make(chan bool, 1),
@@ -280,39 +289,81 @@ func New(ctx context.Context, params backend.Params, opts ...Option) (*EtcdBacke
 		ctx:         closeCtx,
 		watchDone:   make(chan struct{}),
 		buf:         buf,
-		leaseBucket: utils.SeventhJitter(options.leaseBucket),
+		leaseBucket: retryutils.SeventhJitter(options.leaseBucket),
 		leaseCache:  leaseCache,
 	}
 
 	// Check that the etcd nodes are at least the minimum version supported
-	if err = b.reconnect(ctx); err != nil {
+	if err = b.reconnect(b.ctx); err != nil {
+		b.Close()
 		return nil, trace.Wrap(err)
 	}
-	timeout, cancel := context.WithTimeout(ctx, time.Second*3*time.Duration(len(cfg.Nodes)))
-	defer cancel()
-	for _, n := range cfg.Nodes {
-		status, err := b.clients.Next().Status(timeout, n)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-
-		ver := semver.New(status.Version)
-		min := semver.New(teleport.MinimumEtcdVersion)
-		if ver.LessThan(*min) {
-			return nil, trace.BadParameter("unsupported version of etcd %v for node %v, must be %v or greater",
-				status.Version, n, teleport.MinimumEtcdVersion)
-		}
+	if err := b.checkVersion(b.ctx); err != nil {
+		b.Close()
+		return nil, trace.Wrap(err)
 	}
 
 	// Reconnect the etcd client to work around a data race in their code.
 	// Upstream fix: https://github.com/etcd-io/etcd/pull/12992
-	if err = b.reconnect(ctx); err != nil {
+	if err = b.reconnect(b.ctx); err != nil {
+		b.Close()
 		return nil, trace.Wrap(err)
 	}
 	go b.asyncWatch()
 
 	// Wrap backend in a input sanitizer and return it.
 	return b, nil
+}
+
+func (b *EtcdBackend) checkVersion(ctx context.Context) error {
+	// scope version check to one third the default I/O timeout since slowness that is
+	// anywhere near the default timeout is going to cause systemic issues.
+	ctx, cancel := context.WithTimeout(ctx, apidefaults.DefaultIOTimeout/3)
+
+	results := make(chan error, len(b.cfg.Nodes))
+
+	var wg sync.WaitGroup
+	for _, nn := range b.cfg.Nodes {
+		wg.Add(1)
+		go func(n string) (err error) {
+			defer func() {
+				results <- err
+				wg.Done()
+			}()
+			status, err := b.clients.Next().Status(ctx, n)
+			if err != nil {
+				return trace.Wrap(err)
+			}
+
+			ver, err := semver.NewVersion(status.Version)
+			if err != nil {
+				return trace.BadParameter("failed to parse etcd version %q: %v", status.Version, err)
+			}
+
+			min := semver.New(teleport.MinimumEtcdVersion)
+			if ver.LessThan(*min) {
+				return trace.BadParameter("unsupported version of etcd %v for node %v, must be %v or greater",
+					status.Version, n, teleport.MinimumEtcdVersion)
+			}
+
+			return nil
+		}(nn)
+	}
+
+	// wait for results
+	var err error
+	for range b.cfg.Nodes {
+		err = <-results
+		if err == nil {
+			// stop on first success, we don't care about all endpoints
+			// being healthy, just that at least one is.
+			break
+		}
+	}
+
+	cancel()
+	wg.Wait()
+	return trace.Wrap(err)
 }
 
 // Validate checks if all the parameters are present/valid
@@ -365,8 +416,10 @@ func (b *EtcdBackend) Close() error {
 	b.cancel()
 	b.buf.Close()
 	var errs []error
-	for _, clt := range b.clients.items {
-		errs = append(errs, clt.Close())
+	if b.clients != nil {
+		b.clients.ForEach(func(clt *clientv3.Client) {
+			errs = append(errs, clt.Close())
+		})
 	}
 	return trace.NewAggregate(errs...)
 }
@@ -378,12 +431,15 @@ func (b *EtcdBackend) CloseWatchers() {
 }
 
 func (b *EtcdBackend) reconnect(ctx context.Context) error {
-	for _, clt := range b.clients.items {
-		if err := clt.Close(); err != nil {
-			b.Entry.WithError(err).Warning("Failed closing existing etcd client on reconnect.")
-		}
+	if b.clients != nil {
+		b.clients.ForEach(func(clt *clientv3.Client) {
+			if err := clt.Close(); err != nil {
+				b.logger.WarnContext(ctx, "Failed closing existing etcd client on reconnect.", "error", err)
+			}
+		})
+
+		b.clients = nil
 	}
-	b.clients.items = nil
 
 	tlsConfig := utils.TLSConfig(nil)
 
@@ -422,6 +478,7 @@ func (b *EtcdBackend) reconnect(ctx context.Context) error {
 		tlsConfig.ClientCAs = certPool
 	}
 
+	clients := make([]*clientv3.Client, 0, b.cfg.ClientPoolSize)
 	for i := 0; i < b.cfg.ClientPoolSize; i++ {
 		clt, err := clientv3.New(clientv3.Config{
 			Context:            ctx,
@@ -433,13 +490,16 @@ func (b *EtcdBackend) reconnect(ctx context.Context) error {
 			MaxCallSendMsgSize: b.cfg.MaxClientMsgSizeBytes,
 		})
 		if err != nil {
-			if errors.Is(err, context.DeadlineExceeded) {
-				return trace.WrapWithMessage(err, "timed out dialing etcd endpoints: %s", b.nodes)
+			// close any preceding clients
+			for _, c := range clients {
+				c.Close()
 			}
 			return trace.Wrap(err)
 		}
-		b.clients.items = append(b.clients.items, clt)
+		clients = append(clients, clt)
 	}
+
+	b.clients = utils.NewRoundRobin(clients)
 	return nil
 }
 
@@ -450,16 +510,16 @@ WatchEvents:
 	for b.ctx.Err() == nil {
 		err = b.watchEvents(b.ctx)
 
-		b.Debugf("Watch exited: %v", err)
+		b.logger.DebugContext(b.ctx, "Watch exited", "error", err)
 
 		// pause briefly to prevent excessive watcher creation attempts
 		select {
-		case <-time.After(utils.HalfJitter(time.Millisecond * 1500)):
+		case <-time.After(retryutils.HalfJitter(time.Millisecond * 1500)):
 		case <-b.ctx.Done():
 			break WatchEvents
 		}
 	}
-	b.Debugf("Watch stopped: %v.", trace.NewAggregate(err, b.ctx.Err()))
+	b.logger.DebugContext(b.ctx, "Watch stopped", "error", trace.NewAggregate(err, b.ctx.Err()))
 }
 
 // eventResult is used to ferry the result of event processing
@@ -533,7 +593,7 @@ func (b *EtcdBackend) watchEvents(ctx context.Context) error {
 			select {
 			case r := <-q.Pop():
 				if r.err != nil {
-					b.WithError(r.err).Errorf("Failed to unmarshal event: %v.", r.original)
+					b.logger.ErrorContext(ctx, "Failed to unmarshal event", "event", r.original, "error", r.err)
 					continue EmitEvents
 				}
 				b.buf.Emit(r.event)
@@ -568,7 +628,7 @@ func (b *EtcdBackend) watchEvents(ctx context.Context) error {
 
 				// limit backlog warnings to once per minute to prevent log spam.
 				if now := time.Now(); now.After(lastBacklogWarning.Add(time.Minute)) {
-					b.Warnf("Etcd event processing backlog; may result in excess memory usage and stale cluster state.")
+					b.logger.WarnContext(ctx, "Etcd event processing backlog; may result in excess memory usage and stale cluster state.")
 					lastBacklogWarning = now
 				}
 
@@ -591,11 +651,11 @@ func (b *EtcdBackend) NewWatcher(ctx context.Context, watch backend.Watch) (back
 }
 
 // GetRange returns query range
-func (b *EtcdBackend) GetRange(ctx context.Context, startKey, endKey []byte, limit int) (*backend.GetResult, error) {
-	if len(startKey) == 0 {
+func (b *EtcdBackend) GetRange(ctx context.Context, startKey, endKey backend.Key, limit int) (*backend.GetResult, error) {
+	if startKey.IsZero() {
 		return nil, trace.BadParameter("missing parameter startKey")
 	}
-	if len(endKey) == 0 {
+	if endKey.IsZero() {
 		return nil, trace.BadParameter("missing parameter endKey")
 	}
 	opts := []clientv3.OpOption{clientv3.WithRange(b.prependPrefix(endKey))}
@@ -618,7 +678,6 @@ func (b *EtcdBackend) GetRange(ctx context.Context, startKey, endKey []byte, lim
 		items = append(items, backend.Item{
 			Key:      b.trimPrefix(kv.Key),
 			Value:    value,
-			ID:       kv.ModRevision,
 			Revision: toBackendRevision(kv.ModRevision),
 		})
 	}
@@ -660,7 +719,7 @@ func (b *EtcdBackend) Create(ctx context.Context, item backend.Item) (*backend.L
 		return nil, trace.Wrap(convertErr(err))
 	}
 	if !re.Succeeded {
-		return nil, trace.AlreadyExists("%q already exists", string(item.Key))
+		return nil, trace.AlreadyExists("%v already exists", item.Key)
 	}
 
 	lease.Revision = toBackendRevision(re.Header.Revision)
@@ -688,7 +747,7 @@ func (b *EtcdBackend) Update(ctx context.Context, item backend.Item) (*backend.L
 		return nil, trace.Wrap(convertErr(err))
 	}
 	if !re.Succeeded {
-		return nil, trace.NotFound("%q is not found", string(item.Key))
+		return nil, trace.NotFound("%q is not found", item.Key.String())
 	}
 
 	lease.Revision = toBackendRevision(re.Header.Revision)
@@ -732,13 +791,13 @@ func (b *EtcdBackend) ConditionalUpdate(ctx context.Context, item backend.Item) 
 // CompareAndSwap compares item with existing item
 // and replaces is with replaceWith item
 func (b *EtcdBackend) CompareAndSwap(ctx context.Context, expected backend.Item, replaceWith backend.Item) (*backend.Lease, error) {
-	if len(expected.Key) == 0 {
+	if expected.Key.IsZero() {
 		return nil, trace.BadParameter("missing parameter Key")
 	}
-	if len(replaceWith.Key) == 0 {
+	if replaceWith.Key.IsZero() {
 		return nil, trace.BadParameter("missing parameter Key")
 	}
-	if !bytes.Equal(expected.Key, replaceWith.Key) {
+	if expected.Key.Compare(replaceWith.Key) != 0 {
 		return nil, trace.BadParameter("expected and replaceWith keys should match")
 	}
 	var opts []clientv3.OpOption
@@ -766,7 +825,7 @@ func (b *EtcdBackend) CompareAndSwap(ctx context.Context, expected backend.Item,
 		return nil, trace.Wrap(err)
 	}
 	if !re.Succeeded {
-		return nil, trace.CompareFailed("key %q did not match expected value", string(expected.Key))
+		return nil, trace.CompareFailed("key %q did not match expected value", expected.Key.String())
 	}
 
 	lease.Revision = toBackendRevision(re.Header.Revision)
@@ -812,20 +871,20 @@ func (b *EtcdBackend) KeepAlive(ctx context.Context, lease backend.Lease, expire
 	_, err := b.clients.Next().Put(ctx, b.prependPrefix(lease.Key), "", opts...)
 	err = convertErr(err)
 	if trace.IsNotFound(err) {
-		return trace.NotFound("item %q is not found", string(lease.Key))
+		return trace.NotFound("item %q is not found", lease.Key.String())
 	}
 
 	return err
 }
 
 // Get returns a single item or not found error
-func (b *EtcdBackend) Get(ctx context.Context, key []byte) (*backend.Item, error) {
+func (b *EtcdBackend) Get(ctx context.Context, key backend.Key) (*backend.Item, error) {
 	re, err := b.clients.Next().Get(ctx, b.prependPrefix(key))
 	if err != nil {
 		return nil, convertErr(err)
 	}
 	if len(re.Kvs) == 0 {
-		return nil, trace.NotFound("item %q is not found", string(key))
+		return nil, trace.NotFound("item %q is not found", key.String())
 	}
 	kv := re.Kvs[0]
 	value, err := unmarshal(kv.Value)
@@ -835,13 +894,12 @@ func (b *EtcdBackend) Get(ctx context.Context, key []byte) (*backend.Item, error
 	return &backend.Item{
 		Key:      key,
 		Value:    value,
-		ID:       kv.ModRevision,
 		Revision: toBackendRevision(kv.ModRevision),
 	}, nil
 }
 
 // Delete deletes item by key
-func (b *EtcdBackend) Delete(ctx context.Context, key []byte) error {
+func (b *EtcdBackend) Delete(ctx context.Context, key backend.Key) error {
 	start := b.clock.Now()
 	re, err := b.clients.Next().Delete(ctx, b.prependPrefix(key))
 	writeLatencies.Observe(time.Since(start).Seconds())
@@ -850,14 +908,14 @@ func (b *EtcdBackend) Delete(ctx context.Context, key []byte) error {
 		return trace.Wrap(convertErr(err))
 	}
 	if re.Deleted == 0 {
-		return trace.NotFound("%q is not found", key)
+		return trace.NotFound("%q is not found", key.String())
 	}
 
 	return nil
 }
 
 // ConditionalDelete deletes the item if it hasn't been modified.
-func (b *EtcdBackend) ConditionalDelete(ctx context.Context, prefix []byte, rev string) error {
+func (b *EtcdBackend) ConditionalDelete(ctx context.Context, prefix backend.Key, rev string) error {
 	r, err := fromBackendRevision(rev)
 	if err != nil {
 		return trace.Wrap(backend.ErrIncorrectRevision)
@@ -882,11 +940,11 @@ func (b *EtcdBackend) ConditionalDelete(ctx context.Context, prefix []byte, rev 
 }
 
 // DeleteRange deletes range of items with keys between startKey and endKey
-func (b *EtcdBackend) DeleteRange(ctx context.Context, startKey, endKey []byte) error {
-	if len(startKey) == 0 {
+func (b *EtcdBackend) DeleteRange(ctx context.Context, startKey, endKey backend.Key) error {
+	if startKey.IsZero() {
 		return trace.BadParameter("missing parameter startKey")
 	}
-	if len(endKey) == 0 {
+	if endKey.IsZero() {
 		return trace.BadParameter("missing parameter endKey")
 	}
 	start := b.clock.Now()
@@ -924,7 +982,6 @@ func (b *EtcdBackend) setupLease(ctx context.Context, item backend.Item, lease *
 		return trace.Wrap(err)
 	}
 	*opts = []clientv3.OpOption{clientv3.WithLease(leaseID)}
-	lease.ID = int64(leaseID)
 	lease.Key = item.Key
 	lease.Revision = item.Revision
 	return nil
@@ -954,7 +1011,6 @@ func (b *EtcdBackend) fromEvent(ctx context.Context, e clientv3.Event) (*backend
 		Type: fromType(e.Type),
 		Item: backend.Item{
 			Key:      b.trimPrefix(e.Kv.Key),
-			ID:       e.Kv.ModRevision,
 			Revision: toBackendRevision(e.Kv.ModRevision),
 		},
 	}
@@ -1051,10 +1107,10 @@ func fromType(eventType mvccpb.Event_EventType) types.OpType {
 	}
 }
 
-func (b *EtcdBackend) trimPrefix(in []byte) []byte {
-	return bytes.TrimPrefix(in, []byte(b.cfg.Key))
+func (b *EtcdBackend) trimPrefix(in []byte) backend.Key {
+	return backend.KeyFromString(string(in)).TrimPrefix(backend.KeyFromString(b.cfg.Key))
 }
 
-func (b *EtcdBackend) prependPrefix(in []byte) string {
-	return b.cfg.Key + string(in)
+func (b *EtcdBackend) prependPrefix(in backend.Key) string {
+	return b.cfg.Key + in.String()
 }

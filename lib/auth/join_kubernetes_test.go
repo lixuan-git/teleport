@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package auth
 
@@ -26,14 +28,14 @@ import (
 
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/auth/testauthority"
-	"github.com/gravitational/teleport/lib/kubernetestoken"
+	kubetoken "github.com/gravitational/teleport/lib/kube/token"
 )
 
 type mockK8STokenReviewValidator struct {
-	tokens map[string]*kubernetestoken.ValidationResult
+	tokens map[string]*kubetoken.ValidationResult
 }
 
-func (m *mockK8STokenReviewValidator) Validate(_ context.Context, token string) (*kubernetestoken.ValidationResult, error) {
+func (m *mockK8STokenReviewValidator) Validate(_ context.Context, token, _ string) (*kubetoken.ValidationResult, error) {
 	result, ok := m.tokens[token]
 	if !ok {
 		return nil, errMockInvalidToken
@@ -46,14 +48,14 @@ func TestAuth_RegisterUsingToken_Kubernetes(t *testing.T) {
 	// Test setup
 
 	// Creating an auth server with mock Kubernetes token validator
-	tokenReviewTokens := map[string]*kubernetestoken.ValidationResult{
+	tokenReviewTokens := map[string]*kubetoken.ValidationResult{
 		"matching-implicit-in-cluster": {Username: "system:serviceaccount:namespace1:service-account1"},
 		// "matching-explicit-in-cluster" intentionally matches the second allow
 		// rule of explicitInCluster to ensure all rules are processed.
 		"matching-explicit-in-cluster": {Username: "system:serviceaccount:namespace2:service-account2"},
 		"user-token":                   {Username: "namespace1:service-account1"},
 	}
-	jwksTokens := map[string]*kubernetestoken.ValidationResult{
+	jwksTokens := map[string]*kubetoken.ValidationResult{
 		"jwks-matching-service-account":   {Username: "system:serviceaccount:static-jwks:matching"},
 		"jwks-mismatched-service-account": {Username: "system:serviceaccount:static-jwks:mismatched"},
 	}
@@ -61,7 +63,7 @@ func TestAuth_RegisterUsingToken_Kubernetes(t *testing.T) {
 	ctx := context.Background()
 	p, err := newTestPack(ctx, t.TempDir(), func(server *Server) error {
 		server.k8sTokenReviewValidator = &mockK8STokenReviewValidator{tokens: tokenReviewTokens}
-		server.k8sJWKSValidator = func(_ time.Time, _ []byte, _ string, token string) (*kubernetestoken.ValidationResult, error) {
+		server.k8sJWKSValidator = func(_ time.Time, _ []byte, _ string, token string) (*kubetoken.ValidationResult, error) {
 			result, ok := jwksTokens[token]
 			if !ok {
 				return nil, errMockInvalidToken

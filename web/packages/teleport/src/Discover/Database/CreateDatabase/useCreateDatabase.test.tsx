@@ -1,45 +1,46 @@
 /**
- * Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React from 'react';
+import { act, renderHook, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
-import { renderHook, act } from '@testing-library/react-hooks';
 
-import { createTeleportContext } from 'teleport/mocks/contexts';
 import { ContextProvider } from 'teleport';
-import {
-  DiscoverProvider,
-  DiscoverContextState,
-} from 'teleport/Discover/useDiscover';
-import api from 'teleport/services/api';
-import { FeaturesContextProvider } from 'teleport/FeaturesContext';
-import { userEventService } from 'teleport/services/userEvent';
 import cfg from 'teleport/config';
 import {
   DatabaseEngine,
   DatabaseLocation,
 } from 'teleport/Discover/SelectResource';
 import {
-  IamPolicyStatus,
+  DiscoverContextState,
+  DiscoverProvider,
+} from 'teleport/Discover/useDiscover';
+import { FeaturesContextProvider } from 'teleport/FeaturesContext';
+import { createTeleportContext } from 'teleport/mocks/contexts';
+import api from 'teleport/services/api';
+import {
   CreateDatabaseRequest,
+  IamPolicyStatus,
 } from 'teleport/services/databases';
+import { userEventService } from 'teleport/services/userEvent';
 
 import {
-  useCreateDatabase,
   findActiveDatabaseSvc,
+  useCreateDatabase,
   WAITING_TIMEOUT,
 } from './useCreateDatabase';
 
@@ -247,6 +248,7 @@ const newDatabaseReq: CreateDatabaseRequest = {
 };
 
 jest.useFakeTimers();
+const defaultIsCloud = cfg.isCloud;
 
 describe('registering new databases, mainly error checking', () => {
   const discoverCtx: DiscoverContextState = {
@@ -275,6 +277,7 @@ describe('registering new databases, mainly error checking', () => {
   let wrapper;
 
   beforeEach(() => {
+    cfg.isCloud = true;
     jest.spyOn(api, 'get').mockResolvedValue([]); // required for fetchClusterAlerts
 
     jest
@@ -311,6 +314,7 @@ describe('registering new databases, mainly error checking', () => {
   });
 
   afterEach(() => {
+    cfg.isCloud = defaultIsCloud;
     jest.clearAllMocks();
   });
 
@@ -342,6 +346,9 @@ describe('registering new databases, mainly error checking', () => {
     // of steps to skip.
     result.current.nextStep();
     expect(discoverCtx.nextStep).toHaveBeenCalledWith(2);
+    cfg.isCloud = false;
+    result.current.nextStep();
+    expect(discoverCtx.nextStep).toHaveBeenCalledWith(3);
   });
 
   test('continue polling when poll result returns with iamPolicyStatus field set to "pending"', async () => {
@@ -397,6 +404,9 @@ describe('registering new databases, mainly error checking', () => {
     result.current.nextStep();
     // Skips both deploy service AND IAM policy step.
     expect(discoverCtx.nextStep).toHaveBeenCalledWith(3);
+    cfg.isCloud = false;
+    result.current.nextStep();
+    expect(discoverCtx.nextStep).toHaveBeenCalledWith(4);
   });
 
   test('stops polling when poll result returns with iamPolicyStatus field set to "unspecified"', async () => {
@@ -438,7 +448,7 @@ describe('registering new databases, mainly error checking', () => {
     jest
       .spyOn(teleCtx.databaseService, 'fetchDatabaseServices')
       .mockResolvedValue({ services: [] } as any);
-    const { result, waitFor } = renderHook(() => useCreateDatabase(), {
+    const { result } = renderHook(() => useCreateDatabase(), {
       wrapper,
     });
 
@@ -465,6 +475,9 @@ describe('registering new databases, mainly error checking', () => {
     // number of steps to skip defined.
     result.current.nextStep();
     expect(discoverCtx.nextStep).toHaveBeenCalledWith();
+    cfg.isCloud = false;
+    result.current.nextStep();
+    expect(discoverCtx.nextStep).toHaveBeenCalledWith(2);
   });
 
   test('when failed to create db, stops flow', async () => {

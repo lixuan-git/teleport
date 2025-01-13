@@ -1,23 +1,26 @@
 /**
- * Copyright 2023 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 import React, { useState } from 'react';
-import { Box, Flex, ButtonSecondary, LabelInput } from 'design';
-import Select, { Option } from 'shared/components/Select';
+
+import { Box, ButtonSecondary, Flex, LabelInput } from 'design';
 import { Refresh as RefreshIcon } from 'design/Icon';
+import Select, { Option } from 'shared/components/Select';
 
 import { awsRegionMap, Regions } from 'teleport/services/integrations';
 
@@ -28,7 +31,7 @@ export function AwsRegionSelector({
   clear,
 }: {
   onFetch(region: Regions): void;
-  onRefresh(): void;
+  onRefresh?(): void;
   disableSelector: boolean;
   clear(): void;
 }) {
@@ -56,22 +59,19 @@ export function AwsRegionSelector({
             isDisabled={disableSelector}
           />
         </Box>
-        <ButtonSecondary
-          onClick={onRefresh}
-          mt={1}
-          title="Refresh database table"
-          height="40px"
-          width="30px"
-          css={`
-            &:disabled {
-              opacity: 0.35;
-              pointer-events: none;
-            }
-          `}
-          disabled={disableSelector || !selectedRegion}
-        >
-          <RefreshIcon size="medium" />
-        </ButtonSecondary>
+        {onRefresh && (
+          <ButtonSecondary
+            onClick={onRefresh}
+            mt={1}
+            title="Refresh"
+            height="40px"
+            width="40px"
+            p={0}
+            disabled={disableSelector || !selectedRegion}
+          >
+            <RefreshIcon size="medium" />
+          </ButtonSecondary>
+        )}
       </Flex>
     </Box>
   );

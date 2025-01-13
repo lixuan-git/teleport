@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package integration
 
@@ -49,7 +51,7 @@ type AppI interface {
 }
 
 type contexts struct {
-	// baseCtx is the the base context for appCtx and testCtx.
+	// baseCtx is the base context for appCtx and testCtx.
 	// It could store some test-specific information stored using context.WithValue()
 	// such as test name for the logger etc.
 	baseCtx context.Context
@@ -91,7 +93,7 @@ func (s *Suite) initContexts(oldT *testing.T, newT *testing.T) {
 	} else {
 		baseCtx = context.Background()
 	}
-	baseCtx, _ = logger.WithField(baseCtx, "test", newT.Name())
+	baseCtx, _ = logger.With(baseCtx, "test", newT.Name())
 	baseCtx, cancel := context.WithCancel(baseCtx)
 	newT.Cleanup(cancel)
 
@@ -106,8 +108,8 @@ func (s *Suite) initContexts(oldT *testing.T, newT *testing.T) {
 
 // SetContextTimeout limits the lifetime of test and app contexts.
 func (s *Suite) SetContextTimeout(timeout time.Duration) context.Context {
+	s.T().Helper()
 	t := s.T()
-	t.Helper()
 
 	contexts, ok := s.contexts[t]
 	require.True(t, ok)
@@ -127,8 +129,8 @@ func (s *Suite) SetContextTimeout(timeout time.Duration) context.Context {
 
 // Context returns a current test context.
 func (s *Suite) Context() context.Context {
+	s.T().Helper()
 	t := s.T()
-	t.Helper()
 	contexts, ok := s.contexts[t]
 	require.True(t, ok)
 	return contexts.testCtx
@@ -136,8 +138,8 @@ func (s *Suite) Context() context.Context {
 
 // NewTmpFile creates a new temporary file.
 func (s *Suite) NewTmpFile(pattern string) *os.File {
+	s.T().Helper()
 	t := s.T()
-	t.Helper()
 
 	file, err := os.CreateTemp("", pattern)
 	require.NoError(t, err)
@@ -150,8 +152,8 @@ func (s *Suite) NewTmpFile(pattern string) *os.File {
 
 // StartApp spawns an app in parallel with the running test/suite.
 func (s *Suite) StartApp(app AppI) {
+	s.T().Helper()
 	t := s.T()
-	t.Helper()
 
 	contexts, ok := s.contexts[t]
 	require.True(t, ok)
@@ -161,7 +163,7 @@ func (s *Suite) StartApp(app AppI) {
 		if err := app.Run(ctx); err != nil {
 			// We're in a goroutine so we can't just require.NoError(t, err).
 			// All we can do is to log an error.
-			logger.Get(ctx).WithError(err).Error("Application failed")
+			logger.Get(ctx).ErrorContext(ctx, "Application failed", "error", err)
 		}
 	}()
 

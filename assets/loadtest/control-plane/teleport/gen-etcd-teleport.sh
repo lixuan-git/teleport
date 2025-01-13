@@ -14,6 +14,8 @@ clusterName: ${CLUSTER_NAME}.${ROUTE53_ZONE}      # Name of your cluster. Use th
 teleportVersionOverride: ${TELEPORT_VERSION}
 
 extraArgs: ['--debug']
+image: "public.ecr.aws/gravitational-staging/teleport-distroless-debug"
+enterpriseImage: "public.ecr.aws/gravitational-staging/teleport-ent-distroless-debug"
 
 persistence:
     enabled: false
@@ -26,13 +28,13 @@ highAvailability:
 
 authentication:
   type: local
-  secondFactor: "optional"
+  secondFactor: "webauthn"
   webauthn:
     rp_id: ${CLUSTER_NAME}.${ROUTE53_ZONE}
   connector_name: passwordless
   device_trust:
     mode: "off"
-proxyListenerMode: separate
+proxyListenerMode: "multiplex"
 auth:
   teleportConfig:
     version: v3
@@ -43,7 +45,7 @@ auth:
           output: json
       storage:
         type: etcd
-        peers: [https://etcd.etcd.svc.cluster.local:2379]
+        peers: [http://etcd.etcd.svc.cluster.local:2379]
         insecure: true
         prefix: teleport
       connection_limits:

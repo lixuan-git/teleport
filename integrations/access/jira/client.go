@@ -1,18 +1,20 @@
 /*
-Copyright 2020-2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package jira
 
@@ -40,9 +42,10 @@ const (
 
 	jiraMaxConns    = 100
 	jiraHTTPTimeout = 10 * time.Second
-	// Teleport has a 4096 character limit for the reason field so we
+	// JiraReasonLimit is the max size for a reason in jira.
+	// Teleport has a 4096-character limit for the reason field, so we
 	// truncate all reasons to a generous but conservative limit
-	jiraReasonLimit = 3000
+	JiraReasonLimit = 3000
 
 	jiraStatusUpdateTimeout time.Duration = 10 * time.Second
 )
@@ -96,6 +99,7 @@ func NewJiraClient(conf JiraConfig, clusterName, teleportProxyAddr string, statu
 		Transport: &http.Transport{
 			MaxConnsPerHost:     jiraMaxConns,
 			MaxIdleConnsPerHost: jiraMaxConns,
+			Proxy:               http.ProxyFromEnvironment,
 		}}).
 		SetBaseURL(conf.URL).
 		SetBasicAuth(conf.Username, conf.APIToken).
@@ -121,14 +125,14 @@ func NewJiraClient(conf JiraConfig, clusterName, teleportProxyAddr string, statu
 					defer cancel()
 
 					if err := statusSink.Emit(ctx, status); err != nil {
-						log.WithError(err).Errorf("Error while emitting Jira plugin status: %v", err)
+						log.ErrorContext(ctx, "Error while emitting Jira plugin status", "error", err)
 					}
 				}
 
 				if resp.IsError() {
 					switch result := resp.Error().(type) {
 					case *ErrorResult:
-						return trace.Errorf("http error code=%v, errors=[%v]", resp.StatusCode(), strings.Join(result.ErrorMessages, ", "))
+						return trace.Errorf("http error code=%v, errors=[%s]", resp.StatusCode(), result)
 					case nil:
 						return nil
 					default:
@@ -160,6 +164,17 @@ func statusFromStatusCode(httpCode int) types.PluginStatus {
 	return &types.PluginStatusV1{Code: code}
 }
 
+// buildSummary creates the Issue's summary by using the user name and roles.
+// No official docs seem to exist, but it's _known_ that summary field must be less than 255 chars:
+// Eg https://community.atlassian.com/t5/Jira-questions/Summary-must-be-less-than-255-characters/qaq-p/989632
+func buildSummary(reqData RequestData) string {
+	summary := fmt.Sprintf("%s requested %s", reqData.User, strings.Join(reqData.Roles, ", "))
+	if len(summary) <= 254 {
+		return summary
+	}
+	return fmt.Sprintf("%s requested access to %d roles", reqData.User, len(reqData.Roles))
+}
+
 // HealthCheck checks Jira endpoint for validity and also checks the project permissions.
 func (j *Jira) HealthCheck(ctx context.Context) error {
 	log := logger.Get(ctx)
@@ -184,7 +199,7 @@ func (j *Jira) HealthCheck(ctx context.Context) error {
 		}
 	}
 
-	log.Debug("Checking out Jira project...")
+	log.DebugContext(ctx, "Checking out Jira project")
 	var project Project
 	_, err = j.client.NewRequest().
 		SetContext(ctx).
@@ -194,9 +209,12 @@ func (j *Jira) HealthCheck(ctx context.Context) error {
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	log.Debugf("Found project %q named %q", project.Key, project.Name)
+	log.DebugContext(ctx, "Found Jira project",
+		"project", project.Key,
+		"project_name", project.Name,
+	)
 
-	log.Debug("Checking out Jira project permissions...")
+	log.DebugContext(ctx, "Checking out Jira project permissions")
 	queryOptions, err := query.Values(GetMyPermissionsQueryOptions{
 		ProjectKey:  j.project,
 		Permissions: jiraRequiredPermissions,
@@ -239,9 +257,9 @@ func (j *Jira) CreateIssue(ctx context.Context, reqID string, reqData RequestDat
 			},
 		},
 		Fields: IssueFieldsInput{
-			Type:        &IssueType{Name: "Task"},
+			Type:        &IssueType{Name: j.issueType},
 			Project:     &Project{Key: j.project},
-			Summary:     fmt.Sprintf("%s requested %s", reqData.User, strings.Join(reqData.Roles, ", ")),
+			Summary:     buildSummary(reqData),
 			Description: description,
 		},
 	}
@@ -418,7 +436,7 @@ func (j *Jira) ResolveIssue(ctx context.Context, issueID string, resolution Reso
 	if err2 := trace.Wrap(j.TransitionIssue(ctx, issue.ID, transition.ID)); err2 != nil {
 		return trace.NewAggregate(err1, err2)
 	}
-	logger.Get(ctx).Debugf("Successfully moved the issue to the status %q", toStatus)
+	logger.Get(ctx).DebugContext(ctx, "Successfully moved the issue to the target status", "target_status", toStatus)
 
 	return trace.Wrap(err1)
 }
@@ -442,17 +460,17 @@ func (j *Jira) AddResolutionComment(ctx context.Context, id string, resolution R
 		SetBody(CommentInput{Body: builder.String()}).
 		Post("rest/api/2/issue/{issueID}/comment")
 	if err == nil {
-		logger.Get(ctx).Debug("Successfully added a resolution comment to the issue")
+		logger.Get(ctx).DebugContext(ctx, "Successfully added a resolution comment to the issue")
 	}
 	return trace.Wrap(err)
 }
 
 func truncateReasonFields(reqData RequestData) RequestData {
-	if reqData.Resolution.Reason != "" && len(reqData.Resolution.Reason) > jiraReasonLimit {
-		reqData.Resolution.Reason = reqData.Resolution.Reason[:jiraReasonLimit]
+	if reqData.Resolution.Reason != "" && len(reqData.Resolution.Reason) > JiraReasonLimit {
+		reqData.Resolution.Reason = reqData.Resolution.Reason[:JiraReasonLimit]
 	}
-	if reqData.RequestReason != "" && len(reqData.RequestReason) > jiraReasonLimit {
-		reqData.RequestReason = reqData.RequestReason[:jiraReasonLimit]
+	if reqData.RequestReason != "" && len(reqData.RequestReason) > JiraReasonLimit {
+		reqData.RequestReason = reqData.RequestReason[:JiraReasonLimit]
 	}
 	return reqData
 }

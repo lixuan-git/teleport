@@ -1,30 +1,31 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package cloud
 
 import (
 	"context"
-	"fmt"
+	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
-	"golang.org/x/exp/slices"
 
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/cloud"
@@ -41,7 +42,7 @@ import (
 type credentialsChecker struct {
 	cloudClients     cloud.Clients
 	resourceMatchers []services.ResourceMatcher
-	log              logrus.FieldLogger
+	logger           *slog.Logger
 	cache            *utils.FnCache
 }
 
@@ -57,7 +58,7 @@ func newCrednentialsChecker(cfg DiscoveryResourceCheckerConfig) (*credentialsChe
 	return &credentialsChecker{
 		cloudClients:     cfg.Clients,
 		resourceMatchers: cfg.ResourceMatchers,
-		log:              cfg.Log,
+		logger:           cfg.Logger,
 		cache:            cache,
 	}, nil
 }
@@ -71,7 +72,10 @@ func (c *credentialsChecker) Check(ctx context.Context, database types.Database)
 	case database.IsAzure():
 		c.checkAzure(ctx, database)
 	default:
-		c.log.Debugf("Database %q has unknown cloud type %q.", database.GetName(), database.GetType())
+		c.logger.DebugContext(ctx, "Database has unknown cloud type",
+			"database", database.GetName(),
+			"cloud_type", database.GetType(),
+		)
 	}
 	return nil
 }
@@ -80,16 +84,19 @@ func (c *credentialsChecker) checkAWS(ctx context.Context, database types.Databa
 	meta := database.GetAWS()
 	identity, err := c.getAWSIdentity(ctx, &meta)
 	if err != nil {
-		c.warn(err, database, "Failed to get AWS identity when checking a database created by the discovery service.")
+		c.warn(ctx, "Failed to get AWS identity when checking a database created by the discovery service",
+			"database", database.GetName(),
+		)
 		return
 	}
 
 	if meta.AccountID != "" && meta.AccountID != identity.GetAccountID() {
-		c.warn(nil, database, fmt.Sprintf("The database agent's identity and discovered database %q have different AWS account IDs (%s vs %s).",
-			database.GetName(),
-			identity.GetAccountID(),
-			meta.AccountID,
-		))
+		c.warn(ctx,
+			"The database agent's identity and discovered database have different AWS account IDs",
+			"database", database.GetName(),
+			"agent_account_id", identity.GetAccountID(),
+			"discovered_account_id", meta.AccountID,
+		)
 		return
 	}
 }
@@ -104,7 +111,7 @@ func (c *credentialsChecker) getAWSIdentity(ctx context.Context, meta *types.AWS
 	}
 
 	identity, err := utils.FnCacheGet(ctx, c.cache, types.CloudAWS, func(ctx context.Context) (aws.Identity, error) {
-		client, err := c.cloudClients.GetAWSSTSClient(ctx, "")
+		client, err := c.cloudClients.GetAWSSTSClient(ctx, "", cloud.WithAmbientCredentials())
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -122,36 +129,44 @@ func (c *credentialsChecker) checkAzure(ctx context.Context, database types.Data
 		return client.ListSubscriptionIDs(ctx)
 	})
 	if err != nil {
-		c.warn(err, database, "Failed to get Azure subscription IDs when checking a database created by the discovery service.")
+		c.warn(ctx, "Failed to get Azure subscription IDs when checking a database created by the discovery service",
+			"error", err,
+			"database", database.GetName(),
+		)
 		return
 	}
 
 	rid, err := arm.ParseResourceID(database.GetAzure().ResourceID)
 	if err != nil {
-		c.log.Warnf("Failed to parse resource ID of database %q: %v.", database.GetName(), err)
+		c.logger.WarnContext(ctx, "Failed to parse resource ID of database",
+			"database", database.GetName(),
+			"error", err,
+		)
 		return
 	}
 
 	if !slices.Contains(allSubIDs, rid.SubscriptionID) {
-		c.warn(nil, database, fmt.Sprintf("The discovered database %q is in a subscription (ID: %s) that the database agent does not have access to.",
-			database.GetName(),
-			rid.SubscriptionID,
-		))
+		c.warn(ctx, "The discovered database is in a subscription that the database agent does not have access to",
+			"database", database.GetName(),
+			"subscription", rid.SubscriptionID,
+		)
 		return
 	}
 }
 
-func (c *credentialsChecker) warn(err error, database types.Database, msg string) {
-	log := c.log.WithField("database", database)
-	if err != nil {
-		log = log.WithField("error", err.Error())
+func (c *credentialsChecker) warn(ctx context.Context, msg string, args ...any) {
+	logger := c.logger.With(
+		"help_message", `You can update "db_service.resources" section of this agent's config file to filter out unwanted resources (see https://goteleport.com/docs/database-access/reference/configuration/ for more details). If this database is intended to be handled by this agent, please verify that valid cloud credentials are configured for the agent.`,
+	)
+
+	if c.isWildcardMatcher() {
+		//nolint:sloglint // The passed in message and args trips up the linter
+		logger.WarnContext(ctx, msg, args...)
+		return
 	}
 
-	logLevel := logrus.InfoLevel
-	if c.isWildcardMatcher() {
-		logLevel = logrus.WarnLevel
-	}
-	log.Logf(logLevel, "%s You can update \"db_service.resources\" section of this agent's config file to filter out unwanted resources (see https://goteleport.com/docs/database-access/reference/configuration/ for more details). If this database is intended to be handled by this agent, please verify that valid cloud credentials are configured for the agent.", msg)
+	//nolint:sloglint // The passed in message and args trips up the linter
+	logger.InfoContext(ctx, msg, args...)
 }
 
 func (c *credentialsChecker) isWildcardMatcher() bool {

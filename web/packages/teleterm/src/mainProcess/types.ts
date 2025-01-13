@@ -1,29 +1,54 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import { AgentConfigFileClusterProperties } from 'teleterm/mainProcess/createAgentConfigFile';
+import { DeepLinkParseResult } from 'teleterm/deepLinks';
+import { CreateAgentConfigFileArgs } from 'teleterm/mainProcess/createAgentConfigFile';
+import { FileStorage } from 'teleterm/services/fileStorage';
+import { Document } from 'teleterm/ui/services/workspacesService';
 import { RootClusterUri } from 'teleterm/ui/uri';
 
-import { Kind } from 'teleterm/ui/services/workspacesService';
-import { FileStorage } from 'teleterm/services/fileStorage';
-
 import { ConfigService } from '../services/config';
+import { Shell } from './shell';
 
 export type RuntimeSettings = {
+  /**
+   * dev controls whether the app runs in development mode. This mostly controls what kind of URL
+   * the Electron app opens after launching and affects the expectations of the app wrt the
+   * environment its being executed in.
+   */
   dev: boolean;
+  /**
+   * debug controls the level of logs emitted by tshd and gates access to devtools. In a packaged
+   * app it's false by default, but it can be enabled by executing the packaged app with the
+   * --connect-debug flag.
+   *
+   * dev implies debug.
+   */
+  debug: boolean;
+  /**
+   * insecure controls whether tsh invocations and Connect My Computer agents are run in insecure
+   * mode. This typically skips the cert checks when talking to the proxy.
+   *
+   * False by default in both packaged apps and in development mode. It can be turned on by:
+   * - Starting a packaged version of the app with the --insecure flag.
+   * - Starting the app in dev mode with the CONNECT_INSECURE env var.
+   */
+  insecure: boolean;
   userDataDir: string;
   sessionDataDir: string;
   tempDataDir: string;
@@ -35,15 +60,15 @@ export type RuntimeSettings = {
   // Before switching to the recommended path, we need to investigate the impact of this change.
   // https://www.electronjs.org/docs/latest/api/app#appgetpathname
   logsDir: string;
-  defaultShell: string;
+  /** Identifier of default OS shell. */
+  defaultOsShellId: string;
+  availableShells: Shell[];
   platform: Platform;
   agentBinaryPath: string;
   tshd: {
-    insecure: boolean;
     requestedNetworkAddress: string;
     binaryPath: string;
     homeDir: string;
-    flags: string[];
   };
   sharedProcess: {
     requestedNetworkAddress: string;
@@ -65,6 +90,24 @@ export type RuntimeSettings = {
 };
 
 export type MainProcessClient = {
+  /** Subscribes to updates of the native theme. Returns a cleanup function. */
+  subscribeToNativeThemeUpdate: (
+    listener: (value: { shouldUseDarkColors: boolean }) => void
+  ) => {
+    cleanup: () => void;
+  };
+  subscribeToAgentUpdate: (
+    rootClusterUri: RootClusterUri,
+    listener: (state: AgentProcessState) => void
+  ) => {
+    cleanup: () => void;
+  };
+  subscribeToDeepLinkLaunch: (
+    listener: (args: DeepLinkParseResult) => void
+  ) => {
+    cleanup: () => void;
+  };
+
   getRuntimeSettings(): RuntimeSettings;
   getResolvedChildProcessAddresses(): Promise<ChildProcessAddresses>;
   openTerminalContextMenu(): void;
@@ -93,16 +136,9 @@ export type MainProcessClient = {
   /** Opens config file and returns a path to it. */
   openConfigFile(): Promise<string>;
   shouldUseDarkColors(): boolean;
-  /** Subscribes to updates of the native theme. Returns a cleanup function. */
-  subscribeToNativeThemeUpdate: (
-    listener: (value: { shouldUseDarkColors: boolean }) => void
-  ) => {
-    cleanup: () => void;
-  };
   downloadAgent(): Promise<void>;
-  createAgentConfigFile(
-    properties: AgentConfigFileClusterProperties
-  ): Promise<void>;
+  verifyAgent(): Promise<void>;
+  createAgentConfigFile(args: CreateAgentConfigFileArgs): Promise<void>;
   openAgentLogsDirectory(args: {
     rootClusterUri: RootClusterUri;
   }): Promise<void>;
@@ -112,16 +148,17 @@ export type MainProcessClient = {
   }): Promise<boolean>;
   killAgent(args: { rootClusterUri: RootClusterUri }): Promise<void>;
   removeAgentDirectory(args: { rootClusterUri: RootClusterUri }): Promise<void>;
+  /**
+   * tryRemoveConnectMyComputerAgentBinary removes the agent binary but only if all agents are
+   * stopped.
+   *
+   * Rejects on filesystem errors.
+   */
+  tryRemoveConnectMyComputerAgentBinary(): Promise<void>;
   getAgentState(args: { rootClusterUri: RootClusterUri }): AgentProcessState;
   getAgentLogs(args: { rootClusterUri: RootClusterUri }): string;
-  subscribeToAgentUpdate: SubscribeToAgentUpdate;
-};
-
-export type SubscribeToAgentUpdate = (
-  rootClusterUri: RootClusterUri,
-  listener: (state: AgentProcessState) => void
-) => {
-  cleanup: () => void;
+  signalUserInterfaceReadiness(args: { success: boolean }): void;
+  refreshClusterList(): void;
 };
 
 export type ChildProcessAddresses = {
@@ -172,15 +209,12 @@ export interface ClusterContextMenuOptions {
 }
 
 export interface TabContextMenuOptions {
-  documentKind: Kind;
-
+  document: Document;
   onClose(): void;
-
   onCloseOthers(): void;
-
   onCloseToRight(): void;
-
   onDuplicatePty(): void;
+  onReopenPtyInShell(shell: Shell): void;
 }
 
 export const TerminalContextMenuEventChannel =
@@ -194,6 +228,7 @@ export enum TabContextMenuEventType {
   CloseOthers = 'CloseOthers',
   CloseToRight = 'CloseToRight',
   DuplicatePty = 'DuplicatePty',
+  ReopenPtyInShell = 'ReopenPtyInShell',
 }
 
 export enum ConfigServiceEventType {
@@ -208,5 +243,46 @@ export enum FileStorageEventType {
   Write = 'Write',
   Replace = 'Replace',
   GetFilePath = 'GetFilePath',
+  GetFileName = 'GetFileName',
   GetFileLoadingError = 'GetFileLoadingError',
 }
+
+/*
+ * IPC channel enums
+ *
+ * The enum values are used as IPC channels [1], so they should be unique across all enums. That's
+ * why the values are prefixed with the recipient name.
+ *
+ * The enums are grouped by the recipient, e.g. RendererIpc contains messages sent from the main
+ * process to the renderer, WindowsManagerIpc contains messages sent from the renderer to the
+ * windows manager (which lives in the main process).
+ *
+ * [1] https://www.electronjs.org/docs/latest/tutorial/ipc
+ */
+
+export enum RendererIpc {
+  NativeThemeUpdate = 'renderer-native-theme-update',
+  ConnectMyComputerAgentUpdate = 'renderer-connect-my-computer-agent-update',
+  DeepLinkLaunch = 'renderer-deep-link-launch',
+}
+
+export enum MainProcessIpc {
+  GetRuntimeSettings = 'main-process-get-runtime-settings',
+  TryRemoveConnectMyComputerAgentBinary = 'main-process-try-remove-connect-my-computer-agent-binary',
+  RefreshClusterList = 'main-process-refresh-cluster-list',
+  DownloadConnectMyComputerAgent = 'main-process-connect-my-computer-download-agent',
+  VerifyConnectMyComputerAgent = 'main-process-connect-my-computer-verify-agent',
+}
+
+export enum WindowsManagerIpc {
+  SignalUserInterfaceReadiness = 'windows-manager-signal-user-interface-readiness',
+}
+
+/**
+ * A custom message to gracefully quit a process.
+ * It is sent to the child process with `process.send`.
+ *
+ * We need this because `process.kill('SIGTERM')` doesn't work on Windows,
+ * so we couldn't run any cleanup logic.
+ */
+export const TERMINATE_MESSAGE = 'TERMINATE_MESSAGE';

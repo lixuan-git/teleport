@@ -1,36 +1,40 @@
 /**
- * Copyright 2023 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React, { useState, useEffect } from 'react';
+import { useEffect, useState } from 'react';
+
+import { Alert, Box, Indicator } from 'design';
 import useAttempt from 'shared/hooks/useAttemptNext';
-import { Indicator, Box, Alert } from 'design';
 
 import {
   FeatureBox,
   FeatureHeader,
   FeatureHeaderTitle,
 } from 'teleport/components/Layout';
+import {
+  integrationService,
+  type Integration,
+} from 'teleport/services/integrations';
 import useTeleport from 'teleport/useTeleport';
-import { integrationService } from 'teleport/services/integrations';
 
-import { IntegrationsAddButton } from './IntegrationsAddButton';
 import { IntegrationList } from './IntegrationList';
-import { useIntegrationOperation, IntegrationOperations } from './Operations';
-
-import type { Integration } from 'teleport/services/integrations';
+import { IntegrationsAddButton } from './IntegrationsAddButton';
+import { IntegrationOperations, useIntegrationOperation } from './Operations';
 import type { EditableIntegrationFields } from './Operations/useIntegrationOperation';
 
 export function Integrations() {
@@ -39,7 +43,6 @@ export function Integrations() {
   const { attempt, run } = useAttempt('processing');
 
   const ctx = useTeleport();
-  const canCreateIntegrations = ctx.storeUser.getIntegrationsAccess().create;
 
   useEffect(() => {
     // TODO(lisa): handle paginating as a follow up polish.
@@ -59,8 +62,11 @@ export function Integrations() {
     });
   }
 
-  function editIntegration(req: EditableIntegrationFields) {
-    return integrationOps.edit(req).then(updatedIntegration => {
+  function editIntegration(
+    integration: Integration,
+    req: EditableIntegrationFields
+  ) {
+    return integrationOps.edit(integration, req).then(updatedIntegration => {
       const updatedItems = items.map(item => {
         if (item.name == integrationOps.item.name) {
           return updatedIntegration;
@@ -75,9 +81,16 @@ export function Integrations() {
   return (
     <>
       <FeatureBox>
-        <FeatureHeader>
+        <FeatureHeader justifyContent="space-between">
           <FeatureHeaderTitle>Integrations</FeatureHeaderTitle>
-          <IntegrationsAddButton canCreate={canCreateIntegrations} />
+          <IntegrationsAddButton
+            requiredPermissions={[
+              {
+                value: ctx.storeUser.getIntegrationsAccess().create,
+                label: 'integration.create',
+              },
+            ]}
+          />
         </FeatureHeader>
         {attempt.status === 'failed' && <Alert children={attempt.statusText} />}
         {attempt.status === 'processing' && (

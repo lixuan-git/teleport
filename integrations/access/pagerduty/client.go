@@ -1,18 +1,20 @@
 /*
-Copyright 2020-2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package pagerduty
 
@@ -41,7 +43,7 @@ const (
 	pdHTTPTimeout = 10 * time.Second
 	pdListLimit   = uint(100)
 
-	pdIncidentKeyPrefix = "teleport-access-request"
+	PdIncidentKeyPrefix = "teleport-access-request"
 
 	pdStatusUpdateTimeout time.Duration = 10 * time.Second
 )
@@ -87,6 +89,7 @@ func NewPagerdutyClient(conf PagerdutyConfig, clusterName, webProxyAddr string, 
 		Transport: &http.Transport{
 			MaxConnsPerHost:     pdMaxConns,
 			MaxIdleConnsPerHost: pdMaxConns,
+			Proxy:               http.ProxyFromEnvironment,
 		}}).
 		SetBaseURL(conf.APIEndpoint).
 		SetHeader("Accept", "application/vnd.pagerduty+json;version=2").
@@ -119,7 +122,7 @@ func onAfterPagerDutyResponse(sink common.StatusSink) resty.ResponseMiddleware {
 		defer cancel()
 
 		if err := sink.Emit(ctx, status); err != nil {
-			log.WithError(err).Errorf("Error while emitting PagerDuty plugin status: %v", err)
+			log.ErrorContext(ctx, "Error while emitting PagerDuty plugin status", "error", err)
 		}
 
 		if resp.IsError() {
@@ -165,7 +168,7 @@ func (p Pagerduty) CreateIncident(ctx context.Context, serviceID, reqID string, 
 	}
 	body := IncidentBody{
 		Title:       fmt.Sprintf("Access request from %s", reqData.User),
-		IncidentKey: fmt.Sprintf("%s/%s", pdIncidentKeyPrefix, reqID),
+		IncidentKey: fmt.Sprintf("%s/%s", PdIncidentKeyPrefix, reqID),
 		Service: Reference{
 			Type: "service_reference",
 			ID:   serviceID,
@@ -285,7 +288,7 @@ func (p *Pagerduty) FindUserByEmail(ctx context.Context, userEmail string) (User
 	}
 
 	if len(result.Users) > 0 && result.More {
-		logger.Get(ctx).Warningf("PagerDuty returned too many results when querying by email %q", userEmail)
+		logger.Get(ctx).WarnContext(ctx, "PagerDuty returned too many results when querying user email", "email", userEmail)
 	}
 
 	return User{}, trace.NotFound("failed to find pagerduty user by email %s", userEmail)
@@ -384,10 +387,10 @@ func (p *Pagerduty) FilterOnCallPolicies(ctx context.Context, userID string, esc
 
 	if len(filteredIDSet) == 0 {
 		if anyData {
-			logger.Get(ctx).WithFields(logger.Fields{
-				"pd_user_id":               userID,
-				"pd_escalation_policy_ids": escalationPolicyIDs,
-			}).Warningf("PagerDuty returned some oncalls array but none of them matched the query")
+			logger.Get(ctx).WarnContext(ctx, "PagerDuty returned some oncalls array but none of them matched the query",
+				"pd_user_id", userID,
+				"pd_escalation_policy_ids", escalationPolicyIDs,
+			)
 		}
 
 		return nil, nil

@@ -1,33 +1,51 @@
-/*
-Copyright 2022 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+import React from 'react';
 
-    http://www.apache.org/licenses/LICENSE-2.0
+import { Action } from 'design/Alert';
+import { IconProps } from 'design/Icon/Icon';
 
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+export type NotificationSeverity =
+  | 'info'
+  | 'warn'
+  | 'error'
+  | 'success'
+  | 'neutral';
 
 export interface NotificationItem {
   content: NotificationItemContent;
-  severity: 'info' | 'warn' | 'error';
+  severity: NotificationSeverity;
   id: string;
 }
 
 export type NotificationItemContent = string | NotificationItemObjectContent;
 
 export type NotificationItemObjectContent = {
-  title: string;
+  title?: string;
+  subtitle?: string;
   list?: string[];
   description?: string;
-  link?: {
-    href: string;
-    text: string;
-  };
+  icon?: React.ComponentType<IconProps>;
+  action?: Action;
+  /**
+   * If defined, isAutoRemovable circumvents the auto-removing logic in the Notification component,
+   * which automatically removes 'success', 'info', and 'neutral' notifications.
+   */
+  isAutoRemovable?: boolean;
 };

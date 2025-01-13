@@ -69,11 +69,22 @@ type AuditEvent interface {
 	GetClusterName() string
 	// SetClusterName sets the name of the teleport cluster on the event.
 	SetClusterName(string)
+
+	// TrimToMaxSize returns a copy of the event trimmed to a smaller
+	// size. The desired size may not be achievable so callers
+	// should always check the size of the returned event before
+	// using it. Generally fields that are unique to the event
+	// will be trimmed, other fields are not currently modified
+	// (ie *Metadata messages).
+	TrimToMaxSize(maxSizeBytes int) AuditEvent
 }
 
 // Emitter emits audit events.
 type Emitter interface {
 	// EmitAuditEvent emits a single audit event.
+	//
+	// NOTE: when implementing this interface, the context should have
+	// its cancel stripped via `context.WithoutCancel`
 	EmitAuditEvent(context.Context, AuditEvent) error
 }
 

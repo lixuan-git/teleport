@@ -1,26 +1,33 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
 import (
 	"testing"
+	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/testing/protocmp"
 
+	headerv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/header/v1"
+	"github.com/gravitational/teleport/api/gen/proto/go/teleport/vnet/v1"
 	"github.com/gravitational/teleport/api/types"
 )
 
@@ -165,6 +172,11 @@ func TestParseShortcut(t *testing.T) {
 
 		"SamL_IDP_sERVICe_proVidER": {expectedOutput: types.KindSAMLIdPServiceProvider},
 
+		"access_request":  {expectedOutput: types.KindAccessRequest},
+		"access_requests": {expectedOutput: types.KindAccessRequest},
+		"accessrequest":   {expectedOutput: types.KindAccessRequest},
+		"accessrequests":  {expectedOutput: types.KindAccessRequest},
+
 		"unknown_type": {expectedErr: true},
 	}
 
@@ -234,6 +246,53 @@ func Test_setResourceName(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			result := setResourceName(tt.overrideLabels, tt.meta, tt.firstNamePart, tt.extraNameParts...)
 			require.Equal(t, tt.want, result)
+		})
+	}
+}
+
+func TestProtoResourceRoundtrip(t *testing.T) {
+	t.Parallel()
+
+	resource := &vnet.VnetConfig{
+		Metadata: &headerv1.Metadata{
+			Name: "vnet_config",
+		},
+		Spec: &vnet.VnetConfigSpec{
+			Ipv4CidrRange: "100.64.0.0/10",
+		},
+	}
+
+	for _, tc := range []struct {
+		desc          string
+		marshalFunc   func(*vnet.VnetConfig, ...MarshalOption) ([]byte, error)
+		unmarshalFunc func([]byte, ...MarshalOption) (*vnet.VnetConfig, error)
+	}{
+		{
+			desc:          "deprecated",
+			marshalFunc:   FastMarshalProtoResourceDeprecated[*vnet.VnetConfig],
+			unmarshalFunc: FastUnmarshalProtoResourceDeprecated[*vnet.VnetConfig],
+		},
+		{
+			desc:          "new",
+			marshalFunc:   MarshalProtoResource[*vnet.VnetConfig],
+			unmarshalFunc: UnmarshalProtoResource[*vnet.VnetConfig],
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			marshaled, err := tc.marshalFunc(resource)
+			require.NoError(t, err)
+
+			unmarshalled, err := tc.unmarshalFunc(marshaled)
+			require.NoError(t, err)
+			require.Empty(t, cmp.Diff(resource, unmarshalled, protocmp.Transform()))
+
+			revision := "123"
+			expires := time.Now()
+			unmarshalled, err = tc.unmarshalFunc(marshaled,
+				WithRevision(revision), WithExpires(expires))
+			require.NoError(t, err)
+			require.Equal(t, revision, unmarshalled.GetMetadata().GetRevision())
+			require.WithinDuration(t, expires, unmarshalled.GetMetadata().GetExpires().AsTime(), time.Millisecond)
 		})
 	}
 }

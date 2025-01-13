@@ -1,29 +1,32 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package common
 
 import (
 	"context"
+	"log/slog"
+	"maps"
 	"sync"
 	"time"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/gravitational/teleport/api/types"
@@ -33,14 +36,21 @@ const (
 	concurrencyLimit = 5
 )
 
+const (
+	// DefaultDiscoveryPollInterval is the default interval that Discovery Services fetches resources.
+	DefaultDiscoveryPollInterval = 5 * time.Minute
+)
+
 // WatcherConfig is the common discovery watcher configuration.
 type WatcherConfig struct {
-	// Fetchers holds fetchers used for this watcher.
-	Fetchers []Fetcher
+	// FetchersFn is a function that returns the fetchers used for this watcher.
+	FetchersFn func() []Fetcher
 	// Interval is the interval between fetches.
 	Interval time.Duration
-	// Log is the watcher logger.
-	Log logrus.FieldLogger
+	// TriggerFetchC can be used to force an instant Poll, instead of waiting for the next poll Interval.
+	TriggerFetchC chan struct{}
+	// Logger is the watcher logger.
+	Logger *slog.Logger
 	// Clock is used to control time.
 	Clock clockwork.Clock
 	// DiscoveryGroup is the name of the discovery group that the current
@@ -53,20 +63,25 @@ type WatcherConfig struct {
 	DiscoveryGroup string
 	// Origin is used to specify what type of origin watcher's resources are
 	Origin string
+	// PreFetchHookFn is called before starting a new fetch cycle.
+	PreFetchHookFn func()
 }
 
 // CheckAndSetDefaults validates the config.
 func (c *WatcherConfig) CheckAndSetDefaults() error {
 	if c.Interval == 0 {
-		c.Interval = 5 * time.Minute
+		c.Interval = DefaultDiscoveryPollInterval
 	}
-	if c.Log == nil {
-		c.Log = logrus.New()
+	if c.TriggerFetchC == nil {
+		c.TriggerFetchC = make(chan struct{})
+	}
+	if c.Logger == nil {
+		c.Logger = slog.Default()
 	}
 	if c.Clock == nil {
 		c.Clock = clockwork.NewRealClock()
 	}
-	if len(c.Fetchers) == 0 {
+	if c.FetchersFn == nil {
 		return trace.NotFound("missing fetchers")
 	}
 	if c.Origin == "" {
@@ -90,6 +105,7 @@ func NewWatcher(ctx context.Context, config WatcherConfig) (*Watcher, error) {
 	if err := config.CheckAndSetDefaults(); err != nil {
 		return nil, trace.Wrap(err)
 	}
+
 	return &Watcher{
 		cfg:        config,
 		ctx:        ctx,
@@ -99,16 +115,27 @@ func NewWatcher(ctx context.Context, config WatcherConfig) (*Watcher, error) {
 
 // Start starts fetching cloud resources and sending them to the channel.
 func (w *Watcher) Start() {
-	ticker := w.cfg.Clock.NewTicker(w.cfg.Interval)
-	defer ticker.Stop()
-	w.cfg.Log.Infof("Starting watcher.")
+	pollTimer := w.cfg.Clock.NewTimer(w.cfg.Interval)
+	defer pollTimer.Stop()
+	w.cfg.Logger.InfoContext(w.ctx, "Starting watcher")
 	w.fetchAndSend()
 	for {
 		select {
-		case <-ticker.Chan():
+		case <-pollTimer.Chan():
 			w.fetchAndSend()
+			pollTimer.Reset(w.cfg.Interval)
+
+		case <-w.cfg.TriggerFetchC:
+			w.fetchAndSend()
+
+			// stop and drain timer
+			if !pollTimer.Stop() {
+				<-pollTimer.Chan()
+			}
+			pollTimer.Reset(w.cfg.Interval)
+
 		case <-w.ctx.Done():
-			w.cfg.Log.Infof("Watcher done.")
+			w.cfg.Logger.InfoContext(w.ctx, "Watcher done")
 			return
 		}
 	}
@@ -116,13 +143,17 @@ func (w *Watcher) Start() {
 
 // fetchAndSend fetches resources from all fetchers and sends them to the channel.
 func (w *Watcher) fetchAndSend() {
+	if w.cfg.PreFetchHookFn != nil {
+		w.cfg.PreFetchHookFn()
+	}
+
 	var (
 		newFetcherResources = make(types.ResourcesWithLabels, 0, 50)
 		fetchersLock        sync.Mutex
 		group, groupCtx     = errgroup.WithContext(w.ctx)
 	)
 	group.SetLimit(concurrencyLimit)
-	for _, fetcher := range w.cfg.Fetchers {
+	for _, fetcher := range w.cfg.FetchersFn() {
 		lFetcher := fetcher
 
 		group.Go(func() error {
@@ -132,12 +163,40 @@ func (w *Watcher) fetchAndSend() {
 				// not others. This is acceptable, so make a debug log instead
 				// of a warning.
 				if trace.IsAccessDenied(err) || trace.IsNotFound(err) {
-					w.cfg.Log.WithError(err).WithField("fetcher", lFetcher).Debugf("Skipped fetcher for %s at %s.", lFetcher.ResourceType(), lFetcher.Cloud())
+					w.cfg.Logger.DebugContext(groupCtx, "Skipped fetcher for resources", "error", err, "fetcher", lFetcher, "resource", lFetcher.ResourceType(), "cloud", lFetcher.Cloud())
 				} else {
-					w.cfg.Log.WithError(err).WithField("fetcher", lFetcher).Warnf("Unable to fetch resources for %s at %s.", lFetcher.ResourceType(), lFetcher.Cloud())
+					w.cfg.Logger.WarnContext(groupCtx, "Unable to fetch resources", "error", err, "fetcher", lFetcher, "resource", lFetcher.ResourceType(), "cloud", lFetcher.Cloud())
 				}
 				// never return the error otherwise it will impact other watchers.
 				return nil
+			}
+
+			fetcherLabels := make(map[string]string, 0)
+
+			if lFetcher.IntegrationName() != "" {
+				// Add the integration name to the static labels for each resource.
+				fetcherLabels[types.TeleportInternalDiscoveryIntegrationName] = lFetcher.IntegrationName()
+			}
+			if lFetcher.GetDiscoveryConfigName() != "" {
+				// Add the discovery config name to the static labels of each resource.
+				fetcherLabels[types.TeleportInternalDiscoveryConfigName] = lFetcher.GetDiscoveryConfigName()
+			}
+
+			if w.cfg.DiscoveryGroup != "" {
+				// Add the discovery group name to the static labels of each resource.
+				fetcherLabels[types.TeleportInternalDiscoveryGroupName] = w.cfg.DiscoveryGroup
+			}
+
+			// Set the discovery type label to provide information about the
+			// matcher type that matched the resource.
+			if t := lFetcher.FetcherType(); t != "" {
+				fetcherLabels[types.DiscoveryTypeLabel] = t
+			}
+
+			// Set the origin label to provide information where resource comes from
+			fetcherLabels[types.OriginLabel] = w.cfg.Origin
+			if c := lFetcher.Cloud(); c != "" {
+				fetcherLabels[types.CloudLabel] = c
 			}
 
 			for _, r := range resources {
@@ -146,17 +205,7 @@ func (w *Watcher) fetchAndSend() {
 					staticLabels = make(map[string]string)
 				}
 
-				if w.cfg.DiscoveryGroup != "" {
-					// Add the discovery group name to the static labels of each resource.
-					staticLabels[types.TeleportInternalDiscoveryGroupName] = w.cfg.DiscoveryGroup
-				}
-
-				// Set the origin label to provide information where resource comes from
-				staticLabels[types.OriginLabel] = w.cfg.Origin
-				if c := lFetcher.Cloud(); c != "" {
-					staticLabels[types.CloudLabel] = c
-				}
-
+				maps.Copy(staticLabels, fetcherLabels)
 				r.SetStaticLabels(staticLabels)
 			}
 
@@ -178,4 +227,12 @@ func (w *Watcher) fetchAndSend() {
 // Resources returns a channel that receives fetched cloud resources.
 func (w *Watcher) ResourcesC() <-chan types.ResourcesWithLabels {
 	return w.resourcesC
+}
+
+// StaticFetchers converts a list of Fetchers into a function that returns them.
+// Used to convert a static set of Fetchers into a FetchersFn generator.
+func StaticFetchers(fs []Fetcher) func() []Fetcher {
+	return func() []Fetcher {
+		return fs
+	}
 }

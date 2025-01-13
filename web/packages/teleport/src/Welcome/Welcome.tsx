@@ -1,39 +1,52 @@
-/*
-Copyright 2021 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React from 'react';
-
-import { WelcomeWrapper } from 'design/Onboard/WelcomeWrapper';
-
-import { Route, Switch, useParams } from 'teleport/components/Router';
-import history from 'teleport/services/history';
+import { WelcomeWrapper } from 'teleport/components/Onboard';
+import {
+  Route,
+  Switch,
+  useLocation,
+  useParams,
+} from 'teleport/components/Router';
 import cfg from 'teleport/config';
+import history from 'teleport/services/history';
 import { NewCredentialsContainerProps } from 'teleport/Welcome/NewCredentials';
 
 import { CardWelcome } from './CardWelcome';
+import { CLOUD_INVITE_URL_PARAM } from './const';
 
 type WelcomeProps = {
   NewCredentials: (props: NewCredentialsContainerProps) => JSX.Element;
 };
 
-export default function Welcome({ NewCredentials }: WelcomeProps) {
+export function Welcome({ NewCredentials }: WelcomeProps) {
   const { tokenId } = useParams<{ tokenId: string }>();
+  const { search } = useLocation();
 
   const handleOnInviteContinue = () => {
-    history.push(cfg.getUserInviteTokenContinueRoute(tokenId));
+    // We need to pass through the `invite` query parameter (if it exists) to
+    // render the invite collaborators form for Cloud users.
+    let suffix = '';
+    if (new URLSearchParams(search).has(CLOUD_INVITE_URL_PARAM)) {
+      suffix = `?${CLOUD_INVITE_URL_PARAM}`;
+    }
+
+    history.push(`${cfg.getUserInviteTokenContinueRoute(tokenId)}${suffix}`);
   };
 
   const handleOnResetContinue = () => {

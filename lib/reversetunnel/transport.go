@@ -1,18 +1,20 @@
 /*
-Copyright 2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package reversetunnel
 
@@ -21,12 +23,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"time"
 
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
 
 	"github.com/gravitational/teleport"
@@ -34,8 +36,9 @@ import (
 	"github.com/gravitational/teleport/api/types"
 	apievents "github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/api/utils/sshutils"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/multiplexer"
+	"github.com/gravitational/teleport/lib/proxy"
 	"github.com/gravitational/teleport/lib/reversetunnelclient"
 	"github.com/gravitational/teleport/lib/utils"
 )
@@ -58,9 +61,9 @@ func parseDialReq(payload []byte) *sshutils.DialReq {
 // transport is used to build a connection to the target host.
 type transport struct {
 	component    string
-	log          logrus.FieldLogger
+	logger       *slog.Logger
 	closeContext context.Context
-	authClient   auth.ProxyAccessPoint
+	authClient   authclient.ProxyAccessPoint
 	authServers  []string
 	channel      ssh.Channel
 	requestCh    <-chan *ssh.Request
@@ -93,6 +96,9 @@ type transport struct {
 	// preventing users connecting to the proxy tunnel listener spoofing their address; but we are still able to
 	// correctly propagate client address in reverse tunnel agents of nodes/services.
 	forwardClientAddress bool
+
+	// trackUserConnection is an optional mechanism used to count active user sessions.
+	trackUserConnection func() (release func())
 }
 
 // start will start the transporting data over the tunnel. This function will
@@ -120,7 +126,7 @@ func (p *transport) start() {
 			return
 		}
 	case <-time.After(apidefaults.DefaultIOTimeout):
-		p.log.Warnf("Transport request failed: timed out waiting for request.")
+		p.logger.WarnContext(p.closeContext, "Transport request failed: timed out waiting for request")
 		return
 	}
 
@@ -134,8 +140,12 @@ func (p *transport) start() {
 	if !p.forwardClientAddress {
 		// This shouldn't happen in normal operation. Either malicious user or misconfigured client.
 		if dreq.ClientSrcAddr != "" || dreq.ClientDstAddr != "" {
-			p.log.Warnf("Received unexpected dial request with client source address %q, "+
-				"client destination address %q, when they should be empty.", dreq.ClientSrcAddr, dreq.ClientDstAddr)
+			const msg = "Received unexpected dial request with client source address and " +
+				"client destination address populated, when they should be empty."
+			p.logger.WarnContext(p.closeContext, msg,
+				"client_src_addr", dreq.ClientSrcAddr,
+				"client_dest_addr", dreq.ClientDstAddr,
+			)
 		}
 
 		// Make sure address fields are overwritten.
@@ -148,7 +158,11 @@ func (p *transport) start() {
 		}
 	}
 
-	p.log.Debugf("Received out-of-band proxy transport request for %v [%v], from %v.", dreq.Address, dreq.ServerID, dreq.ClientSrcAddr)
+	p.logger.DebugContext(p.closeContext, "Received out-of-band proxy transport request",
+		"target_address", dreq.Address,
+		"target_server_id", dreq.ServerID,
+		"client_addr", dreq.ClientSrcAddr,
+	)
 
 	// directAddress will hold the address of the node to dial to, if we don't
 	// have a tunnel for it.
@@ -159,7 +173,7 @@ func (p *transport) start() {
 	// Connect to an Auth Server.
 	case reversetunnelclient.RemoteAuthServer:
 		if len(p.authServers) == 0 {
-			p.log.Errorf("connection rejected: no auth servers configured")
+			p.logger.ErrorContext(p.closeContext, "connection rejected: no auth servers configured")
 			p.reply(req, false, []byte("no auth servers configured"))
 
 			return
@@ -184,11 +198,14 @@ func (p *transport) start() {
 				return
 			}
 			if err := req.Reply(true, []byte("Connected.")); err != nil {
-				p.log.Errorf("Failed responding OK to %q request: %v", req.Type, err)
+				p.logger.ErrorContext(p.closeContext, "Failed responding OK to request",
+					"request_type", req.Type,
+					"error", err,
+				)
 				return
 			}
 
-			p.log.Debug("Handing off connection to a local kubernetes service")
+			p.logger.DebugContext(p.closeContext, "Handing off connection to a local kubernetes service")
 
 			// If dreq has ClientSrcAddr we wrap connection
 			var clientConn net.Conn = sshutils.NewChConn(p.sconn, p.channel)
@@ -205,7 +222,7 @@ func (p *transport) start() {
 				p.reply(req, false, []byte("connection rejected: configure kubernetes proxy for this cluster."))
 				return
 			}
-			p.log.Debugf("Forwarding connection to %q", p.kubeDialAddr.Addr)
+			p.logger.DebugContext(p.closeContext, "Forwarding connection to kubernetes proxy", "kube_proxy_addr", p.kubeDialAddr.Addr)
 			directAddress = p.kubeDialAddr.Addr
 		}
 
@@ -221,17 +238,20 @@ func (p *transport) start() {
 
 		if p.server != nil {
 			if p.sconn == nil {
-				p.log.Debug("Connection rejected: server connection missing")
+				p.logger.DebugContext(p.closeContext, "Connection rejected: server connection missing")
 				p.reply(req, false, []byte("connection rejected: server connection missing"))
 				return
 			}
 
 			if err := req.Reply(true, []byte("Connected.")); err != nil {
-				p.log.Errorf("Failed responding OK to %q request: %v", req.Type, err)
+				p.logger.ErrorContext(p.closeContext, "Failed responding OK to request",
+					"request_type", req.Type,
+					"error", err,
+				)
 				return
 			}
 
-			p.log.Debugf("Handing off connection to a local %q service.", dreq.ConnType)
+			p.logger.DebugContext(p.closeContext, "Handing off connection to a local service.", "conn_type", dreq.ConnType)
 
 			// If dreq has ClientSrcAddr we wrap connection
 			var clientConn net.Conn = sshutils.NewChConn(p.sconn, p.channel)
@@ -246,6 +266,10 @@ func (p *transport) start() {
 		// tunnel from the SSH node by dreq.ServerID. We'll need to forward
 		// dreq.Address as well.
 		directAddress = dreq.Address
+
+		if p.trackUserConnection != nil {
+			defer p.trackUserConnection()()
+		}
 	default:
 		// Not a special address; could be empty.
 		directAddress = dreq.Address
@@ -284,13 +308,19 @@ func (p *transport) start() {
 
 	// Dial was successful.
 	if err := req.Reply(true, []byte("Connected.")); err != nil {
-		p.log.Errorf("Failed responding OK to %q request: %v", req.Type, err)
+		p.logger.ErrorContext(p.closeContext, "Failed responding OK to request",
+			"request_type", req.Type,
+			"error", err,
+		)
 		if err := conn.Close(); err != nil {
-			p.log.Errorf("Failed closing connection: %v", err)
+			p.logger.ErrorContext(p.closeContext, "Failed closing connection", "error", err)
 		}
 		return
 	}
-	p.log.Debugf("Successfully dialed to %v %q, start proxying.", dreq.Address, dreq.ServerID)
+	p.logger.DebugContext(p.closeContext, "Successfully dialed to target, starting to proxy",
+		"target_addr", dreq.Address,
+		"target_server_id", dreq.ServerID,
+	)
 
 	// Start processing channel requests. Pass in a context that wraps the passed
 	// in context with a context that closes when this function returns to
@@ -304,9 +334,9 @@ func (p *transport) start() {
 	if len(signedHeader) > 0 {
 		_, err = conn.Write(signedHeader)
 		if err != nil {
-			p.log.Errorf("Could not write PROXY header to the connection: %v", err)
+			p.logger.ErrorContext(p.closeContext, "Could not write PROXY header to the connection", "error", err)
 			if err := conn.Close(); err != nil {
-				p.log.Errorf("Failed closing connection: %v", err)
+				p.logger.ErrorContext(p.closeContext, "Failed closing connection", "error", err)
 			}
 			return
 		}
@@ -332,7 +362,7 @@ func (p *transport) start() {
 		select {
 		case <-errorCh:
 		case <-p.closeContext.Done():
-			p.log.Warnf("Proxy transport failed: closing context.")
+			p.logger.WarnContext(p.closeContext, "Proxy transport failed: closing context")
 			return
 		}
 	}
@@ -365,7 +395,7 @@ func (p *transport) handleChannelRequests(closeContext context.Context, useTunne
 func (p *transport) getConn(addr string, r *sshutils.DialReq) (net.Conn, bool, error) {
 	// This function doesn't attempt to dial if a host with one of the
 	// search names is not registered. It's a fast check.
-	p.log.Debugf("Attempting to dial through tunnel with server ID %q.", r.ServerID)
+	p.logger.DebugContext(p.closeContext, "Attempting to dial server through tunnel", "target_server_id", r.ServerID)
 	conn, err := p.tunnelDial(r)
 	if err != nil {
 		if !trace.IsNotFound(err) {
@@ -384,17 +414,31 @@ func (p *transport) getConn(addr string, r *sshutils.DialReq) (net.Conn, bool, e
 		}
 
 		errTun := err
-		p.log.Debugf("Attempting to dial directly %q.", addr)
+		p.logger.DebugContext(p.closeContext, "Attempting to dial server directly", "target_addr", addr)
 		conn, err = p.directDial(addr)
 		if err != nil {
 			return nil, false, trace.ConnectionProblem(err, "failed dialing through tunnel (%v) or directly (%v)", errTun, err)
 		}
 
-		p.log.Debugf("Returning direct dialed connection to %q.", addr)
+		p.logger.DebugContext(p.closeContext, "Returning direct dialed connection", "target_addr", addr)
+
+		// Requests to get a connection to the remote auth server do not provide a ConnType,
+		// and since an empty ConnType is converted to [types.NodeTunnel] in CheckAndSetDefaults,
+		// we need to check the address of the request to prevent auth connections from being
+		// counted as a proxied ssh session.
+		if r.ConnType == types.NodeTunnel && r.Address != reversetunnelclient.RemoteAuthServer {
+			return proxy.NewProxiedMetricConn(conn), false, nil
+		}
+
 		return conn, false, nil
 	}
 
-	p.log.Debugf("Returning connection dialed through tunnel with server ID %v.", r.ServerID)
+	p.logger.DebugContext(p.closeContext, "Returning connection to server dialed through tunnel", "target_server_id", r.ServerID)
+
+	if r.ConnType == types.NodeTunnel {
+		return proxy.NewProxiedMetricConn(conn), true, nil
+	}
+
 	return conn, true, nil
 }
 
@@ -425,10 +469,10 @@ func (p *transport) tunnelDial(r *sshutils.DialReq) (net.Conn, error) {
 
 func (p *transport) reply(req *ssh.Request, ok bool, msg []byte) {
 	if !ok {
-		p.log.Debugf("Non-ok reply to %q request: %s", req.Type, msg)
+		p.logger.DebugContext(p.closeContext, "Non-ok reply to request", "request_type", req.Type, "error", string(msg))
 	}
 	if err := req.Reply(ok, msg); err != nil {
-		p.log.Warnf("Failed sending reply to %q request on SSH channel: %v", req.Type, err)
+		p.logger.WarnContext(p.closeContext, "Failed sending reply to request", "request_type", req.Type, "error", err)
 	}
 }
 

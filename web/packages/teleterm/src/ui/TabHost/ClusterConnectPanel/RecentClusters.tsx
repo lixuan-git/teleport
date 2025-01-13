@@ -1,26 +1,27 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React from 'react';
-
-import { Box, ButtonBorder, Card, Text } from 'design';
+import { Box, ButtonBorder, Card, Flex, Text } from 'design';
 
 import { useAppContext } from 'teleterm/ui/appContextProvider';
-import { getUserWithClusterName } from 'teleterm/ui/utils';
+import { ProfileStatusError } from 'teleterm/ui/components/ProfileStatusError';
 import { RootClusterUri } from 'teleterm/ui/uri';
+import { getUserWithClusterName } from 'teleterm/ui/utils';
 
 export function RecentClusters() {
   const ctx = useAppContext();
@@ -35,6 +36,7 @@ export function RecentClusters() {
         userName: cluster.loggedInUser?.name,
         clusterName: cluster.name,
       }),
+      connectionProblemError: cluster.profileStatusError,
       uri: cluster.uri,
     }));
 
@@ -47,7 +49,7 @@ export function RecentClusters() {
   }
 
   return (
-    <Card p={3} maxWidth="480px" m="auto">
+    <Card p={3} maxWidth="580px" m="auto">
       <Text bold fontSize={3} mb={1}>
         Recent clusters
       </Text>
@@ -62,16 +64,21 @@ export function RecentClusters() {
               justify-content: space-between;
             `}
           >
-            <Text
-              color="text.main"
-              mr={2}
-              title={cluster.userWithClusterName}
-              css={`
-                white-space: nowrap;
-              `}
-            >
-              {cluster.userWithClusterName}
-            </Text>
+            <Flex flexDirection="column">
+              <Text
+                color="text.main"
+                mr={2}
+                title={cluster.userWithClusterName}
+                css={`
+                  white-space: nowrap;
+                `}
+              >
+                {cluster.userWithClusterName}
+              </Text>
+              {cluster.connectionProblemError && (
+                <ProfileStatusError error={cluster.connectionProblemError} />
+              )}
+            </Flex>
             <ButtonBorder
               size="small"
               onClick={() => connect(cluster.uri)}

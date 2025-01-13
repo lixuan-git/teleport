@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package auth
 
@@ -32,20 +34,41 @@ import (
 )
 
 type mockIDTokenValidator struct {
-	tokens             map[string]githubactions.IDTokenClaims
-	lastCalledGHESHost string
+	tokens                   map[string]githubactions.IDTokenClaims
+	lastCalledGHESHost       string
+	lastCalledEnterpriseSlug string
+	lastCalledJWKS           string
 }
 
 var errMockInvalidToken = errors.New("invalid token")
 
-func (m *mockIDTokenValidator) Validate(_ context.Context, ghes string, token string) (*githubactions.IDTokenClaims, error) {
+func (m *mockIDTokenValidator) Validate(
+	_ context.Context, ghes, enterpriseSlug, token string,
+) (*githubactions.IDTokenClaims, error) {
 	m.lastCalledGHESHost = ghes
-
+	m.lastCalledEnterpriseSlug = enterpriseSlug
 	claims, ok := m.tokens[token]
 	if !ok {
 		return nil, errMockInvalidToken
 	}
 
+	return &claims, nil
+}
+
+func (m *mockIDTokenValidator) reset() {
+	m.lastCalledGHESHost = ""
+	m.lastCalledEnterpriseSlug = ""
+	m.lastCalledJWKS = ""
+}
+
+func (m *mockIDTokenValidator) ValidateJWKS(
+	_ time.Time, jwks []byte, token string,
+) (*githubactions.IDTokenClaims, error) {
+	m.lastCalledJWKS = string(jwks)
+	claims, ok := m.tokens[token]
+	if !ok {
+		return nil, errMockInvalidToken
+	}
 	return &claims, nil
 }
 
@@ -67,6 +90,7 @@ func TestAuth_RegisterUsingToken_GHA(t *testing.T) {
 	}
 	var withTokenValidator ServerOption = func(server *Server) error {
 		server.ghaIDTokenValidator = idTokenValidator
+		server.ghaIDTokenJWKSValidator = idTokenValidator.ValidateJWKS
 		return nil
 	}
 	ctx := context.Background()
@@ -132,6 +156,36 @@ func TestAuth_RegisterUsingToken_GHA(t *testing.T) {
 			assertError: require.NoError,
 		},
 		{
+			name: "success with jwks",
+			tokenSpec: types.ProvisionTokenSpecV2{
+				JoinMethod: types.JoinMethodGitHub,
+				Roles:      []types.SystemRole{types.RoleNode},
+				GitHub: &types.ProvisionTokenSpecV2GitHub{
+					Allow: []*types.ProvisionTokenSpecV2GitHub_Rule{
+						allowRule(nil),
+					},
+					StaticJWKS: "my-jwks",
+				},
+			},
+			request:     newRequest(validIDToken),
+			assertError: require.NoError,
+		},
+		{
+			name: "failure with jwks",
+			tokenSpec: types.ProvisionTokenSpecV2{
+				JoinMethod: types.JoinMethodGitHub,
+				Roles:      []types.SystemRole{types.RoleNode},
+				GitHub: &types.ProvisionTokenSpecV2GitHub{
+					Allow: []*types.ProvisionTokenSpecV2GitHub_Rule{
+						allowRule(nil),
+					},
+					StaticJWKS: "my-jwks",
+				},
+			},
+			request:     newRequest("invalid"),
+			assertError: require.Error,
+		},
+		{
 			name: "ghes override",
 			tokenSpec: types.ProvisionTokenSpecV2{
 				JoinMethod: types.JoinMethodGitHub,
@@ -148,12 +202,45 @@ func TestAuth_RegisterUsingToken_GHA(t *testing.T) {
 			setEnterprise: true,
 		},
 		{
+			name: "enterprise slug",
+			tokenSpec: types.ProvisionTokenSpecV2{
+				JoinMethod: types.JoinMethodGitHub,
+				Roles:      []types.SystemRole{types.RoleNode},
+				GitHub: &types.ProvisionTokenSpecV2GitHub{
+					EnterpriseSlug: "slug",
+					Allow: []*types.ProvisionTokenSpecV2GitHub_Rule{
+						allowRule(nil),
+					},
+				},
+			},
+			setEnterprise: true,
+			request:       newRequest(validIDToken),
+			assertError:   require.NoError,
+		},
+		{
 			name: "ghes override requires enterprise license",
 			tokenSpec: types.ProvisionTokenSpecV2{
 				JoinMethod: types.JoinMethodGitHub,
 				Roles:      []types.SystemRole{types.RoleNode},
 				GitHub: &types.ProvisionTokenSpecV2GitHub{
 					EnterpriseServerHost: "my.ghes.instance",
+					Allow: []*types.ProvisionTokenSpecV2GitHub_Rule{
+						allowRule(nil),
+					},
+				},
+			},
+			request: newRequest(validIDToken),
+			assertError: require.ErrorAssertionFunc(func(t require.TestingT, err error, i ...interface{}) {
+				require.ErrorIs(t, err, ErrRequiresEnterprise)
+			}),
+		},
+		{
+			name: "enterprise slug requires enterprise license",
+			tokenSpec: types.ProvisionTokenSpecV2{
+				JoinMethod: types.JoinMethodGitHub,
+				Roles:      []types.SystemRole{types.RoleNode},
+				GitHub: &types.ProvisionTokenSpecV2GitHub{
+					EnterpriseSlug: "slug",
 					Allow: []*types.ProvisionTokenSpecV2GitHub_Rule{
 						allowRule(nil),
 					},
@@ -312,6 +399,7 @@ func TestAuth_RegisterUsingToken_GHA(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Cleanup(idTokenValidator.reset)
 			if tt.setEnterprise {
 				modules.SetTestModules(
 					t,
@@ -327,14 +415,25 @@ func TestAuth_RegisterUsingToken_GHA(t *testing.T) {
 
 			_, err = auth.RegisterUsingToken(ctx, tt.request)
 			tt.assertError(t, err)
-
-			if tt.tokenSpec.GitHub.EnterpriseServerHost != "" {
-				require.Equal(
-					t,
-					tt.tokenSpec.GitHub.EnterpriseServerHost,
-					idTokenValidator.lastCalledGHESHost,
-				)
+			if err != nil {
+				return
 			}
+
+			require.Equal(
+				t,
+				tt.tokenSpec.GitHub.EnterpriseServerHost,
+				idTokenValidator.lastCalledGHESHost,
+			)
+			require.Equal(
+				t,
+				tt.tokenSpec.GitHub.EnterpriseSlug,
+				idTokenValidator.lastCalledEnterpriseSlug,
+			)
+			require.Equal(
+				t,
+				tt.tokenSpec.GitHub.StaticJWKS,
+				idTokenValidator.lastCalledJWKS,
+			)
 		})
 	}
 }

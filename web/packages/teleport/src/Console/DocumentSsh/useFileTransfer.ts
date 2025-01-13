@@ -1,36 +1,40 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import { useEffect, useState, useCallback } from 'react';
+import { useCallback, useEffect, useState } from 'react';
+
 import { useFileTransferContext } from 'shared/components/FileTransfer';
 
-import Tty from 'teleport/lib/term/tty';
-import { EventType } from 'teleport/lib/term/enums';
-import { Session } from 'teleport/services/session';
+import cfg from 'teleport/config';
 import { DocumentSsh } from 'teleport/Console/stores';
+import { EventType } from 'teleport/lib/term/enums';
+import Tty from 'teleport/lib/term/tty';
+import { MfaState } from 'teleport/lib/useMfa';
+import { Session } from 'teleport/services/session';
 
 import { useConsoleContext } from '../consoleContextProvider';
-
 import { getHttpFileTransferHandlers } from './httpFileTransferHandlers';
-import useGetScpUrl from './useGetScpUrl';
 
 export type FileTransferRequest = {
   sid: string;
   requestID: string;
   requester: string;
+  /** A list of accounts that approved this request. */
   approvers: string[];
   location: string;
   filename?: string;
@@ -48,7 +52,7 @@ export const useFileTransfer = (
   tty: Tty,
   session: Session,
   currentDoc: DocumentSsh,
-  addMfaToScpUrls: boolean
+  mfa: MfaState
 ) => {
   const { filesStore } = useFileTransferContext();
   const startTransfer = filesStore.start;
@@ -57,8 +61,6 @@ export const useFileTransfer = (
   const [fileTransferRequests, setFileTransferRequests] = useState<
     FileTransferRequest[]
   >([]);
-  const { getScpUrl, attempt: getMfaResponseAttempt } =
-    useGetScpUrl(addMfaToScpUrls);
   const { clusterId, serverId, login } = currentDoc;
 
   const download = useCallback(
@@ -67,7 +69,8 @@ export const useFileTransfer = (
       abortController: AbortController,
       moderatedSessionParams?: ModeratedSessionParams
     ) => {
-      const url = await getScpUrl({
+      const mfaResponse = await mfa.getChallengeResponse();
+      const url = cfg.getScpUrl({
         location,
         clusterId,
         serverId,
@@ -75,7 +78,9 @@ export const useFileTransfer = (
         filename: location,
         moderatedSessionId: moderatedSessionParams?.moderatedSessionId,
         fileTransferRequestId: moderatedSessionParams?.fileRequestId,
+        mfaResponse,
       });
+
       if (!url) {
         // if we return nothing here, the file transfer will not be added to the
         // file transfer list. If we add it to the list, the file will continue to
@@ -85,7 +90,7 @@ export const useFileTransfer = (
       }
       return getHttpFileTransferHandlers().download(url, abortController);
     },
-    [clusterId, login, serverId, getScpUrl]
+    [clusterId, login, serverId, mfa]
   );
 
   const upload = useCallback(
@@ -95,7 +100,9 @@ export const useFileTransfer = (
       abortController: AbortController,
       moderatedSessionParams?: ModeratedSessionParams
     ) => {
-      const url = await getScpUrl({
+      const mfaResponse = await mfa.getChallengeResponse();
+
+      const url = cfg.getScpUrl({
         location,
         clusterId,
         serverId,
@@ -103,6 +110,7 @@ export const useFileTransfer = (
         filename: file.name,
         moderatedSessionId: moderatedSessionParams?.moderatedSessionId,
         fileTransferRequestId: moderatedSessionParams?.fileRequestId,
+        mfaResponse,
       });
       if (!url) {
         // if we return nothing here, the file transfer will not be added to the
@@ -113,7 +121,7 @@ export const useFileTransfer = (
       }
       return getHttpFileTransferHandlers().upload(url, file, abortController);
     },
-    [clusterId, serverId, login, getScpUrl]
+    [clusterId, serverId, login, mfa]
   );
 
   /*
@@ -253,7 +261,6 @@ export const useFileTransfer = (
 
   return {
     fileTransferRequests,
-    getMfaResponseAttempt,
     getUploader,
     getDownloader,
   };

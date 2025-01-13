@@ -1,18 +1,20 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package awsoidc
 
@@ -25,16 +27,16 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2instanceconnect"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
+	"github.com/aws/aws-sdk-go-v2/service/eks"
 	"github.com/aws/aws-sdk-go-v2/service/rds"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/gravitational/trace"
+
+	awsutils "github.com/gravitational/teleport/api/utils/aws"
 )
 
 // AWSClientRequest contains the required fields to set up an AWS service client.
 type AWSClientRequest struct {
-	// IntegrationName is the integration name that is going to issue an API Call.
-	IntegrationName string
-
 	// Token is the token used to issue the API Call.
 	Token string
 
@@ -50,10 +52,6 @@ type AWSClientRequest struct {
 
 // CheckAndSetDefaults checks if the required fields are present.
 func (req *AWSClientRequest) CheckAndSetDefaults() error {
-	if req.IntegrationName == "" {
-		return trace.BadParameter("integration name is required")
-	}
-
 	if req.Token == "" {
 		return trace.BadParameter("token is required")
 	}
@@ -62,8 +60,10 @@ func (req *AWSClientRequest) CheckAndSetDefaults() error {
 		return trace.BadParameter("role arn is required")
 	}
 
-	if req.Region == "" {
-		return trace.BadParameter("region is required")
+	if req.Region != "" {
+		if err := awsutils.IsValidRegion(req.Region); err != nil {
+			return trace.Wrap(err)
+		}
 	}
 
 	return nil
@@ -91,6 +91,15 @@ func newAWSConfig(ctx context.Context, req *AWSClientRequest) (*aws.Config, erro
 	)
 
 	return &cfg, nil
+}
+
+func newEKSClient(ctx context.Context, req *AWSClientRequest) (*eks.Client, error) {
+	cfg, err := newAWSConfig(ctx, req)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return eks.NewFromConfig(*cfg), nil
 }
 
 // newRDSClient creates an [rds.Client] using the provided Token, RoleARN and Region.
@@ -143,8 +152,8 @@ func newEC2InstanceConnectClient(ctx context.Context, req *AWSClientRequest) (*e
 	return ec2instanceconnect.NewFromConfig(*cfg), nil
 }
 
-// newAWSCredentialsProvider creates an [aws.CredentialsRetriever] using the provided Token, RoleARN and Region.
-func newAWSCredentialsProvider(ctx context.Context, req *AWSClientRequest) (aws.CredentialsProvider, error) {
+// NewAWSCredentialsProvider creates an [aws.CredentialsProvider] using the provided Token, RoleARN and Region.
+func NewAWSCredentialsProvider(ctx context.Context, req *AWSClientRequest) (aws.CredentialsProvider, error) {
 	cfg, err := newAWSConfig(ctx, req)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -159,4 +168,27 @@ type IdentityToken string
 // GetIdentityToken returns the token configured.
 func (j IdentityToken) GetIdentityToken() ([]byte, error) {
 	return []byte(j), nil
+}
+
+// CallerIdentityGetter is a subset of [sts.Client] that can be used to information about the caller identity.
+type CallerIdentityGetter interface {
+	// GetCallerIdentity returns information about the caller identity.
+	GetCallerIdentity(ctx context.Context, params *sts.GetCallerIdentityInput, optFns ...func(*sts.Options)) (*sts.GetCallerIdentityOutput, error)
+}
+
+// CheckAccountID is a helper func that check if the current caller account ID
+// matches the expected account ID.
+func CheckAccountID(ctx context.Context, clt CallerIdentityGetter, wantAccountID string) error {
+	if wantAccountID == "" {
+		return nil
+	}
+	callerIdentity, err := clt.GetCallerIdentity(ctx, nil)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	currentAccountID := aws.ToString(callerIdentity.Account)
+	if wantAccountID != currentAccountID {
+		return trace.BadParameter("expected account ID %s but current account ID is %s", wantAccountID, currentAccountID)
+	}
+	return nil
 }

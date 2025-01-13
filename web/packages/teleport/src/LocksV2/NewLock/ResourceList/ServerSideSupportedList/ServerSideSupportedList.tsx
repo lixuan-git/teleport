@@ -1,41 +1,49 @@
 /**
- * Copyright 2023 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React, { useState, useEffect, useMemo } from 'react';
-import { SortType } from 'design/DataTable/types';
-import { Flex } from 'design';
-import { StyledPanel } from 'design/DataTable/StyledTable';
-import { SearchPanel } from 'shared/components/Search';
-import { StyledArrowBtn } from 'design/DataTable/Pager/StyledPager';
-import { CircleArrowLeft, CircleArrowRight } from 'design/Icon';
+import { useEffect, useMemo, useState } from 'react';
 
+import { Flex } from 'design';
+import { StyledArrowBtn } from 'design/DataTable/Pager/StyledPager';
+import { StyledPanel } from 'design/DataTable/StyledTable';
+import { SortType } from 'design/DataTable/types';
+import { CircleArrowLeft, CircleArrowRight } from 'design/Icon';
+import { SearchPanel } from 'shared/components/Search';
+import { makeAdvancedSearchQueryForLabel } from 'shared/utils/advancedSearchLabelQuery';
+
+import { useServerSidePagination } from 'teleport/components/hooks';
+import cfg, { UrlResourcesParams } from 'teleport/config';
+import type {
+  ResourceFilter,
+  ResourceLabel,
+  ResourcesResponse,
+} from 'teleport/services/agents';
 import { Desktop } from 'teleport/services/desktops';
 import { Node } from 'teleport/services/nodes';
-import { useServerSidePagination } from 'teleport/components/hooks';
-import useTeleport from 'teleport/useTeleport';
-import cfg from 'teleport/config';
+import { RoleResource } from 'teleport/services/resources';
 import Ctx from 'teleport/teleportContext';
+import useTeleport from 'teleport/useTeleport';
 
-import { TableWrapper, ServerSideListProps } from '../common';
 import { CommonListProps, LockResourceKind } from '../../common';
-
-import { Nodes } from './Nodes';
+import { ServerSideListProps, TableWrapper } from '../common';
 import { Desktops } from './Desktops';
-
-import type { ResourceLabel, ResourceFilter } from 'teleport/services/agents';
+import { Nodes } from './Nodes';
+import { Roles } from './Roles';
 
 export function ServerSideSupportedList(props: CommonListProps) {
   const ctx = useTeleport();
@@ -54,7 +62,7 @@ export function ServerSideSupportedList(props: CommonListProps) {
     fetchFunc: getFetchFuncForServerSidePaginating(
       ctx,
       props.selectedResourceKind
-    ) as any,
+    ),
     clusterId: cfg.proxyCluster, // Locking only supported with root cluster
     params: resourceFilter,
     pageSize: props.pageSize,
@@ -90,11 +98,14 @@ export function ServerSideSupportedList(props: CommonListProps) {
   }
 
   function onResourceLabelClick(label: ResourceLabel) {
-    const query = addResourceLabelToQuery(resourceFilter, label);
+    const query = makeAdvancedSearchQueryForLabel(label, resourceFilter);
     setResourceFilter({ ...resourceFilter, search: '', query });
   }
 
   const table = useMemo(() => {
+    // If there is a fetchStatus, a fetching is going on.
+    // Show the loading indicator instead of trying to process previous data.
+    const resources = fetchStatus === 'loading' ? [] : fetchedData.agents;
     const listProps: ServerSideListProps = {
       fetchStatus,
       customSort: {
@@ -108,18 +119,18 @@ export function ServerSideSupportedList(props: CommonListProps) {
     };
 
     switch (props.selectedResourceKind) {
+      case 'role':
+        return <Roles roles={resources as RoleResource[]} {...listProps} />;
       case 'node':
-        return <Nodes nodes={fetchedData.agents as Node[]} {...listProps} />;
+        return <Nodes nodes={resources as Node[]} {...listProps} />;
       case 'windows_desktop':
-        return (
-          <Desktops desktops={fetchedData.agents as Desktop[]} {...listProps} />
-        );
+        return <Desktops desktops={resources as Desktop[]} {...listProps} />;
       default:
         console.error(
           `[ServerSideSupportedList.tsx] table not defined for resource kind ${props.selectedResourceKind}`
         );
     }
-  }, [props.attempt, fetchedData, fetchStatus, props.selectedResources]);
+  }, [fetchedData, fetchStatus, props.selectedResources]);
 
   return (
     <TableWrapper
@@ -127,7 +138,6 @@ export function ServerSideSupportedList(props: CommonListProps) {
       css={`
         border-radius: 8px;
         overflow: hidden;
-        box-shadow: ${props => props.theme.boxShadow[0]};
       `}
     >
       <SearchPanel
@@ -138,12 +148,12 @@ export function ServerSideSupportedList(props: CommonListProps) {
           to: pageIndicators.to,
           total: pageIndicators.totalCount,
         }}
+        hideAdvancedSearch={props.selectedResourceKind === 'role'} // Roles don't support advanced search.
         filter={resourceFilter}
-        showSearchBar={true}
         disableSearch={fetchStatus === 'loading'}
       />
       {table}
-      <StyledPanel borderBottomLeftRadius={3} borderBottomRightRadius={3}>
+      <StyledPanel>
         <Flex justifyContent="flex-end" width="100%">
           <Flex alignItems="center" mr={2}></Flex>
           <Flex>
@@ -180,7 +190,16 @@ function getDefaultSort(kind: LockResourceKind): SortType {
 function getFetchFuncForServerSidePaginating(
   ctx: Ctx,
   resourceKind: LockResourceKind
-) {
+): (
+  clusterId: string,
+  params: UrlResourcesParams
+) => Promise<ResourcesResponse<unknown>> {
+  if (resourceKind === 'role') {
+    return async (clusterId, params) => {
+      const { items, startKey } = await ctx.resourceService.fetchRoles(params);
+      return { agents: items, startKey };
+    };
+  }
   if (resourceKind === 'node') {
     return ctx.nodeService.fetchNodes;
   }
@@ -188,24 +207,4 @@ function getFetchFuncForServerSidePaginating(
   if (resourceKind === 'windows_desktop') {
     return ctx.desktopService.fetchDesktops;
   }
-}
-
-function addResourceLabelToQuery(filter: ResourceFilter, label: ResourceLabel) {
-  const queryParts = [];
-
-  // Add existing query
-  if (filter.query) {
-    queryParts.push(filter.query);
-  }
-
-  // If there is an existing simple search,
-  // convert it to predicate language and add it
-  if (filter.search) {
-    queryParts.push(`search("${filter.search}")`);
-  }
-
-  // Create the label query.
-  queryParts.push(`labels["${label.name}"] == "${label.value}"`);
-
-  return queryParts.join(' && ');
 }
