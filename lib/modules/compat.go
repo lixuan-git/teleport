@@ -1,5 +1,5 @@
 // Teleport
-// Copyright (C) 2024 Gravitational, Inc.
+// Copyright (C) 2026 Gravitational, Inc.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -14,11 +14,11 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-//go:build !boringcrypto
-
 package modules
 
-// IsFIPSBuild checks if the binary was compiled in FIPS140 mode.
-func IsFIPSBuild() bool {
-	return false
+// IsBoringBinary checks if the binary was compiled in FIPS140 mode. It is
+// a compatibility shim that will be removed once the callers from other repos
+// have been removed.
+func IsBoringBinary() bool {
+	return IsFIPSBuild()
 }
